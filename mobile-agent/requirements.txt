@@ -1,0 +1,9 @@
+google-genai>=0.5.0
+python-telegram-bot>=20.0
+python-dotenv>=1.0.0
+imagehash>=4.3
+Pillow>=10.0
+aiosqlite>=0.20
+pytest>=8.0
+pytest-asyncio>=0.23
+pytest-mock>=3.12
