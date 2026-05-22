@@ -23,11 +23,11 @@ from security.hitl_gate import HitlGate
 log = logging.getLogger("mobile_agent.main")
 
 
-async def _verify_emulator(expected_device_id: str) -> None:
-    devices = await check_emulator_running()
+async def _verify_emulator(expected_device_id: str, allow_physical: bool) -> None:
+    devices = await check_emulator_running(allow_physical=allow_physical)
     if expected_device_id not in devices:
         raise RuntimeError(
-            f"Expected emulator '{expected_device_id}' is not running. "
+            f"Expected device '{expected_device_id}' is not attached. "
             f"Found: {devices}"
         )
 
@@ -55,7 +55,15 @@ def main() -> None:
 
     settings = load_settings()
 
-    asyncio.run(_verify_emulator(settings.android_device_id))
+    asyncio.run(
+        _verify_emulator(settings.android_device_id, settings.allow_physical_device)
+    )
+    if settings.allow_physical_device:
+        log.warning(
+            "ALLOW_PHYSICAL_DEVICE is set — driving real phone %s. "
+            "HITL gates remain in place; review payment/OTP prompts carefully.",
+            settings.android_device_id,
+        )
 
     adb = AdbController(settings.android_device_id)
     hitl = HitlGate()
@@ -69,8 +77,12 @@ def main() -> None:
     users = UserStore(settings.users_path)
     _bootstrap_users(users, settings.telegram_allowed_user_ids_env)
 
-    # If admin is configured and not yet paired, register them with the most
-    # permissive policy so they can immediately issue pair codes for others.
+    # If admin is configured and not yet paired, register them with the
+    # standard policy. Admin status is a separate axis from HITL policy:
+    # admin-only commands (/issue_pair_code, /users, /revoke) check
+    # `admin_id`, not policy — so confirm_sensitive doesn't block them from
+    # bootstrapping pair codes, but DOES keep the payment/OTP HITL gate in
+    # play when they run tasks themselves.
     if (
         settings.telegram_admin_id is not None
         and not users.is_allowed(settings.telegram_admin_id)
@@ -82,7 +94,7 @@ def main() -> None:
                 UserRecord.new(
                     user_id=settings.telegram_admin_id,
                     name="admin",
-                    policy=UserPolicy.ALWAYS_APPROVE,
+                    policy=UserPolicy.CONFIRM_SENSITIVE,
                 )
             )
         )

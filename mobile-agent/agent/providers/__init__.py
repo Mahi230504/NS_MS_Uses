@@ -21,16 +21,15 @@ __all__ = [
 
 
 def make_provider(name: str, **kwargs) -> VisionProvider:
-    """Factory: instantiate the named provider with kwargs.
-
-    Currently only 'gemini' is supported. Add new providers here when they
-    land — keep `agent/computer_use.py` and the orchestrator decoupled from
-    concrete implementations.
-    """
+    """Factory: instantiate the named provider with kwargs."""
     if name == "gemini":
         from agent.providers.gemini import GeminiProvider
 
         return GeminiProvider(**kwargs)
+    if name == "openrouter":
+        from agent.providers.openrouter import OpenRouterProvider
+
+        return OpenRouterProvider(**kwargs)
     raise ValueError(
-        f"Unsupported VISION_PROVIDER: {name!r}. Supported: 'gemini'."
+        f"Unsupported VISION_PROVIDER: {name!r}. Supported: 'gemini', 'openrouter'."
     )

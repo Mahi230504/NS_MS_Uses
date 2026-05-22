@@ -8,12 +8,16 @@ class EmulatorError(RuntimeError):
     """Raised when the device check fails the emulator-only safety rule."""
 
 
-async def check_emulator_running() -> list[str]:
-    """Return the list of running emulator device IDs.
+async def check_emulator_running(allow_physical: bool = False) -> list[str]:
+    """Return the list of attached device IDs visible to adb.
 
-    Enforces the emulator-only safety rule:
+    Default behaviour (the project's safety rule): emulator-only.
       - raises EmulatorError if any physical device is attached
       - raises EmulatorError if no emulator is attached
+
+    When `allow_physical=True`, the rule is opted out: both emulator and
+    physical devices are returned. Use this only when the user has explicitly
+    set ALLOW_PHYSICAL_DEVICE=1; never silently flip the default.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -51,11 +55,14 @@ async def check_emulator_running() -> list[str]:
         else:
             physical.append(device_id)
 
-    if physical:
+    if physical and not allow_physical:
         raise EmulatorError(
             f"Refusing to run: physical device(s) attached: {physical}. "
-            "This agent is emulator-only for safety."
+            "This agent is emulator-only by default. Set ALLOW_PHYSICAL_DEVICE=1 "
+            "in your .env if you explicitly want to drive a real phone."
         )
+    if allow_physical:
+        return emulators + physical
     if not emulators:
         raise EmulatorError(
             "No Android emulator detected. Start one (e.g. `emulator -avd <name>`) and retry."

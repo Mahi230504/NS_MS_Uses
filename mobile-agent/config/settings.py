@@ -33,6 +33,7 @@ class Settings:
     config_dir: Path
     users_path: Path
     db_path: Path
+    allow_physical_device: bool
 
 
 def _resolve_config_dir() -> Path:
@@ -113,6 +114,12 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
     raw_log_dir = os.environ.get("LOG_DIR", "").strip()
     log_dir = Path(raw_log_dir) if raw_log_dir else (config_dir / "logs")
 
+    # Opt-in override of the emulator-only safety rule. Set to "1" / "true" /
+    # "yes" to run on a physical device. Leave empty (default) to refuse.
+    allow_physical = os.environ.get("ALLOW_PHYSICAL_DEVICE", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+
     return Settings(
         gemini_api_key=os.environ["GEMINI_API_KEY"],
         gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
@@ -126,4 +133,5 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
         config_dir=config_dir,
         users_path=config_dir / "users.json",
         db_path=config_dir / "tasks.db",
+        allow_physical_device=allow_physical,
     )
