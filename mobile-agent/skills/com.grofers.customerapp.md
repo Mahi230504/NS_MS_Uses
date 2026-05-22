@@ -1,4 +1,4 @@
-# Blinkit (com.blinkit.markets)
+# Blinkit (com.grofers.customerapp — rebranded from Grofers but kept the package)
 
 ## Navigation
 - The search bar lives near the top of the home screen. Tap it before typing.

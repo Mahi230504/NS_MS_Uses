@@ -1,4 +1,4 @@
-"""Telegram callbacks: lifecycle, pairing, admin, approval."""
+"""Telegram callbacks: menu-driven app/task flow + pairing + admin + approval."""
 from __future__ import annotations
 
 import asyncio
@@ -9,9 +9,23 @@ from telegram.ext import Application, ContextTypes
 from agent.orchestrator import Orchestrator
 from agent.persistence import TaskRepository
 from agent.state_machine import Task
+from bot.apps import (
+    APPS,
+    App,
+    TaskTemplate,
+    get_app,
+    get_task,
+    render_prompt,
+)
 from bot.pairing import PairCodeIssuer
+from bot.session import Session, SessionState, SessionStore
 from bot.users import UserPolicy, UserRecord, UserStore
 from security.hitl_gate import HitlGate
+
+
+# Inline-keyboard layout knobs.
+_APP_BUTTONS_PER_ROW = 3
+_TASK_BUTTONS_PER_ROW = 2
 
 
 class Handlers:
@@ -34,7 +48,11 @@ class Handlers:
         self._pairing = pairing
         self._admin_id = admin_id
         self._repo = repo
+        self._sessions = SessionStore()
         self._running: dict[int, asyncio.Task] = {}
+
+    # ------------------------------------------------------------------
+    # Auth helpers
 
     def _is_paired(self, user_id: int | None) -> bool:
         return user_id is not None and self._users.is_allowed(user_id)
@@ -46,6 +64,13 @@ class Handlers:
             and user_id == self._admin_id
         )
 
+    def _has_running_task(self, user_id: int) -> bool:
+        existing = self._running.get(user_id)
+        return existing is not None and not existing.done()
+
+    # ------------------------------------------------------------------
+    # /start — top-level menu
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
         if update.message is None or user is None:
@@ -56,15 +81,25 @@ class Handlers:
                 "Ask the admin for a pairing code, then send /pair <code>."
             )
             return
-        await update.message.reply_text(
-            "mobile-agent — generalized Android automation.\n\n"
-            "Send me a task in plain English (e.g. 'open the search bar in YouTube').\n\n"
-            "Commands:\n"
-            "  /status — current task state\n"
-            "  /history — last 10 tasks\n"
-            "  /abort — cancel running task\n"
-            "  /pair <code> — finish pairing"
+        if self._has_running_task(user.id):
+            await update.message.reply_text(
+                "A task is already running. Use /abort first or wait for it to finish."
+            )
+            return
+
+        sess = self._sessions.get(user.id)
+        sess.state = SessionState.CHOOSING_APP
+        sess.app_id = None
+        sess.task_id = None
+
+        sent = await update.message.reply_text(
+            "What do you want to do? Pick an app or type a task in plain English.",
+            reply_markup=_app_keyboard(),
         )
+        sess.menu_message_id = sent.message_id
+
+    # ------------------------------------------------------------------
+    # Free-text message handler
 
     async def message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -76,21 +111,184 @@ class Handlers:
             )
             return
 
-        existing = self._running.get(user.id)
-        if existing is not None and not existing.done():
-            await update.message.reply_text(
-                "A task is already running. Use /abort first or wait for it to finish."
-            )
-            return
-
         text = (update.message.text or "").strip()
         if not text:
             await update.message.reply_text("Please send a non-empty task description.")
             return
 
-        task = Task(user_id=user.id, description=text)
+        sess = self._sessions.get(user.id)
+        if sess.state == SessionState.AWAITING_PARAM:
+            # User is filling in a templated task's free-text slot.
+            await self._launch_templated_task(update, user.id, text)
+            return
+
+        # Otherwise: free-form path — exactly the pre-menu behaviour.
+        if self._has_running_task(user.id):
+            await update.message.reply_text(
+                "A task is already running. Use /abort first or wait for it to finish."
+            )
+            return
+        await self._launch_freeform_task(update, user.id, text)
+
+    # ------------------------------------------------------------------
+    # Callback handler — menu navigation + HITL approve/deny
+
+    async def menu_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        query = update.callback_query
+        if query is None or query.from_user is None:
+            return
+        user_id = query.from_user.id
+        if not self._is_paired(user_id):
+            await query.answer("Not authorized.")
+            return
+
+        data = query.data or ""
+        # Approval callbacks (HITL) are routed to the original flow.
+        if data in ("approve", "deny"):
+            await self._handle_approval_callback(query, user_id, data)
+            return
+
+        await query.answer()
+
+        if data.startswith("app:"):
+            await self._on_app_pick(query, user_id, data[4:])
+        elif data.startswith("task:"):
+            await self._on_task_pick(query, user_id, data[5:])
+        elif data == "back:apps":
+            await self._on_back_to_apps(query, user_id)
+        elif data == "freeform":
+            await self._on_freeform_pick(query, user_id)
+        elif data == "cancel":
+            await self._on_cancel(query, user_id)
+        else:
+            # Unknown callback — likely from an old message after a redeploy.
+            pass
+
+    # ------------------------------------------------------------------
+    # Menu transitions
+
+    async def _on_app_pick(self, query, user_id: int, app_id: str) -> None:
+        app = get_app(app_id)
+        if app is None:
+            await query.edit_message_text("That app is no longer available.")
+            return
+        sess = self._sessions.get(user_id)
+        sess.state = SessionState.CHOOSING_TASK
+        sess.app_id = app_id
+        sess.task_id = None
+        await query.edit_message_text(
+            f"{app.emoji} {app.name} — what would you like to do?",
+            reply_markup=_task_keyboard(app),
+        )
+
+    async def _on_task_pick(self, query, user_id: int, task_id: str) -> None:
+        sess = self._sessions.get(user_id)
+        if sess.app_id is None:
+            await query.edit_message_text("Session expired — /start again.")
+            return
+        app = get_app(sess.app_id)
+        if app is None:
+            await query.edit_message_text("That app is no longer available.")
+            return
+        task = get_task(app, task_id)
+        if task is None:
+            await query.edit_message_text("That task is no longer available.")
+            return
+        sess.task_id = task_id
+
+        if task.needs_param:
+            sess.state = SessionState.AWAITING_PARAM
+            await query.edit_message_text(
+                f"{app.emoji} {app.name} → {task.label}\n\n{task.param_prompt}"
+            )
+            return
+
+        # No param needed — fire the task immediately.
+        await query.edit_message_text(
+            f"Starting: {task.label} in {app.name}."
+        )
+        await self._launch_task_from_session(query.message, user_id, param=None)
+
+    async def _on_back_to_apps(self, query, user_id: int) -> None:
+        sess = self._sessions.get(user_id)
+        sess.state = SessionState.CHOOSING_APP
+        sess.app_id = None
+        sess.task_id = None
+        await query.edit_message_text(
+            "What do you want to do? Pick an app or type a task in plain English.",
+            reply_markup=_app_keyboard(),
+        )
+
+    async def _on_freeform_pick(self, query, user_id: int) -> None:
+        sess = self._sessions.get(user_id)
+        sess.state = SessionState.IDLE
+        sess.app_id = None
+        sess.task_id = None
+        await query.edit_message_text(
+            "Tell me what you'd like to do — plain English. I'll figure out the app and the steps.\n\n"
+            "Example: 'open the search bar in YouTube and search for jazz'."
+        )
+
+    async def _on_cancel(self, query, user_id: int) -> None:
+        self._sessions.reset(user_id)
+        await query.edit_message_text("Cancelled.")
+
+    # ------------------------------------------------------------------
+    # Task hand-off
+
+    async def _launch_templated_task(
+        self, update: Update, user_id: int, param: str
+    ) -> None:
+        if update.message is None:
+            return
+        if self._has_running_task(user_id):
+            await update.message.reply_text(
+                "A task is already running. Use /abort first or wait for it to finish."
+            )
+            return
+        await self._launch_task_from_session(update.message, user_id, param=param)
+
+    async def _launch_task_from_session(
+        self, message, user_id: int, *, param: str | None
+    ) -> None:
+        sess = self._sessions.get(user_id)
+        if sess.app_id is None or sess.task_id is None:
+            await message.reply_text("Session expired — /start again.")
+            return
+        app = get_app(sess.app_id)
+        task_tpl = get_task(app, sess.task_id) if app else None
+        if app is None or task_tpl is None:
+            await message.reply_text("Session expired — /start again.")
+            return
+
+        description = render_prompt(task_tpl.template, param)
+        task = Task(user_id=user_id, description=description)
+        sess.state = SessionState.RUNNING
+        await message.reply_text(
+            f"Starting in {app.emoji} {app.name}: {description}"
+        )
+        self._running[user_id] = asyncio.create_task(
+            self._orch.run_task(task, launch_package=app.package)
+        )
+
+    async def _launch_freeform_task(
+        self, update: Update, user_id: int, text: str
+    ) -> None:
+        if update.message is None:
+            return
+        task = Task(user_id=user_id, description=text)
+        sess = self._sessions.get(user_id)
+        sess.state = SessionState.RUNNING
+        sess.app_id = None
+        sess.task_id = None
         await update.message.reply_text(f"Starting task: {text}")
-        self._running[user.id] = asyncio.create_task(self._orch.run_task(task))
+        # No launch_package — the agent decides where to start.
+        self._running[user_id] = asyncio.create_task(self._orch.run_task(task))
+
+    # ------------------------------------------------------------------
+    # Other commands (unchanged from before)
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -147,12 +345,13 @@ class Handlers:
         running = self._running.get(user.id)
         if running is not None and not running.done():
             running.cancel()
+            self._sessions.reset(user.id)
             await update.message.reply_text("Task aborted.")
         else:
             await update.message.reply_text("No task to abort.")
 
     # ------------------------------------------------------------------
-    # Pairing flow
+    # Pairing flow (unchanged)
 
     async def issue_pair_code(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -194,7 +393,7 @@ class Handlers:
         await self._users.add(record)
         await update.message.reply_text(
             f"Paired as {name}. Default policy: confirm_sensitive.\n"
-            "Send a task to get started, or /start for help."
+            "Send /start to pick an app or just type a task."
         )
 
     async def list_users(
@@ -238,20 +437,10 @@ class Handlers:
         )
 
     # ------------------------------------------------------------------
-    # Callbacks the orchestrator pushes back into Telegram.
+    # HITL approval (existing, unchanged)
 
-    async def approval_callback(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        query = update.callback_query
-        if query is None or query.from_user is None:
-            return
-        user_id = query.from_user.id
-        if not self._is_paired(user_id):
-            await query.answer("Not authorized.")
-            return
+    async def _handle_approval_callback(self, query, user_id: int, data: str) -> None:
         await query.answer()
-        data = query.data or ""
         if data == "approve":
             self._hitl.grant(user_id)
             if query.message:
@@ -260,6 +449,9 @@ class Handlers:
             self._hitl.deny(user_id)
             if query.message:
                 await query.edit_message_text("Action denied.")
+
+    # Keep the old name registered as the catch-all callback handler.
+    approval_callback = menu_callback
 
     async def on_approval_request(self, task: Task, action: dict) -> None:
         reason = (
@@ -290,3 +482,43 @@ class Handlers:
             chat_id=task.user_id,
             text=f"[{task.state.value}] {message}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Inline keyboard builders
+
+def _app_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for app in APPS:
+        row.append(
+            InlineKeyboardButton(
+                f"{app.emoji} {app.name}", callback_data=f"app:{app.id}"
+            )
+        )
+        if len(row) == _APP_BUTTONS_PER_ROW:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append(
+        [
+            InlineKeyboardButton("📝 Free-form", callback_data="freeform"),
+            InlineKeyboardButton("✖ Cancel", callback_data="cancel"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _task_keyboard(app: App) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for t in app.tasks:
+        row.append(InlineKeyboardButton(t.label, callback_data=f"task:{t.id}"))
+        if len(row) == _TASK_BUTTONS_PER_ROW:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅ Back", callback_data="back:apps")])
+    return InlineKeyboardMarkup(rows)

@@ -113,6 +113,47 @@ class AdbController:
         """Back-button — the standard "undo whatever I just did" gesture."""
         await self.key_event(KEYCODE_BACK)
 
+    async def launch_package(self, package: str) -> str:
+        """Bring an app to the foreground deterministically.
+
+        Tries the hardcoded package first. If that fails (wrong variant,
+        regional rename), greps the installed package list for a close match
+        and tries that. Returns the package name that actually launched, or
+        raises AdbError if nothing worked.
+        """
+        try:
+            await self._run(
+                "shell", "monkey", "-p", package, "-c",
+                "android.intent.category.LAUNCHER", "1",
+            )
+            return package
+        except AdbError:
+            pass
+        # Fallback: search the installed package list for a partial match on
+        # the most distinctive segment (e.g. "blinkit" out of com.blinkit.markets).
+        stem = _package_stem(package)
+        try:
+            out = await self._run("shell", "pm", "list", "packages")
+        except AdbError:
+            raise AdbError(
+                f"launch_package({package!r}) failed and `pm list packages` is unavailable."
+            )
+        installed = _parse_pm_list(out.decode("utf-8", errors="replace"))
+        for candidate in installed:
+            if stem in candidate.lower():
+                try:
+                    await self._run(
+                        "shell", "monkey", "-p", candidate, "-c",
+                        "android.intent.category.LAUNCHER", "1",
+                    )
+                    return candidate
+                except AdbError:
+                    continue
+        raise AdbError(
+            f"Could not launch {package!r} — not installed and no close match "
+            f"found in the installed package list."
+        )
+
     async def get_screen_size(self) -> tuple[int, int]:
         """Return (width, height) in pixels. Cached after the first call."""
         if self._screen_size is not None:
@@ -156,6 +197,29 @@ class AdbController:
             return False
         self._adbkeyboard_active = out == _ADBKEYBOARD_IME
         return self._adbkeyboard_active
+
+
+def _package_stem(package: str) -> str:
+    """The most distinctive lowercase segment of a package name.
+
+    For com.blinkit.markets → "blinkit". Falls back to the last segment if
+    no segment is clearly distinctive.
+    """
+    parts = [p for p in package.lower().split(".") if p not in ("com", "in", "io", "net", "org", "app", "android")]
+    if not parts:
+        return package.lower().rsplit(".", 1)[-1]
+    # Heuristic: the longest remaining segment is the brand most of the time.
+    return max(parts, key=len)
+
+
+def _parse_pm_list(output: str) -> list[str]:
+    """Parse `pm list packages` output ('package:com.foo.bar' per line)."""
+    pkgs: list[str] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if line.startswith("package:"):
+            pkgs.append(line[len("package:"):])
+    return pkgs
 
 
 def _escape_for_input_text(text: str) -> str:

@@ -23,6 +23,24 @@ from security.hitl_gate import HitlGate
 log = logging.getLogger("mobile_agent.main")
 
 
+def _provider_kwargs(settings) -> dict:
+    """Translate Settings into per-provider constructor kwargs."""
+    if settings.vision_provider == "gemini":
+        return {"api_key": settings.gemini_api_key, "model": settings.gemini_model}
+    if settings.vision_provider == "vertex":
+        return {
+            "project": settings.gcp_project_id,
+            "location": settings.gcp_location,
+            "model": settings.gemini_model,
+        }
+    if settings.vision_provider == "openrouter":
+        return {
+            "api_key": settings.openrouter_api_key,
+            "model": settings.openrouter_model,
+        }
+    raise RuntimeError(f"Unhandled VISION_PROVIDER: {settings.vision_provider!r}")
+
+
 async def _verify_emulator(expected_device_id: str, allow_physical: bool) -> None:
     devices = await check_emulator_running(allow_physical=allow_physical)
     if expected_device_id not in devices:
@@ -70,8 +88,7 @@ def main() -> None:
     audit = AuditLogger(settings.log_dir)
     vision = make_provider(
         settings.vision_provider,
-        api_key=settings.gemini_api_key,
-        model=settings.gemini_model,
+        **_provider_kwargs(settings),
     )
 
     users = UserStore(settings.users_path)

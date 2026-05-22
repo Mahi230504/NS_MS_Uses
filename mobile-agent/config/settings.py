@@ -9,8 +9,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+# Base requirements (every provider). Per-provider requirements are checked
+# separately so e.g. Vertex (service-account auth) doesn't need GEMINI_API_KEY.
 _REQUIRED = (
-    "GEMINI_API_KEY",
     "TELEGRAM_BOT_TOKEN",
     "ANDROID_DEVICE_ID",
 )
@@ -24,6 +25,12 @@ class Settings:
     gemini_api_key: str
     gemini_model: str
     vision_provider: str
+    # Vertex-only (empty otherwise).
+    gcp_project_id: str
+    gcp_location: str
+    # OpenRouter-only (empty otherwise).
+    openrouter_api_key: str
+    openrouter_model: str
     telegram_bot_token: str
     telegram_admin_id: int | None
     telegram_allowed_user_ids_env: frozenset[int]
@@ -81,12 +88,39 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
         # that might appear after we checked (rare, but cheap).
         load_dotenv()
 
-    missing = [k for k in _REQUIRED if not os.environ.get(k)]
+    provider = os.environ.get("VISION_PROVIDER", "gemini").strip() or "gemini"
+
+    # Per-provider required vars. Validated alongside the base list so the
+    # user gets one error listing everything that's missing.
+    provider_required: list[str] = []
+    if provider == "gemini":
+        provider_required = ["GEMINI_API_KEY"]
+    elif provider == "vertex":
+        provider_required = ["GCP_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS"]
+    elif provider == "openrouter":
+        provider_required = ["OPENROUTER_API_KEY"]
+    else:
+        raise RuntimeError(
+            f"Unsupported VISION_PROVIDER: {provider!r}. "
+            "Supported: 'gemini', 'vertex', 'openrouter'."
+        )
+
+    missing = [k for k in (*_REQUIRED, *provider_required) if not os.environ.get(k)]
     if missing:
         raise RuntimeError(
             "Missing required env vars: " + ", ".join(missing) + ". "
             f"Edit {config_dir / '.env'} (template at .env.example)."
         )
+
+    # For Vertex specifically: validate the credentials file actually exists.
+    # ADC will fail with a less-helpful error otherwise.
+    if provider == "vertex":
+        cred_path = Path(os.environ["GOOGLE_APPLICATION_CREDENTIALS"]).expanduser()
+        if not cred_path.is_file():
+            raise RuntimeError(
+                f"GOOGLE_APPLICATION_CREDENTIALS points to {cred_path}, "
+                "which doesn't exist or isn't a file."
+            )
 
     raw_admin = os.environ.get("TELEGRAM_ADMIN_ID", "").strip()
     admin_id: int | None = None
@@ -121,9 +155,13 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
     )
 
     return Settings(
-        gemini_api_key=os.environ["GEMINI_API_KEY"],
+        gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
         gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
-        vision_provider=os.environ.get("VISION_PROVIDER", "gemini"),
+        vision_provider=provider,
+        gcp_project_id=os.environ.get("GCP_PROJECT_ID", ""),
+        gcp_location=os.environ.get("GCP_LOCATION", "us-central1"),
+        openrouter_api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+        openrouter_model=os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash"),
         telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
         telegram_admin_id=admin_id,
         telegram_allowed_user_ids_env=user_ids,

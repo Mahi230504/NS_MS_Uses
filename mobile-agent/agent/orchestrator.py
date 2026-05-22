@@ -83,7 +83,12 @@ class Orchestrator:
     def get_task(self, user_id: int) -> Task | None:
         return self._tasks.get(user_id)
 
-    async def run_task(self, task: Task) -> Task:
+    async def run_task(
+        self,
+        task: Task,
+        *,
+        launch_package: str | None = None,
+    ) -> Task:
         self._tasks[task.user_id] = task
         self._last_step_status_at = 0.0
         self._low_rpd_warned = False
@@ -95,6 +100,16 @@ class Orchestrator:
         await self._persist_insert(task)
         await self._status(task, f"starting: {task.description}")
         try:
+            if launch_package is not None:
+                try:
+                    launched = await self._adb.launch_package(launch_package)
+                    await self._status(task, f"launched {launched}")
+                except AdbError as e:
+                    # Don't fail the task — the agent may still be able to
+                    # find the app from the home screen. But warn the user.
+                    await self._status(
+                        task, f"⚠️ couldn't launch {launch_package}: {e}"
+                    )
             await asyncio.wait_for(self._loop(task), timeout=self._timeout)
         except asyncio.TimeoutError:
             task.state = TaskState.TIMED_OUT

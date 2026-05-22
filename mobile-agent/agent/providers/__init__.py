@@ -30,6 +30,11 @@ def make_provider(name: str, **kwargs) -> VisionProvider:
         from agent.providers.openrouter import OpenRouterProvider
 
         return OpenRouterProvider(**kwargs)
+    if name == "vertex":
+        from agent.providers.vertex import VertexProvider
+
+        return VertexProvider(**kwargs)
     raise ValueError(
-        f"Unsupported VISION_PROVIDER: {name!r}. Supported: 'gemini', 'openrouter'."
+        f"Unsupported VISION_PROVIDER: {name!r}. "
+        "Supported: 'gemini', 'vertex', 'openrouter'."
     )

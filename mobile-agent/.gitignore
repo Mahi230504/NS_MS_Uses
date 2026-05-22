@@ -1,0 +1,32 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+*credentials*.json
+*service-account*.json
+*.pem
+*.key
+*.p12
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Project artifacts
+logs/
+*.log
+test_screenshot.png
+tasks.db
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
