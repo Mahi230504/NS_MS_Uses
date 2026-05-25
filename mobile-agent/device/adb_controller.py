@@ -83,41 +83,58 @@ class AdbController:
     async def type_text(self, text: str) -> None:
         """Send text to the device's focused input field.
 
-        Preferred path (ADBKeyboard): broadcast ADB_INPUT_B64 to the IME.
-        Robust against the navigate-then-type focus race because it delivers
-        characters directly to whatever has IME focus, not via simulated
-        hardware key events. If ADBKeyboard isn't the active IME, we briefly
-        swap to it for this one call and restore the user's normal keyboard
-        afterwards — so the user doesn't have to live with ADBKeyboard
-        as their everyday keyboard.
+        If ADBKeyboard is the currently active IME (which the orchestrator
+        ensures during a task via use_adbkeyboard_for_task), we deliver via
+        the ADB_INPUT_B64 broadcast — robust against any focus race because
+        commitText goes to whichever EditText currently holds focus through
+        the existing InputConnection.
 
-        Fallback path: `adb shell input text` with shell-escaping. Spaces
-        map to %s (input's own token-separator escape); other shell-special
-        chars are backslash-escaped to survive the shell layer.
+        If ADBKeyboard isn't active, we don't try to swap it in mid-typing —
+        that mid-task swap is unreliable on some OEMs because the
+        InputConnection drops during the IME change and may not re-establish
+        before the broadcast lands. Instead, fall back to `adb shell input
+        text` and accept the focus-race risk.
         """
-        if not await self._adbkeyboard_is_enabled():
-            await self._run("shell", "input", "text", _escape_for_input_text(text))
-            return
-
-        original_ime = await self._current_ime()
-        needs_swap = original_ime != _ADBKEYBOARD_IME
-        payload = base64.standard_b64encode(text.encode("utf-8")).decode("ascii")
-        try:
-            if needs_swap:
-                await self._run("shell", "ime", "set", _ADBKEYBOARD_IME)
-                # Give the IME switch a beat to propagate before we broadcast.
-                await asyncio.sleep(0.2)
+        current = await self._current_ime()
+        if current == _ADBKEYBOARD_IME:
+            payload = base64.standard_b64encode(text.encode("utf-8")).decode("ascii")
             await self._run(
                 "shell", "am", "broadcast", "-a", "ADB_INPUT_B64",
                 "--es", "msg", payload,
             )
-        finally:
-            # Always restore the user's preferred keyboard, even if broadcast failed.
-            if needs_swap and original_ime:
-                try:
-                    await self._run("shell", "ime", "set", original_ime)
-                except AdbError:
-                    pass  # best-effort; user can switch back manually
+            return
+        await self._run("shell", "input", "text", _escape_for_input_text(text))
+
+    async def use_adbkeyboard_for_task(self) -> str | None:
+        """Switch the default IME to ADBKeyboard for the duration of a task.
+
+        Returns the original IME id (so the caller can restore it on task
+        exit), or None if ADBKeyboard isn't enabled / switching failed.
+        Idempotent: calling when already on ADBKeyboard is a no-op that
+        returns None (nothing to restore).
+        """
+        if not await self._adbkeyboard_is_enabled():
+            return None
+        original = await self._current_ime()
+        if original == _ADBKEYBOARD_IME or not original:
+            return None
+        try:
+            await self._run("shell", "ime", "set", _ADBKEYBOARD_IME)
+        except AdbError:
+            return None
+        # Brief wait so the IME swap is fully active before the agent loop
+        # starts tapping into text fields.
+        await asyncio.sleep(0.5)
+        return original
+
+    async def restore_ime(self, ime_id: str | None) -> None:
+        """Restore the IME previously captured by use_adbkeyboard_for_task."""
+        if not ime_id:
+            return
+        try:
+            await self._run("shell", "ime", "set", ime_id)
+        except AdbError:
+            pass
 
     async def key_event(self, keycode: int) -> None:
         await self._run("shell", "input", "keyevent", str(keycode))

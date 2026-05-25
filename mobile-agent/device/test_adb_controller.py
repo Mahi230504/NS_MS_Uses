@@ -105,8 +105,38 @@ class TestTypeText:
         decoded = base64.standard_b64decode(broadcasts[0][-1]).decode("utf-8")
         assert decoded == "can't & won't"
 
-    async def test_swaps_ime_then_restores(self, monkeypatch) -> None:
-        """ADBKeyboard is enabled but Gboard is active → swap, broadcast, swap back."""
+    async def test_falls_back_to_input_text_when_gboard_is_active(
+        self, monkeypatch
+    ) -> None:
+        """ADBKeyboard exists but isn't current: don't try to swap mid-typing.
+
+        The mid-task IME swap is unreliable on some OEMs (InputConnection
+        drops), so type_text falls back to `input text` rather than swapping.
+        The orchestrator is responsible for swapping ADBKeyboard in at task
+        start via use_adbkeyboard_for_task().
+        """
+        adb = AdbController("emulator-5554")
+        gboard = "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+        calls: list[tuple[str, ...]] = []
+
+        async def fake_run(*args: str) -> bytes:
+            calls.append(args)
+            if args[:5] == ("shell", "settings", "get", "secure", "default_input_method"):
+                return f"{gboard}\n".encode()
+            return b""
+
+        monkeypatch.setattr(adb, "_run", fake_run)
+        await adb.type_text("milk")
+
+        # No swap, no broadcast — just the fallback.
+        assert not [c for c in calls if c[:3] == ("shell", "ime", "set")]
+        assert not [c for c in calls if c[:2] == ("shell", "am")]
+        input_calls = [c for c in calls if c[:3] == ("shell", "input", "text")]
+        assert input_calls == [("shell", "input", "text", "milk")]
+
+
+class TestUseAdbkeyboardForTask:
+    async def test_swaps_when_enabled_and_not_active(self, monkeypatch) -> None:
         adb = AdbController("emulator-5554")
         gboard = "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
         calls: list[tuple[str, ...]] = []
@@ -120,47 +150,32 @@ class TestTypeText:
             return b""
 
         monkeypatch.setattr(adb, "_run", fake_run)
-        await adb.type_text("milk")
-
+        original = await adb.use_adbkeyboard_for_task()
+        assert original == gboard
         ime_sets = [c for c in calls if c[:3] == ("shell", "ime", "set")]
-        # Exactly two: swap to adbkeyboard, then restore Gboard.
-        assert len(ime_sets) == 2
-        assert ime_sets[0] == ("shell", "ime", "set", "com.android.adbkeyboard/.AdbIME")
-        assert ime_sets[1] == ("shell", "ime", "set", gboard)
-        # Broadcast happened between the swap and the restore.
-        broadcasts = [c for c in calls if c[:2] == ("shell", "am")]
-        assert len(broadcasts) == 1
+        assert ime_sets == [("shell", "ime", "set", "com.android.adbkeyboard/.AdbIME")]
 
-    async def test_falls_back_to_input_text_when_adbkeyboard_not_enabled(
-        self, monkeypatch
-    ) -> None:
-        adb = AdbController("emulator-5554")
-        calls: list[tuple[str, ...]] = []
-
-        async def fake_run(*args: str) -> bytes:
-            calls.append(args)
-            if args[:4] == ("shell", "ime", "list", "-s"):
-                # ADBKeyboard is NOT in the enabled list.
-                return b"com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME\n"
-            return b""
-
-        monkeypatch.setattr(adb, "_run", fake_run)
-        await adb.type_text("hello world")
-
-        # Only the input-text fallback should fire — no `ime set`, no broadcast.
-        assert not [c for c in calls if c[:2] == ("shell", "am")]
-        assert not [c for c in calls if c[:3] == ("shell", "ime", "set")]
-        input_calls = [c for c in calls if c[:3] == ("shell", "input", "text")]
-        assert input_calls == [("shell", "input", "text", "hello%sworld")]
-
-    async def test_falls_back_when_ime_list_errors(self, monkeypatch) -> None:
+    async def test_noop_when_already_active(self, monkeypatch) -> None:
         adb = AdbController("emulator-5554")
 
         async def fake_run(*args: str) -> bytes:
             if args[:4] == ("shell", "ime", "list", "-s"):
-                raise AdbError("ime command not supported")
+                return b"com.android.adbkeyboard/.AdbIME\n"
+            if args[:5] == ("shell", "settings", "get", "secure", "default_input_method"):
+                return b"com.android.adbkeyboard/.AdbIME\n"
             return b""
 
         monkeypatch.setattr(adb, "_run", fake_run)
-        # Should NOT raise — IME enumeration failure falls back to input text.
-        await adb.type_text("hello")
+        original = await adb.use_adbkeyboard_for_task()
+        assert original is None  # nothing to restore
+
+    async def test_noop_when_adbkeyboard_not_enabled(self, monkeypatch) -> None:
+        adb = AdbController("emulator-5554")
+
+        async def fake_run(*args: str) -> bytes:
+            if args[:4] == ("shell", "ime", "list", "-s"):
+                return b"com.google.android.inputmethod.latin/...\n"
+            return b""
+
+        monkeypatch.setattr(adb, "_run", fake_run)
+        assert await adb.use_adbkeyboard_for_task() is None

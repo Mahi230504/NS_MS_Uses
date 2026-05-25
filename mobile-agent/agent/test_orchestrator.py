@@ -76,6 +76,13 @@ class _FakeAdb:
         # degrades to screenshot-only (existing assertions still hold).
         return None
 
+    async def use_adbkeyboard_for_task(self) -> str | None:
+        # No IME on a fake device — return None (nothing to restore).
+        return None
+
+    async def restore_ime(self, ime_id: str | None) -> None:
+        return None
+
 
 def _make_png(color: tuple[int, int, int]) -> bytes:
     """Return PNG bytes for a tiny solid-color image — phash-stable."""

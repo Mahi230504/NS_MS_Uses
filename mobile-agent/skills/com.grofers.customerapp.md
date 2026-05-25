@@ -9,17 +9,24 @@
 - Cart icon is bottom-right; the cart screen lists items + total before checkout.
 
 ## Search and add — read carefully
-- For a generic request like "milk", tap the **ADD** button on the **FIRST**
-  product card in the result list. Exactly ONE tap on ONE card.
+- First, READ the product name on the first result card. If it doesn't match
+  what the user asked for (e.g. searching "cigarettes" returned beer because
+  Blinkit doesn't sell cigarettes), emit need_approval with
+  `"no matching product — results show <what>"`. Don't ADD a wrong-category item.
+- For a generic request like "milk" with a matching first card: tap the **ADD**
+  button on that card. Exactly ONE tap on ONE card.
 - For a branded request like "Amul gold milk", scan the result cards and tap ADD
   on the FIRST card whose product name contains "Amul" AND "gold" (or as much of
-  the brand specifier as you can match). If no card matches, fall back to the
-  first card.
+  the brand specifier as you can match).
+- **TAP THE ADD BUTTON, NOT THE CARD BODY.** Each product card has the product
+  image and name on the LEFT and a small green "ADD" button on the RIGHT side
+  (roughly the right ~20% of the card's width). Tapping the image or product
+  name opens a detail page — that's a wasted step. The ADD button's coords are
+  in the UI elements list under the id `add` / `add_to_cart` / similar, or as
+  text "ADD". Use those coords exactly.
 - **Never tap ADD on multiple product cards for a single requested item.** That
-  adds multiple products to the cart, which is almost never what the user wants.
-- Each product card's ADD button is at the bottom-right corner of the card. Tap
-  again to increment quantity — only do this if the user explicitly asked for
-  more than 1.
+  adds multiple products to the cart.
+- Tap ADD again to increment quantity — only if the user asked for more than 1.
 
 ## Cart and checkout — HITL is mandatory
 - When you reach the **Cart** screen (showing the items added, with a

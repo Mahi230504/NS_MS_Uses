@@ -107,6 +107,15 @@ class Orchestrator:
         task.state = TaskState.RUNNING
         await self._persist_insert(task)
         await self._status(task, f"starting: {task.description}")
+        # Switch the device's IME to ADBKeyboard for the duration of the task,
+        # so the agent's type actions land reliably. Restore the user's normal
+        # IME on exit (finally:). Returns None if ADBKeyboard isn't enabled,
+        # in which case typing falls back to `adb shell input text`.
+        original_ime: str | None = None
+        try:
+            original_ime = await self._adb.use_adbkeyboard_for_task()
+        except Exception:
+            original_ime = None
         try:
             if launch_package is not None:
                 try:
@@ -137,6 +146,13 @@ class Orchestrator:
             task.state = TaskState.FAILED
             task.failure_reason = f"unexpected error: {e}"
             await self._status(task, task.failure_reason)
+        finally:
+            # Restore the user's original IME if we swapped for the task.
+            # Best-effort — a stuck IME never blocks task completion.
+            try:
+                await self._adb.restore_ime(original_ime)
+            except Exception:
+                pass
         await self._persist_update(task)
         return task
 
@@ -464,23 +480,42 @@ class Orchestrator:
         await self._status(task, f"⚠️ low daily quota: {rpd} requests remaining")
 
     async def _request_approval(self, task: Task, action: dict) -> None:
-        if self.on_approval_request is not None:
+        # If the approval message can't be delivered (Telegram outage), the
+        # subsequent wait_for_approval will time out cleanly — no need to
+        # crash the task with the network error.
+        if self.on_approval_request is None:
+            return
+        try:
             await self.on_approval_request(task, action)
+        except Exception:
+            pass
 
     async def _status(self, task: Task, message: str) -> None:
-        """Always send (lifecycle, errors, warnings)."""
-        if self.on_status_update is not None:
+        """Lifecycle / error messages — best-effort, never fatal.
+
+        A Telegram outage or transient timeout must not abort an in-flight
+        task. We swallow status-callback exceptions; the agent loop keeps
+        running and the user can /status the task later.
+        """
+        if self.on_status_update is None:
+            return
+        try:
             await self.on_status_update(task, message)
+        except Exception:
+            pass
 
     async def _step_status(self, task: Task, message: str) -> None:
-        """Per-step progress — throttled so we don't spam Telegram."""
+        """Per-step progress — throttled + best-effort (same rationale)."""
         if self.on_status_update is None:
             return
         now = time.monotonic()
         if now - self._last_step_status_at < STEP_STATUS_MIN_INTERVAL_SECONDS:
             return
         self._last_step_status_at = now
-        await self.on_status_update(task, message)
+        try:
+            await self.on_status_update(task, message)
+        except Exception:
+            pass
 
 
     async def _persist_insert(self, task: Task) -> None:
