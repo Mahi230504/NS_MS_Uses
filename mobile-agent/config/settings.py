@@ -41,6 +41,7 @@ class Settings:
     users_path: Path
     db_path: Path
     allow_physical_device: bool
+    enable_vision_hitl: bool
 
 
 def _resolve_config_dir() -> Path:
@@ -154,6 +155,14 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
         "1", "true", "yes", "on"
     )
 
+    # Vision-augmented HITL doubles Gemini calls per state-changing action
+    # (one for the action, one to classify whether the screen is sensitive).
+    # On strict free tiers (20 RPD on gemini-2.5-flash) that halves usable
+    # tasks/day. Default OFF; keyword filter still gates payment/OTP/etc.
+    enable_vision_hitl = os.environ.get("ENABLE_VISION_HITL", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+
     return Settings(
         gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
         gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"),
@@ -172,4 +181,5 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
         users_path=config_dir / "users.json",
         db_path=config_dir / "tasks.db",
         allow_physical_device=allow_physical,
+        enable_vision_hitl=enable_vision_hitl,
     )

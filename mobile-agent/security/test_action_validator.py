@@ -57,6 +57,15 @@ class TestValidate:
         assert not ok
         assert "blocked term" in reason
 
+    def test_note_field_is_exempt_from_blocklist(self) -> None:
+        # `note` is human-readable narration ("tap CALL on the contact") and
+        # must NOT be scanned for blocked terms like "call". Otherwise every
+        # ADD on Blinkit gets blocked because the note describes the product.
+        ok, reason = validate(
+            {"action": "tap", "x": 1, "y": 2, "note": "tap CALL on the contact card"}
+        )
+        assert ok, reason
+
     def test_allowed_action_set_is_locked_down(self) -> None:
         # The allowed set is small and intentional; this test fails if anyone
         # widens it without thinking.

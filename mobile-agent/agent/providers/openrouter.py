@@ -38,9 +38,12 @@ MAX_OUTPUT_TOKENS = 1024
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 1.0
 
-# Conservative defaults for OpenRouter free-credit tier; tune via constructor.
-DEFAULT_RPM = 20
-DEFAULT_RPD = 200
+# Paid-tier defaults. OpenRouter's per-account rate limits are model-dependent
+# and generally well above 60 RPM for paid accounts; the local throttle just
+# acts as a safety cap against runaway loops. The orchestrator's loop
+# detection (hard-aborts after a few cycles) is the real cost guard now.
+DEFAULT_RPM = 60
+DEFAULT_RPD = 5000
 
 
 class OpenRouterProvider:
@@ -65,6 +68,7 @@ class OpenRouterProvider:
         step_history: list[dict],
         screen_size: tuple[int, int] | None = None,
         skill_hint: str | None = None,
+        ui_tree: str | None = None,
     ) -> ProviderResponse:
         screen_line = (
             f"Device screen: {screen_size[0]}x{screen_size[1]} px\n\n"
@@ -74,9 +78,11 @@ class OpenRouterProvider:
         skill_block = (
             f"App-specific guidance:\n{skill_hint}\n\n" if skill_hint else ""
         )
+        tree_block = f"{ui_tree}\n\n" if ui_tree else ""
         user_text = (
             f"{screen_line}"
             f"{skill_block}"
+            f"{tree_block}"
             f"Task: {task_description}\n\n"
             f"Step history (most recent last):\n{self._format_history(step_history)}\n\n"
             "What is the next action? Output a single JSON object only."

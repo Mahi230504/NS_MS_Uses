@@ -137,6 +137,7 @@ def main() -> None:
         users=users,
         skills=skills,
         repo=repo,
+        enable_vision_hitl=settings.enable_vision_hitl,
     )
 
     app = build_application(settings.telegram_bot_token)

@@ -83,28 +83,41 @@ class AdbController:
     async def type_text(self, text: str) -> None:
         """Send text to the device's focused input field.
 
-        Path 1 (preferred): if com.android.adbkeyboard is the active IME, send
-        the text base64-encoded via its ADB_INPUT_B64 broadcast — handles all
-        unicode, spaces, punctuation cleanly.
-        Path 2 (fallback): `adb shell input text` with shell-escaping. Spaces
+        Preferred path (ADBKeyboard): broadcast ADB_INPUT_B64 to the IME.
+        Robust against the navigate-then-type focus race because it delivers
+        characters directly to whatever has IME focus, not via simulated
+        hardware key events. If ADBKeyboard isn't the active IME, we briefly
+        swap to it for this one call and restore the user's normal keyboard
+        afterwards — so the user doesn't have to live with ADBKeyboard
+        as their everyday keyboard.
+
+        Fallback path: `adb shell input text` with shell-escaping. Spaces
         map to %s (input's own token-separator escape); other shell-special
         chars are backslash-escaped to survive the shell layer.
         """
-        if await self._adbkeyboard_is_default():
-            payload = base64.standard_b64encode(text.encode("utf-8")).decode("ascii")
-            await self._run(
-                "shell",
-                "am",
-                "broadcast",
-                "-a",
-                "ADB_INPUT_B64",
-                "--es",
-                "msg",
-                payload,
-            )
+        if not await self._adbkeyboard_is_enabled():
+            await self._run("shell", "input", "text", _escape_for_input_text(text))
             return
 
-        await self._run("shell", "input", "text", _escape_for_input_text(text))
+        original_ime = await self._current_ime()
+        needs_swap = original_ime != _ADBKEYBOARD_IME
+        payload = base64.standard_b64encode(text.encode("utf-8")).decode("ascii")
+        try:
+            if needs_swap:
+                await self._run("shell", "ime", "set", _ADBKEYBOARD_IME)
+                # Give the IME switch a beat to propagate before we broadcast.
+                await asyncio.sleep(0.2)
+            await self._run(
+                "shell", "am", "broadcast", "-a", "ADB_INPUT_B64",
+                "--es", "msg", payload,
+            )
+        finally:
+            # Always restore the user's preferred keyboard, even if broadcast failed.
+            if needs_swap and original_ime:
+                try:
+                    await self._run("shell", "ime", "set", original_ime)
+                except AdbError:
+                    pass  # best-effort; user can switch back manually
 
     async def key_event(self, keycode: int) -> None:
         await self._run("shell", "input", "keyevent", str(keycode))
@@ -168,6 +181,30 @@ class AdbController:
         self._screen_size = (int(w), int(h))
         return self._screen_size
 
+    async def dump_ui_xml(self) -> str | None:
+        """Return the on-screen UI hierarchy as XML, or None on failure.
+
+        `uiautomator dump` is Android's accessibility-tree export. It produces
+        an XML document where each <node> carries text, content-desc,
+        resource-id, class, bounds, and clickability — far more precise than
+        what a vision model can extract from pixels. Feeding this alongside
+        the screenshot is the single biggest reliability win for grounding.
+
+        Returns None (not raises) so callers can degrade gracefully when the
+        tool isn't available (e.g. some OEM ROMs strip it).
+        """
+        try:
+            out = await self._run("exec-out", "uiautomator", "dump", "/dev/tty")
+        except AdbError:
+            return None
+        text = out.decode("utf-8", errors="replace").strip()
+        # uiautomator dump sometimes appends "UI hierchary dumped to: ..." after
+        # the XML. Strip anything past the closing </hierarchy> tag.
+        end = text.rfind("</hierarchy>")
+        if end == -1:
+            return None
+        return text[: end + len("</hierarchy>")]
+
     async def get_foreground_package(self) -> str | None:
         """Return the package name of the foregrounded activity, or None.
 
@@ -183,20 +220,30 @@ class AdbController:
         m = _CURRENT_FOCUS_RE.search(out)
         return m.group(1) if m else None
 
-    async def _adbkeyboard_is_default(self) -> bool:
+    async def _adbkeyboard_is_enabled(self) -> bool:
+        """Cached: is ADBKeyboard listed as an enabled IME?"""
         if self._adbkeyboard_active is not None:
             return self._adbkeyboard_active
         try:
-            out = (
-                await self._run(
-                    "shell", "settings", "get", "secure", "default_input_method"
-                )
-            ).decode("utf-8", errors="replace").strip()
+            out = (await self._run("shell", "ime", "list", "-s")).decode(
+                "utf-8", errors="replace"
+            )
         except AdbError:
             self._adbkeyboard_active = False
             return False
-        self._adbkeyboard_active = out == _ADBKEYBOARD_IME
+        self._adbkeyboard_active = _ADBKEYBOARD_IME in out
         return self._adbkeyboard_active
+
+    async def _current_ime(self) -> str | None:
+        """The IME currently active on the device. NOT cached — can change."""
+        try:
+            out = await self._run(
+                "shell", "settings", "get", "secure", "default_input_method"
+            )
+        except AdbError:
+            return None
+        ime = out.decode("utf-8", errors="replace").strip()
+        return ime or None
 
 
 def _package_stem(package: str) -> str:

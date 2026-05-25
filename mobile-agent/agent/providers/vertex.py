@@ -72,6 +72,7 @@ class VertexProvider:
         step_history: list[dict],
         screen_size: tuple[int, int] | None = None,
         skill_hint: str | None = None,
+        ui_tree: str | None = None,
     ) -> ProviderResponse:
         screen_line = (
             f"Device screen: {screen_size[0]}x{screen_size[1]} px\n\n"
@@ -81,9 +82,11 @@ class VertexProvider:
         skill_block = (
             f"App-specific guidance:\n{skill_hint}\n\n" if skill_hint else ""
         )
+        tree_block = f"{ui_tree}\n\n" if ui_tree else ""
         user_text = (
             f"{screen_line}"
             f"{skill_block}"
+            f"{tree_block}"
             f"Task: {task_description}\n\n"
             f"Step history (most recent last):\n{self._format_history(step_history)}\n\n"
             "What is the next action? Output a single JSON object only."

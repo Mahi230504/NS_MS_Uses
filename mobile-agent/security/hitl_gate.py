@@ -75,7 +75,6 @@ class HitlGate:
                 raise ReadOnlyViolation(
                     f"read_only user cannot perform '{action_type}'"
                 )
-            # need_approval / wait / done are still gated normally below.
 
         if user_policy == "always_approve":
             return False
@@ -83,8 +82,21 @@ class HitlGate:
         if action_type == "need_approval":
             return True
 
+        # The keyword scan only makes sense for actions that actually do
+        # something. `wait` and `done` carry the model's narration in their
+        # `reason`/`summary`, which routinely mentions the broader plan
+        # (e.g. "waiting before checkout") — that's not a payment screen,
+        # it's the model thinking out loud. Gating waits creates false
+        # positives that derail every run.
+        if action_type not in _STATE_CHANGING_ACTIONS:
+            return False
+
+        # `note` is the model's human-readable description of what it's doing
+        # ("tapping Place Order button"). Scanning it lets the gate catch
+        # dangerous intentions stated in plain English even when the action
+        # type alone wouldn't.
         haystack = " ".join(
-            str(action_json.get(k, "")) for k in ("reason", "summary", "text")
+            str(action_json.get(k, "")) for k in ("reason", "summary", "text", "note")
         ).lower()
         return any(kw in haystack for kw in SENSITIVE_KEYWORDS)
 

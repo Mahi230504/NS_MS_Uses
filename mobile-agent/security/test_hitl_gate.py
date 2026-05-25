@@ -32,6 +32,16 @@ class TestRequiresApproval:
         gate = HitlGate()
         assert await gate.requires_approval({"action": "tap", field: value}, "")
 
+    async def test_sensitive_keyword_in_note_triggers(self) -> None:
+        # `note` is the model's plain-English narration. If it mentions
+        # "checkout" / "payment" / etc., that's a dangerous intention and
+        # the gate should fire even if no `reason` field is present.
+        gate = HitlGate()
+        assert await gate.requires_approval(
+            {"action": "tap", "x": 1, "y": 2, "note": "tap Place Order to pay now"},
+            "",
+        )
+
     async def test_benign_text_does_not_trigger(self) -> None:
         gate = HitlGate()
         assert not await gate.requires_approval(

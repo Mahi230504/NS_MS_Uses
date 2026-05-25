@@ -25,9 +25,14 @@ MAX_OUTPUT_TOKENS = 1024
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 1.0
 
-# Free-tier defaults for gemini-2.0-flash. Adjust via constructor for paid tiers.
-DEFAULT_RPM = 10
-DEFAULT_RPD = 1500
+# Free-tier defaults. Google's daily limit varies wildly per model:
+#   gemini-2.5-flash   : 5 RPM, 20  RPD
+#   gemini-2.0-flash   : 10 RPM, 200 RPD
+#   gemini-1.5-flash-8b: 15 RPM, 1500 RPD
+# These constants are the strictest among them so we never over-spend. Paid
+# tier callers override via the constructor.
+DEFAULT_RPM = 5
+DEFAULT_RPD = 20
 
 
 class GeminiProvider:
@@ -51,6 +56,7 @@ class GeminiProvider:
         step_history: list[dict],
         screen_size: tuple[int, int] | None = None,
         skill_hint: str | None = None,
+        ui_tree: str | None = None,
     ) -> ProviderResponse:
         # Screen dims drive coordinate accuracy — without them the model can't
         # know whether to emit 1080x1920 or 1440x2960 coords for a tap.
@@ -62,9 +68,11 @@ class GeminiProvider:
         skill_block = (
             f"App-specific guidance:\n{skill_hint}\n\n" if skill_hint else ""
         )
+        tree_block = f"{ui_tree}\n\n" if ui_tree else ""
         user_text = (
             f"{screen_line}"
             f"{skill_block}"
+            f"{tree_block}"
             f"Task: {task_description}\n\n"
             f"Step history (most recent last):\n{self._format_history(step_history)}\n\n"
             "What is the next action? Output a single JSON object only."
@@ -103,7 +111,11 @@ class GeminiProvider:
                     raise ProviderError(
                         f"Gemini failed after {MAX_RETRIES} retries: {e}"
                     ) from e
-                await asyncio.sleep(BASE_BACKOFF_SECONDS * (2**attempt))
+                # Honour the server's retry hint when present (e.g. RetryInfo
+                # says "retry in 35s") — otherwise fall back to exponential.
+                hinted = _parse_retry_delay_seconds(e)
+                delay = hinted if hinted is not None else BASE_BACKOFF_SECONDS * (2**attempt)
+                await asyncio.sleep(delay)
             except (ProviderError, ValueError):
                 # Parsing errors are not retryable.
                 raise
@@ -190,3 +202,27 @@ class GeminiProvider:
             rpm_remaining=rpm_remaining,
             rpd_remaining=rpd_remaining,
         )
+
+
+def _parse_retry_delay_seconds(error: Exception) -> float | None:
+    """Extract `retry in Ns` from a 429 error if Google attached RetryInfo.
+
+    Google's APIError carries a `details` payload with type
+    `google.rpc.RetryInfo` containing `retryDelay` like "35s" or "35.5s".
+    Falls back gracefully when the shape doesn't match.
+    """
+    import re
+
+    # Cheap & robust: regex the stringified error for `retry in <num>s` or
+    # `retryDelay: '<num>s'` — both forms appear in the genai SDK's repr.
+    text = str(error)
+    m = re.search(r"retry in (\d+(?:\.\d+)?)s", text, re.IGNORECASE)
+    if not m:
+        m = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s", text)
+    if not m:
+        return None
+    try:
+        # Add a small cushion so the next call doesn't race the window edge.
+        return float(m.group(1)) + 1.0
+    except ValueError:
+        return None

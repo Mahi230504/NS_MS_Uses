@@ -40,6 +40,7 @@ class VisionProvider(Protocol):
         step_history: list[dict],
         screen_size: tuple[int, int] | None = None,
         skill_hint: str | None = None,
+        ui_tree: str | None = None,
     ) -> ProviderResponse: ...
 
     async def classify_yes_no(

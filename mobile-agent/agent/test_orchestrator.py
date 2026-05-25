@@ -71,6 +71,11 @@ class _FakeAdb:
     async def get_foreground_package(self) -> str | None:
         return self._foreground_package
 
+    async def dump_ui_xml(self) -> str | None:
+        # Tests don't need a real tree; return None so the orchestrator
+        # degrades to screenshot-only (existing assertions still hold).
+        return None
+
 
 def _make_png(color: tuple[int, int, int]) -> bytes:
     """Return PNG bytes for a tiny solid-color image — phash-stable."""
@@ -126,11 +131,14 @@ class _ScriptedVision:
         step_history: list,
         screen_size: tuple[int, int] | None = None,
         skill_hint: str | None = None,
+        ui_tree: str | None = None,
     ) -> ProviderResponse:
         self.calls.append(
             {
                 "screen_size": screen_size,
                 "skill_hint": skill_hint,
+                "ui_tree": ui_tree,
+                "task_description": task_description,
                 "history_len": len(step_history),
             }
         )
@@ -476,7 +484,13 @@ class TestVisionAugmentedHitl:
             hitl.grant(_task.user_id)  # auto-approve so the loop continues
 
         orch = Orchestrator(
-            adb, hitl, audit, vision, session_timeout_seconds=10, users=users
+            adb,
+            hitl,
+            audit,
+            vision,
+            session_timeout_seconds=10,
+            users=users,
+            enable_vision_hitl=True,
         )
         orch.on_approval_request = on_approval
         await orch.run_task(Task(user_id=1, description="t"))
@@ -484,6 +498,89 @@ class TestVisionAugmentedHitl:
         # Exactly one approval request — for the tap that the vision flagged.
         assert len(approvals) == 1
         assert approvals[0]["action"] == "tap"
+
+
+class TestLoopDetection:
+    async def test_repeated_tap_triggers_loop_hint(
+        self, audit: AuditLogger
+    ) -> None:
+        same_tap = {"action": "tap", "x": 100, "y": 200}
+        vision = _ScriptedVision(
+            [
+                (same_tap, _usage()),
+                (same_tap, _usage()),
+                ({"action": "done", "summary": "stopping after loop hint"}, _usage()),
+            ]
+        )
+        adb = _FakeAdb()
+        orch = Orchestrator(adb, HitlGate(), audit, vision, session_timeout_seconds=10)
+        await orch.run_task(Task(user_id=1, description="do the thing"))
+
+        # First two calls: no loop hint (only one prior action each, or none).
+        assert "loop" not in vision.calls[0]["task_description"].lower()
+        assert "loop" not in vision.calls[1]["task_description"].lower()
+        # Third call: hint should be injected.
+        assert "identical" in vision.calls[2]["task_description"]
+
+    async def test_abab_cycle_triggers_loop_hint(self, audit: AuditLogger) -> None:
+        # Four actions forming A-B-A-B → the fifth call gets the cycle hint.
+        a = {"action": "tap", "x": 100, "y": 200}
+        b = {"action": "tap", "x": 800, "y": 900}
+        vision = _ScriptedVision(
+            [
+                (a, _usage()),
+                (b, _usage()),
+                (a, _usage()),
+                (b, _usage()),
+                ({"action": "done", "summary": "stop"}, _usage()),
+            ]
+        )
+        adb = _FakeAdb()
+        orch = Orchestrator(adb, HitlGate(), audit, vision, session_timeout_seconds=10)
+        await orch.run_task(Task(user_id=1, description="t"))
+
+        # Hint should appear on the 5th call (after the 4-action cycle is complete).
+        assert "cycle" in vision.calls[4]["task_description"]
+
+    async def test_persistent_looping_hard_aborts(self, audit: AuditLogger) -> None:
+        # Same tap forever — after MAX_LOOPS_BEFORE_ABORT detected loops,
+        # orchestrator should fail the task instead of hinting endlessly.
+        same = {"action": "tap", "x": 100, "y": 200}
+        vision = _ScriptedVision([(same, _usage()) for _ in range(30)])
+        adb = _FakeAdb()
+        orch = Orchestrator(adb, HitlGate(), audit, vision, session_timeout_seconds=30)
+        task = Task(user_id=1, description="loop forever")
+        await orch.run_task(task)
+        assert task.state is TaskState.FAILED
+        assert "stuck" in (task.failure_reason or "").lower()
+
+
+class TestActionNarration:
+    async def test_note_field_appears_in_status(
+        self, audit: AuditLogger
+    ) -> None:
+        vision = _ScriptedVision(
+            [
+                (
+                    {"action": "tap", "x": 1, "y": 2,
+                     "note": "tap ADD on Amul Taaza Milk 500ml"},
+                    _usage(),
+                ),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        adb = _FakeAdb()
+        orch = Orchestrator(adb, HitlGate(), audit, vision, session_timeout_seconds=10)
+        sent: list[str] = []
+
+        async def status(_task: Task, msg: str) -> None:
+            sent.append(msg)
+
+        orch.on_status_update = status
+        await orch.run_task(Task(user_id=1, description="t"))
+
+        step_msgs = [m for m in sent if m.startswith("step ")]
+        assert any("Amul Taaza Milk" in m for m in step_msgs)
 
 
 class TestPersistence:

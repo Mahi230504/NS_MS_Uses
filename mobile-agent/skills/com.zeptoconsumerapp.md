@@ -1,13 +1,22 @@
 # Zepto (com.zeptoconsumerapp)
 
 ## Navigation
-- Search bar is at the top of the home screen.
-- Cart icon is bottom-right; "Proceed to checkout" and "Place order" are HITL-worthy.
+- Home-screen search bar at top — tapping navigates to a search screen with the
+  real EditText. Tap the EditText before typing.
+- Search results render live as you type. Wait one cycle after typing.
+- Cart icon bottom-right.
 
-## Add to cart
-- Each product card has an "ADD" button; tapping again increments quantity.
-- Wait one cycle after typing for the result list to settle.
+## Search and add
+- For "X": tap ADD on the FIRST card matching X. Exactly ONE tap on ONE card.
+- For "<brand> X": find the first card whose name contains the brand specifier;
+  fall back to first card if no match.
+- Never ADD multiple products for one requested item.
+
+## Cart and checkout — HITL mandatory
+- On the Cart screen, DO NOT tap "Proceed to checkout" / "Place order" / "Pay".
+  Emit need_approval with reason listing items + total. User must approve.
+- Payment selection and final pay buttons are also HITL.
 
 ## Pitfalls
-- A delivery address sheet may pop up on first cart visit — confirm or dismiss before checkout.
-- Promo banners occasionally cover the cart icon; dismiss with the "x" first.
+- Address sheet may pop on first cart visit — confirm/dismiss before proceeding.
+- If no payment method available, emit need_approval — don't try to add one.

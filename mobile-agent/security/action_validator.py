@@ -19,7 +19,12 @@ BLOCKED_ACTIONS: tuple[str, ...] = (
 # User/agent content fields are excluded from the blocklist substring scan so
 # that legitimate text input like "call mom" or "remove from cart" is not
 # false-positive blocked. Structural fields are still scanned.
-_CONTENT_FIELDS = frozenset({"text", "reason", "summary"})
+#   - text:    the literal characters being typed
+#   - reason:  the model's narration for wait/need_approval
+#   - summary: the final summary on done
+#   - note:    short human-readable description on state-changing actions
+#              (e.g. "tapping ADD on Amul Taaza Milk 500ml")
+_CONTENT_FIELDS = frozenset({"text", "reason", "summary", "note"})
 
 
 def validate(action_json: dict) -> tuple[bool, str]:

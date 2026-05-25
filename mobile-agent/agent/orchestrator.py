@@ -12,6 +12,7 @@ from agent.phash import compute as compute_phash
 from agent.providers.base import VisionProvider
 from agent.skills import SkillRegistry
 from agent.state_machine import Task, TaskState
+from agent.ui_tree import to_prompt_section as ui_tree_to_prompt
 from bot.users import UserStore
 from device.adb_controller import KEYCODE_BACK, AdbController, AdbError
 from security.action_validator import validate
@@ -29,6 +30,9 @@ LOW_RPD_WARNING_THRESHOLD = 30
 # Cap consecutive synthetic waits emitted by dedup. After this many in a row,
 # fall through to a real provider call so a frozen UI eventually gets noticed.
 MAX_CONSECUTIVE_SYNTHETIC_WAITS = 3
+# After this many loop-detected events in a single task we give up — the model
+# isn't going to escape on its own. Hard-fail with a clear reason.
+MAX_LOOPS_BEFORE_ABORT = 4
 # Outcome-verification: if the screen doesn't change after this many state-
 # changing actions in a row, try a back-button recovery, then give up.
 UNCHANGED_STREAK_RECOVERY = 2
@@ -60,6 +64,7 @@ class Orchestrator:
         users: UserStore | None = None,
         skills: SkillRegistry | None = None,
         repo: TaskRepository | None = None,
+        enable_vision_hitl: bool = False,
     ) -> None:
         self._adb = adb
         self._hitl = hitl
@@ -69,6 +74,7 @@ class Orchestrator:
         self._users = users
         self._skills = skills
         self._repo = repo
+        self._enable_vision_hitl = enable_vision_hitl
         self.on_approval_request: Optional[ApprovalCallback] = None
         self.on_status_update: Optional[StatusCallback] = None
         self._tasks: dict[int, Task] = {}
@@ -78,6 +84,7 @@ class Orchestrator:
         self._last_phash: str | None = None
         self._consecutive_synthetic_waits: int = 0
         self._unchanged_streak: int = 0
+        self._loops_detected: int = 0
         self._current_task_db_id: int | None = None
 
     def get_task(self, user_id: int) -> Task | None:
@@ -95,6 +102,7 @@ class Orchestrator:
         self._last_phash = None
         self._consecutive_synthetic_waits = 0
         self._unchanged_streak = 0
+        self._loops_detected = 0
         self._current_task_db_id = None
         task.state = TaskState.RUNNING
         await self._persist_insert(task)
@@ -153,12 +161,27 @@ class Orchestrator:
             else:
                 self._consecutive_synthetic_waits = 0
                 skill_hint = await self._lookup_skill()
+                ui_tree = await self._lookup_ui_tree()
+                loop_hint = self._loop_hint(task)
+                if loop_hint:
+                    self._audit.log_action(
+                        task.user_id, task.description, {"action": "loop_hint"},
+                        f"INJECTED: {loop_hint}",
+                    )
+                    if self._loops_detected >= MAX_LOOPS_BEFORE_ABORT:
+                        raise OrchestratorError(
+                            f"stuck: detected {self._loops_detected} action loops; "
+                            "the model isn't escaping. Aborting."
+                        )
                 response = await self._vision.get_next_action(
                     screenshot_bytes=screenshot,
-                    task_description=task.description,
+                    task_description=(
+                        f"{task.description}\n\n{loop_hint}" if loop_hint else task.description
+                    ),
                     step_history=task.history,
                     screen_size=screen_size,
                     skill_hint=skill_hint,
+                    ui_tree=ui_tree,
                 )
                 action = response.action
                 self._record_usage(task, response.usage)
@@ -197,7 +220,13 @@ class Orchestrator:
                 task.user_id, task.description, action, f"RESULT: {result}"
             )
             await self._persist_step(task, action, result)
-            await self._step_status(task, f"step {task.step_count}: {result}")
+            note = str(action.get("note", "")).strip()
+            status_msg = (
+                f"step {task.step_count}: {result} — {note}"
+                if note
+                else f"step {task.step_count}: {result}"
+            )
+            await self._step_status(task, status_msg)
 
             # Outcome verification is meaningful only for state-changing
             # actions. A wait (real or synthetic) doesn't reset the streak —
@@ -236,6 +265,61 @@ class Orchestrator:
             return None
         return self._skills.get(pkg)
 
+    async def _lookup_ui_tree(self) -> str | None:
+        """Fetch the on-screen accessibility tree as a model-friendly text
+        block. Returns None on any failure — the model can still operate on
+        the screenshot alone, just less precisely.
+        """
+        try:
+            xml = await self._adb.dump_ui_xml()
+        except Exception:
+            return None
+        if not xml:
+            return None
+        rendered = ui_tree_to_prompt(xml)
+        return rendered or None
+
+    def _loop_hint(self, task: Task) -> str:
+        """Detect repeated-action and cycle patterns; return a hint or ''.
+
+        Recognised shapes (looking only at state-changing actions in history):
+          - A-A          : last two actions identical
+          - A-B-A-B      : last four actions form a two-step cycle
+        Either pattern increments self._loops_detected; the caller hard-aborts
+        when that crosses MAX_LOOPS_BEFORE_ABORT.
+        """
+        recent_state_changing = [
+            h.get("action", {})
+            for h in task.history
+            if isinstance(h.get("action"), dict)
+            and h["action"].get("action") in _STATE_CHANGING
+        ]
+        if len(recent_state_changing) < 2:
+            return ""
+
+        last_two = recent_state_changing[-2:]
+        last_four = recent_state_changing[-4:]
+
+        is_aa = _actions_equivalent(last_two[0], last_two[1])
+        is_abab = (
+            len(last_four) == 4
+            and _actions_equivalent(last_four[0], last_four[2])
+            and _actions_equivalent(last_four[1], last_four[3])
+            and not _actions_equivalent(last_four[0], last_four[1])
+        )
+
+        if not (is_aa or is_abab):
+            return ""
+
+        self._loops_detected += 1
+        shape = "identical" if is_aa else "alternating A↔B cycle"
+        return (
+            f"NOTE: Your last actions form an {shape} pattern that isn't "
+            "advancing the screen. STOP this loop — pick a DIFFERENT element "
+            "from the UI list, scroll to surface new options, or emit "
+            "`need_approval` if you're genuinely stuck."
+        )
+
     # ------------------------------------------------------------------
     # HITL gate (keyword + vision)
 
@@ -266,7 +350,8 @@ class Orchestrator:
         # for state-changing actions on the standard policy — terminal actions
         # and read_only / always_approve users are already handled above.
         if (
-            not needs_approval
+            self._enable_vision_hitl
+            and not needs_approval
             and policy == "confirm_sensitive"
             and action.get("action") in _STATE_CHANGING
             and screenshot_phash is not None
@@ -424,6 +509,29 @@ class Orchestrator:
             )
         except Exception:
             pass
+
+
+def _actions_equivalent(a: dict, b: dict) -> bool:
+    """True if two actions are 'the same effective gesture'.
+
+    For tap/swipe we compare coords (with a tiny tolerance — pixel-perfect
+    repeats are rare so any few-pixel jitter still counts as a loop). For
+    type we compare the text. Anything else compares by action type only.
+    """
+    if a.get("action") != b.get("action"):
+        return False
+    t = a.get("action")
+    if t == "tap":
+        return abs(int(a.get("x", 0)) - int(b.get("x", 0))) <= 5 \
+            and abs(int(a.get("y", 0)) - int(b.get("y", 0))) <= 5
+    if t == "type":
+        return str(a.get("text", "")) == str(b.get("text", ""))
+    if t == "swipe":
+        return all(
+            abs(int(a.get(k, 0)) - int(b.get(k, 0))) <= 5
+            for k in ("x1", "y1", "x2", "y2")
+        )
+    return True
 
 
 def _safe_phash(image_bytes: bytes) -> str | None:
