@@ -22,6 +22,10 @@ async def execute(action: dict, adb: AdbController) -> str:
     if action_type == "type":
         text = str(action["text"])
         await adb.type_text(text)
+        # Automatically send ENTER to dismiss the keyboard and commit searches.
+        # This prevents the keyboard from obscuring the UI for the next vision call.
+        await asyncio.sleep(0.5)
+        await adb.key_event(66) # KEYCODE_ENTER
         return f"typed {len(text)} char(s)"
 
     if action_type == "swipe":

@@ -561,6 +561,567 @@ class TestLoopDetection:
         assert task.state is TaskState.FAILED
         assert "stuck" in (task.failure_reason or "").lower()
 
+    async def test_need_approval_after_loop_hint_hard_terminates(
+        self, audit: AuditLogger
+    ) -> None:
+        """If the model emits need_approval within LOOP_TO_GIVEUP_WINDOW steps
+        of a loop hint being injected, the orchestrator must abort rather than
+        pausing for human rescue — the model is using approval as an escape."""
+        same_tap = {"action": "tap", "x": 100, "y": 200}
+        vision = _ScriptedVision(
+            [
+                (same_tap, _usage()),
+                # Second identical tap triggers loop hint.
+                (same_tap, _usage()),
+                # Model tries to escape via need_approval on the next step.
+                ({"action": "need_approval", "reason": "stuck"}, _usage()),
+            ]
+        )
+        adb = _FakeAdb()
+        hitl = HitlGate()
+        approvals: list[dict] = []
+
+        async def on_approval(_task: Task, action: dict) -> None:
+            approvals.append(action)
+            hitl.grant(_task.user_id)
+
+        orch = Orchestrator(adb, hitl, audit, vision, session_timeout_seconds=10)
+        orch.on_approval_request = on_approval
+        task = Task(user_id=1, description="t")
+        await orch.run_task(task)
+
+        assert task.state is TaskState.FAILED
+        assert "loop" in (task.failure_reason or "").lower()
+        # Must NOT have paused for approval.
+        assert approvals == []
+
+    async def test_need_approval_outside_window_still_works(
+        self, audit: AuditLogger
+    ) -> None:
+        """A genuine need_approval far from any loop hint must still pause
+        normally — the guard only fires within the LOOP_TO_GIVEUP_WINDOW."""
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 10, "y": 20}, _usage()),
+                # No loop — only one action so far. Next is need_approval.
+                ({"action": "need_approval", "reason": "payment screen"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        adb = _FakeAdb()
+        hitl = HitlGate()
+        approvals: list[dict] = []
+
+        async def on_approval(_task: Task, action: dict) -> None:
+            approvals.append(action)
+            # Defer grant so wait_for_approval registers its event first.
+            async def _deferred_grant():
+                await asyncio.sleep(0)
+                hitl.grant(_task.user_id)
+            asyncio.ensure_future(_deferred_grant())
+
+        orch = Orchestrator(adb, hitl, audit, vision, session_timeout_seconds=10)
+        orch.on_approval_request = on_approval
+        task = Task(user_id=1, description="t")
+        await orch.run_task(task)
+
+        assert task.state is TaskState.DONE
+        # Approval should have fired normally.
+        assert len(approvals) == 1
+
+
+class TestCoordEnforcement:
+    async def test_rejects_tap_outside_any_element(
+        self, audit: AuditLogger
+    ) -> None:
+        """Model emits a tap at coords that don't fall on any tree element.
+        Orchestrator must reject (not execute), append a hint to history,
+        and let the model retry with corrected coords on the next call.
+        """
+        # First action: bad coords. Second action: done. The bad tap must
+        # NOT actually fire on the adb fake.
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 9999, "y": 9999,
+                  "note": "tap a thing that doesn't exist"}, _usage()),
+                ({"action": "done", "summary": "stop"}, _usage()),
+            ]
+        )
+
+        class _AdbWithTree(_FakeAdb):
+            async def dump_ui_xml(self) -> str | None:
+                return (
+                    "<hierarchy rotation='0'>"
+                    '<node text="Search" class="android.widget.EditText" '
+                    'bounds="[10,100][500,200]" clickable="true" />'
+                    "</hierarchy>"
+                )
+
+        adb = _AdbWithTree()
+        orch = Orchestrator(adb, HitlGate(), audit, vision, session_timeout_seconds=10)
+        task = Task(user_id=1, description="t")
+        await orch.run_task(task)
+
+        # The bad tap was rejected → never tapped.
+        assert adb.taps == []
+        # History should show the rejection hint somewhere.
+        assert any(
+            "REJECTED" in str(h.get("result", ""))
+            for h in task.history
+        )
+        assert task.state is TaskState.DONE
+
+
+class TestIntentMismatch:
+    """The orchestrator must reject taps whose `note` describes one element
+    type while the coord lands on a different type. The exact scenario from
+    the Blinkit run-3 log: model tapped (517, 200) labelled 'tap search bar'
+    but (517, 200) is the [LOCATION] delivery header on Blinkit's home."""
+
+    async def test_search_intent_on_location_header_rejected(
+        self, audit: AuditLogger
+    ) -> None:
+        # UI tree with two clickable elements at the top of the screen:
+        #   - LOCATION header at y=200 (matches the misclick coords)
+        #   - real search bar at y=340 (EditText)
+        # The model taps the location with a "search bar" note → REJECT.
+        xml = (
+            "<hierarchy rotation='0'>"
+            '<node text="Delivering to Home · 8 mins" '
+            'resource-id="com.grofers.customerapp:id/location_header" '
+            'class="android.widget.TextView" '
+            'bounds="[0,100][1080,280]" clickable="true" />'
+            '<node text="Search for atta, butter…" '
+            'resource-id="com.grofers.customerapp:id/search_box" '
+            'class="android.widget.EditText" '
+            'bounds="[40,300][1040,400]" clickable="true" />'
+            "</hierarchy>"
+        )
+
+        class _AdbWithTree(_FakeAdb):
+            async def dump_ui_xml(self) -> str | None:
+                return xml
+
+        vision = _ScriptedVision(
+            [
+                # The exact misclick from the production log.
+                ({"action": "tap", "x": 517, "y": 200,
+                  "note": "tap search bar"}, _usage()),
+                # After rejection, retry on the real search element.
+                ({"action": "tap", "x": 540, "y": 350,
+                  "note": "tap search EditText"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        adb = _AdbWithTree()
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10
+        )
+        task = Task(user_id=1, description="search for maggi")
+        await orch.run_task(task)
+
+        # The bad tap on the location header was rejected → never executed.
+        # Only the corrected tap on the real search element fired.
+        assert adb.taps == [(540, 350)]
+        assert task.state is TaskState.DONE
+        # History must record the intent-mismatch hint.
+        assert any(
+            "[LOCATION]" in str(h.get("result", ""))
+            and "REJECTED" in str(h.get("result", ""))
+            for h in task.history
+        )
+
+    async def test_address_intent_on_location_header_allowed(
+        self, audit: AuditLogger
+    ) -> None:
+        """If the note mentions address/location/delivery, tapping the
+        [LOCATION] header is the right move and must not be rejected."""
+        xml = (
+            "<hierarchy rotation='0'>"
+            '<node text="Delivering to Home · 8 mins" '
+            'resource-id="com.grofers.customerapp:id/location_header" '
+            'class="android.widget.TextView" '
+            'bounds="[0,100][1080,280]" clickable="true" />'
+            "</hierarchy>"
+        )
+
+        class _AdbWithTree(_FakeAdb):
+            async def dump_ui_xml(self) -> str | None:
+                return xml
+
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 540, "y": 200,
+                  "note": "tap delivery address header to change location"},
+                 _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        adb = _AdbWithTree()
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10
+        )
+        task = Task(user_id=1, description="change my delivery address")
+        await orch.run_task(task)
+
+        # Address-intent tap on the location header is legitimate.
+        assert adb.taps == [(540, 200)]
+        assert task.state is TaskState.DONE
+
+    async def test_add_intent_on_non_action_rejected(
+        self, audit: AuditLogger
+    ) -> None:
+        """The note says 'tap ADD on …' but the coord lands on a category
+        tile, not an [ACTION] element — reject."""
+        xml = (
+            "<hierarchy rotation='0'>"
+            # A category tile, clickable, no ADD button anywhere on screen.
+            '<node text="Maggi N Maggi House" '
+            'resource-id="com.grofers.customerapp:id/category_tile" '
+            'class="android.widget.TextView" '
+            'bounds="[40,600][520,900]" clickable="true" />'
+            "</hierarchy>"
+        )
+
+        class _AdbWithTree(_FakeAdb):
+            async def dump_ui_xml(self) -> str | None:
+                return xml
+
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 280, "y": 750,
+                  "note": "tap ADD on Maggi 2 Minute Masala Noodles"},
+                 _usage()),
+                # After rejection, model scrolls.
+                ({"action": "swipe", "x1": 540, "y1": 1600,
+                  "x2": 540, "y2": 800, "duration_ms": 300,
+                  "note": "scroll to find products"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        adb = _AdbWithTree()
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10
+        )
+        task = Task(user_id=1, description="add maggi to cart")
+        await orch.run_task(task)
+
+        # The bogus ADD tap never executed.
+        assert adb.taps == []
+        assert task.state is TaskState.DONE
+        assert any(
+            "ADD" in str(h.get("result", "")) and "REJECTED" in str(h.get("result", ""))
+            for h in task.history
+        )
+
+    async def test_add_intent_on_action_element_passes(
+        self, audit: AuditLogger
+    ) -> None:
+        """The note says 'tap ADD' and the coord IS on an [ACTION] element
+        (Button with text 'ADD') — no rejection."""
+        xml = (
+            "<hierarchy rotation='0'>"
+            # A real ADD button — text 'ADD' triggers is_action via the
+            # text-token allowlist.
+            '<node text="ADD" '
+            'resource-id="com.grofers.customerapp:id/add_to_cart" '
+            'class="android.widget.Button" '
+            'bounds="[820,720][1000,820]" clickable="true" />'
+            "</hierarchy>"
+        )
+
+        class _AdbWithTree(_FakeAdb):
+            async def dump_ui_xml(self) -> str | None:
+                return xml
+
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 910, "y": 770,
+                  "note": "tap ADD on Maggi 2 Minute Masala Noodles"},
+                 _usage()),
+                ({"action": "done", "summary": "added"}, _usage()),
+            ]
+        )
+        adb = _AdbWithTree()
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10
+        )
+        task = Task(user_id=1, description="add maggi to cart")
+        await orch.run_task(task)
+
+        assert adb.taps == [(910, 770)]
+        assert task.state is TaskState.DONE
+
+    async def test_search_tap_on_real_search_bar_passes(
+        self, audit: AuditLogger
+    ) -> None:
+        """Sanity: tap with a search-bar note that lands on an EditText
+        (not a LOCATION header) is honored."""
+        xml = (
+            "<hierarchy rotation='0'>"
+            '<node text="Search for atta, butter…" '
+            'resource-id="com.grofers.customerapp:id/search_box" '
+            'class="android.widget.EditText" '
+            'bounds="[40,300][1040,400]" clickable="true" />'
+            "</hierarchy>"
+        )
+
+        class _AdbWithTree(_FakeAdb):
+            async def dump_ui_xml(self) -> str | None:
+                return xml
+
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 540, "y": 350,
+                  "note": "tap search bar"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        adb = _AdbWithTree()
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10
+        )
+        task = Task(user_id=1, description="search for maggi")
+        await orch.run_task(task)
+
+        assert adb.taps == [(540, 350)]
+        assert task.state is TaskState.DONE
+
+
+class TestGiveupRejection:
+    async def test_no_products_found_before_scroll_is_rejected(
+        self, audit: AuditLogger
+    ) -> None:
+        """The model emits need_approval with a 'no products found' reason
+        without having scrolled. The orchestrator must reject, inject a
+        scroll hint, and let the model recover — not pause for the user."""
+        approvals: list[dict] = []
+
+        async def on_approval(_task: Task, action: dict) -> None:
+            approvals.append(action)
+
+        vision = _ScriptedVision(
+            [
+                # First call: model immediately bails after typing.
+                (
+                    {"action": "need_approval",
+                     "reason": "no Maggi products found for 'maggi'"},
+                    _usage(),
+                ),
+                # After our rejection injects the scroll hint, the model
+                # actually scrolls.
+                (
+                    {"action": "swipe", "x1": 540, "y1": 1600,
+                     "x2": 540, "y2": 800, "duration_ms": 300,
+                     "note": "scroll to find products"},
+                    _usage(),
+                ),
+                ({"action": "done", "summary": "found products"}, _usage()),
+            ]
+        )
+        adb = _FakeAdb()
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10
+        )
+        orch.on_approval_request = on_approval
+
+        task = Task(user_id=1, description="add maggi to cart")
+        await orch.run_task(task)
+
+        # The need_approval must NOT have been forwarded to the user.
+        assert approvals == []
+        # And the task must end DONE — the scroll path succeeded.
+        assert task.state is TaskState.DONE
+        # History should record the rejection hint.
+        assert any(
+            "REJECTED need_approval" in str(h.get("result", ""))
+            for h in task.history
+        )
+
+    async def test_giveup_with_after_scrolling_suffix_still_rejected(
+        self, audit: AuditLogger
+    ) -> None:
+        """The 'after scrolling' textual suffix is NOT a valid bypass —
+        earlier versions accepted it, but the model learned to lie. Only
+        an executed swipe in history counts. The fake suffix should still
+        get rejected if no actual swipe happened."""
+        approvals: list[dict] = []
+        hitl = HitlGate()
+
+        async def on_approval(_task: Task, action: dict) -> None:
+            approvals.append(action)
+
+        vision = _ScriptedVision(
+            [
+                # Model fakes the suffix without actually swiping.
+                (
+                    {"action": "need_approval",
+                     "reason": "no Maggi products found for 'maggi' after scrolling"},
+                    _usage(),
+                ),
+                # After rejection, model emits a real swipe.
+                (
+                    {"action": "swipe", "x1": 540, "y1": 1600,
+                     "x2": 540, "y2": 800, "duration_ms": 300},
+                    _usage(),
+                ),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        adb = _FakeAdb()
+        orch = Orchestrator(
+            adb, hitl, audit, vision, session_timeout_seconds=10
+        )
+        orch.on_approval_request = on_approval
+
+        task = Task(user_id=1, description="add maggi to cart")
+        await orch.run_task(task)
+
+        # The lying need_approval did NOT reach the user.
+        assert approvals == []
+        assert task.state is TaskState.DONE
+        # And the rejection hint must mention the structural reason.
+        assert any(
+            "REJECTED need_approval" in str(h.get("result", ""))
+            for h in task.history
+        )
+
+    async def test_giveup_immediately_after_add_tap_is_rejected(
+        self, audit: AuditLogger
+    ) -> None:
+        """If the most recent tap had 'ADD' in its note, a 'no products
+        found' need_approval right after it is contradictory and must be
+        rejected — even if the model has executed swipes earlier."""
+        approvals: list[dict] = []
+        hitl = HitlGate()
+
+        async def on_approval(_task: Task, action: dict) -> None:
+            approvals.append(action)
+
+        vision = _ScriptedVision(
+            [
+                # Step 1: scroll (so history has a swipe — proves the
+                # contradiction check fires independently of scroll status).
+                (
+                    {"action": "swipe", "x1": 540, "y1": 1600,
+                     "x2": 540, "y2": 800, "duration_ms": 300},
+                    _usage(),
+                ),
+                # Step 2: tap ADD on a product.
+                (
+                    {"action": "tap", "x": 880, "y": 794,
+                     "note": "tap ADD on Maggi 2 Minute Masala Noodles"},
+                    _usage(),
+                ),
+                # Step 3: contradictory bail-out — must be rejected.
+                (
+                    {"action": "need_approval",
+                     "reason": "no Maggi products found for 'maggi'"},
+                    _usage(),
+                ),
+                # Step 4: model recovers — navigates to cart.
+                ({"action": "done", "summary": "in cart"}, _usage()),
+            ]
+        )
+        adb = _FakeAdb()
+        orch = Orchestrator(
+            adb, hitl, audit, vision, session_timeout_seconds=10
+        )
+        orch.on_approval_request = on_approval
+
+        task = Task(user_id=1, description="add maggi to cart")
+        await orch.run_task(task)
+
+        # The contradictory need_approval was rejected, never reached user.
+        assert approvals == []
+        assert task.state is TaskState.DONE
+        assert any(
+            "contradictory" in str(h.get("result", "")).lower()
+            or "REJECTED need_approval" in str(h.get("result", ""))
+            for h in task.history
+        )
+
+    async def test_giveup_after_actual_swipe_passes_through(
+        self, audit: AuditLogger
+    ) -> None:
+        """If the task history already contains an executed swipe, the
+        model has earned the right to give up — no rejection."""
+        approvals: list[dict] = []
+        hitl = HitlGate()
+
+        async def on_approval(_task: Task, action: dict) -> None:
+            approvals.append(action)
+            async def _deferred():
+                await asyncio.sleep(0)
+                hitl.deny(_task.user_id)
+            asyncio.ensure_future(_deferred())
+
+        vision = _ScriptedVision(
+            [
+                # Step 1: model swipes to scroll the list.
+                (
+                    {"action": "swipe", "x1": 540, "y1": 1600,
+                     "x2": 540, "y2": 800, "duration_ms": 300},
+                    _usage(),
+                ),
+                # Step 2: still no products — bails. Should be honored
+                # because the history shows a real swipe happened.
+                (
+                    {"action": "need_approval",
+                     "reason": "no Maggi products found for 'maggi'"},
+                    _usage(),
+                ),
+            ]
+        )
+        adb = _FakeAdb()
+        orch = Orchestrator(
+            adb, hitl, audit, vision, session_timeout_seconds=10
+        )
+        orch.on_approval_request = on_approval
+
+        task = Task(user_id=1, description="add maggi to cart")
+        await orch.run_task(task)
+
+        assert len(approvals) == 1
+        assert task.state is TaskState.FAILED
+
+    async def test_unrelated_need_approval_unaffected(
+        self, audit: AuditLogger
+    ) -> None:
+        """Cart-review / payment need_approval (no 'no products' phrase)
+        must NOT trip the giveup check."""
+        approvals: list[dict] = []
+        hitl = HitlGate()
+
+        async def on_approval(_task: Task, action: dict) -> None:
+            approvals.append(action)
+            async def _deferred():
+                await asyncio.sleep(0)
+                hitl.grant(_task.user_id)
+            asyncio.ensure_future(_deferred())
+
+        vision = _ScriptedVision(
+            [
+                (
+                    {"action": "need_approval",
+                     "reason": "Cart review: 1x Maggi 70g · Total: ₹14"},
+                    _usage(),
+                ),
+                ({"action": "done", "summary": "approved"}, _usage()),
+            ]
+        )
+        adb = _FakeAdb()
+        orch = Orchestrator(
+            adb, hitl, audit, vision, session_timeout_seconds=10
+        )
+        orch.on_approval_request = on_approval
+
+        task = Task(user_id=1, description="add maggi to cart")
+        await orch.run_task(task)
+
+        assert len(approvals) == 1
+        assert task.state is TaskState.DONE
+
 
 class TestActionNarration:
     async def test_note_field_appears_in_status(

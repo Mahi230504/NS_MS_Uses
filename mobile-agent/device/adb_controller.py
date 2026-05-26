@@ -3,10 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import re
 
 from device.base import DeviceError
 
+
+_log = logging.getLogger("mobile_agent.adb")
+
+# Per-call adb timeout. Real-world adb commands finish in <2s on a healthy
+# device; if one is still pending after 25s we assume the daemon, USB link,
+# or device is stuck and bail rather than freezing the whole agent loop for
+# the full session timeout. The orchestrator catches AdbError and retries.
+_ADB_CALL_TIMEOUT_SECONDS = 25.0
 
 _WM_SIZE_RE = re.compile(r"(\d+)x(\d+)")
 # Special shell metacharacters that `adb shell input text` and the surrounding
@@ -37,7 +46,7 @@ class AdbController:
     def get_device_id(self) -> str:
         return self._device_id
 
-    async def _run(self, *args: str) -> bytes:
+    async def _run(self, *args: str, timeout: float = _ADB_CALL_TIMEOUT_SECONDS) -> bytes:
         try:
             proc = await asyncio.create_subprocess_exec(
                 "adb",
@@ -51,7 +60,23 @@ class AdbController:
             raise AdbError(
                 "`adb` not found on PATH. Install Android platform-tools and retry."
             )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            # Subprocess is still alive — terminate it so we don't leak a
+            # zombie adb process. SIGTERM first, then SIGKILL if it ignores.
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+            _log.warning("adb %s timed out after %.0fs", " ".join(args), timeout)
+            raise AdbError(
+                f"adb {' '.join(args)} timed out after {timeout:.0f}s "
+                "(device may be sleeping, USB unstable, or daemon stuck)"
+            )
         if proc.returncode != 0:
             err = stderr.decode("utf-8", errors="replace").strip()
             raise AdbError(

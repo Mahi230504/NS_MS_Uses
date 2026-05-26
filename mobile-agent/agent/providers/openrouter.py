@@ -92,6 +92,35 @@ class OpenRouterProvider:
         action, usage = await self._call(messages, MAX_OUTPUT_TOKENS, require_json=True)
         return ProviderResponse(action=action, usage=usage)
 
+    async def complete_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 200,
+    ) -> str:
+        """Text-only completion. Used by the bot's intent router.
+
+        Returns the model's raw reply (stripped). No image, no JSON forcing
+        unless the caller requested it via system_prompt — keeps the surface
+        narrow and reusable for routing, summarisation, etc.
+        """
+        rpm_remaining, rpd_remaining = await self._throttle.acquire()
+        try:
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=max_tokens,
+                temperature=0.0,
+            )
+        except RateLimitError as e:
+            raise QuotaExceeded(f"OpenRouter quota exhausted: {e}") from e
+        except APIError as e:
+            raise ProviderError(f"complete_text failed: {e}") from e
+        return (response.choices[0].message.content or "").strip()
+
     async def classify_yes_no(
         self, screenshot_bytes: bytes, question: str
     ) -> bool:

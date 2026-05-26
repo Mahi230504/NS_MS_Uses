@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
+import re
 import time
 from typing import Awaitable, Callable, Optional
+
+_log = logging.getLogger("mobile_agent.orchestrator")
 
 from agent.action_executor import execute as execute_action
 from agent.persistence import TaskRepository
@@ -12,7 +16,13 @@ from agent.phash import compute as compute_phash
 from agent.providers.base import VisionProvider
 from agent.skills import SkillRegistry
 from agent.state_machine import Task, TaskState
-from agent.ui_tree import to_prompt_section as ui_tree_to_prompt
+from agent.ui_tree import (
+    UiElement,
+    find_smallest_element_at,
+    is_coord_in_elements,
+    parse as ui_tree_parse,
+    to_prompt_section as ui_tree_to_prompt,
+)
 from bot.users import UserStore
 from device.adb_controller import KEYCODE_BACK, AdbController, AdbError
 from security.action_validator import validate
@@ -24,6 +34,53 @@ MAX_LOOP_ITERATIONS = 30
 # Minimum gap between mid-loop step status messages sent to Telegram. Lifecycle
 # messages (starting / done / failed / timeout) bypass this throttle.
 STEP_STATUS_MIN_INTERVAL_SECONDS = 2.0
+# Regexes for the "model gives up" need_approval reasons. The orchestrator
+# treats matching reasons as an illegal escape (rule 10 in the system prompt)
+# and rejects them unless the task history shows the model actually scrolled.
+# Each pattern is matched case-insensitively against the reason string.
+# Note: there is NO textual "after scrolling" bypass — earlier versions of
+# this guard accepted that suffix as proof of scrolling, but the model
+# learned to append it without actually scrolling. Only an executed swipe in
+# task.history counts.
+_GIVEUP_PATTERNS = (
+    # "no <anything> products found" / "no products found" / "no Maggi found"
+    re.compile(r"\bno\b[^.]{0,40}\b(products?|results?|items?|matches?)\b", re.IGNORECASE),
+    re.compile(r"\bno\s+\w+\s+found\b", re.IGNORECASE),  # "no Maggi found"
+    re.compile(r"\bcouldn'?t\s+find\b", re.IGNORECASE),
+    re.compile(r"\bcould\s+not\s+find\b", re.IGNORECASE),
+    re.compile(r"\bnothing\s+(found|matches?|matching)\b", re.IGNORECASE),
+    re.compile(r"\bnot\s+available\b", re.IGNORECASE),
+)
+# Tokens that indicate the most recent tap was supposed to add a product to
+# the cart. If the model claims that, then immediately emits a giveup-style
+# need_approval, the two statements are contradictory — block the escape.
+_ADD_TAP_NOTE_RE = re.compile(
+    r"\b(add\s+to\s+cart|tap\s+add|ADD\b|\+\s|qty|quantity|increment|buy\s+now)",
+    re.IGNORECASE,
+)
+# Intent regexes for the intent-vs-element check. They scan the tap's `note`
+# field to infer what the model THINKS it's tapping, then we cross-check
+# against the actual element under the coord.
+#
+# Search intent: the note mentions a search bar / box / input / field — but
+# NOT an address/location word, because some apps overlap (e.g. "search for
+# an address" is a legitimate location-picker action).
+_SEARCH_INTENT_RE = re.compile(
+    r"\b(search\s+(bar|box|input|field|icon)|search\s+for|search\s+the)\b",
+    re.IGNORECASE,
+)
+_ADDRESS_INTENT_RE = re.compile(
+    r"\b(address|location|deliver(?:y|ing)?\s|pin\s?code|change\s+pin)\b",
+    re.IGNORECASE,
+)
+# ADD/cart intent: the model claims the tap is adding to cart, incrementing
+# quantity, or starting checkout. The target MUST be an [ACTION] element.
+_ADD_INTENT_RE = re.compile(
+    r"\b(tap\s+add|press\s+add|add\s+to\s+cart|add\s+button|"
+    r"\+\s?button|plus\s+button|increment|qty|quantity\s+(\+|plus)|"
+    r"checkout|place\s+order|proceed\s+to|buy\s+now|pay\s+now)\b",
+    re.IGNORECASE,
+)
 # When the provider reports fewer than this many requests left for the day,
 # warn the user so they aren't surprised by a QuotaExceeded mid-task.
 LOW_RPD_WARNING_THRESHOLD = 30
@@ -37,6 +94,11 @@ MAX_LOOPS_BEFORE_ABORT = 4
 # changing actions in a row, try a back-button recovery, then give up.
 UNCHANGED_STREAK_RECOVERY = 2
 UNCHANGED_STREAK_FAIL = 3
+# If the model emits `need_approval` within this many steps of a loop_hint
+# being injected, treat the approval as a giveup and hard-terminate. The
+# user wants stuck-loops to fail fast, not pause for human rescue. Genuine
+# cart-review approvals happen on clean flows where no loop was detected.
+LOOP_TO_GIVEUP_WINDOW = 3
 # Retry policy for ADB action execution. Index = retry attempt (0..n).
 RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
 # Action types whose effect we verify with a follow-up screencap.
@@ -85,6 +147,7 @@ class Orchestrator:
         self._consecutive_synthetic_waits: int = 0
         self._unchanged_streak: int = 0
         self._loops_detected: int = 0
+        self._last_loop_step: int = -1
         self._current_task_db_id: int | None = None
 
     def get_task(self, user_id: int) -> Task | None:
@@ -103,6 +166,7 @@ class Orchestrator:
         self._consecutive_synthetic_waits = 0
         self._unchanged_streak = 0
         self._loops_detected = 0
+        self._last_loop_step = -1
         self._current_task_db_id = None
         task.state = TaskState.RUNNING
         await self._persist_insert(task)
@@ -131,10 +195,12 @@ class Orchestrator:
         except asyncio.TimeoutError:
             task.state = TaskState.TIMED_OUT
             task.failure_reason = f"task exceeded {self._timeout}s session timeout"
+            _log.warning("task %d %s", task.user_id, task.failure_reason)
             await self._status(task, task.failure_reason)
         except OrchestratorError as e:
             task.state = TaskState.FAILED
             task.failure_reason = str(e)
+            _log.warning("task %d failed: %s", task.user_id, e)
             await self._status(task, f"failed: {e}")
         except asyncio.CancelledError:
             task.state = TaskState.FAILED
@@ -145,6 +211,9 @@ class Orchestrator:
         except Exception as e:
             task.state = TaskState.FAILED
             task.failure_reason = f"unexpected error: {e}"
+            # exc_info gives us the full traceback in stdout — previous
+            # behaviour was a one-line "unexpected error" in Telegram only.
+            _log.exception("task %d unexpected error", task.user_id)
             await self._status(task, task.failure_reason)
         finally:
             # Restore the user's original IME if we swapped for the task.
@@ -161,10 +230,20 @@ class Orchestrator:
 
         for _ in range(MAX_LOOP_ITERATIONS):
             task.step_count += 1
+            _log.info("step %d: begin", task.step_count)
 
+            _log.info("step %d: screencap", task.step_count)
             screenshot = await self._adb.screencap()
             screenshot_b64 = base64.standard_b64encode(screenshot).decode("ascii")
             current_phash = _safe_phash(screenshot)
+
+            # The UI tree is fetched once per iteration. We use it for two
+            # purposes: (1) inject into the model prompt for accurate
+            # coordinates, (2) validate the model's tap/swipe coords against
+            # known element bounds to reject hallucinated coords. Both
+            # branches below need access to `ui_elements` for the validation.
+            ui_tree: str | None = None
+            ui_elements: list[UiElement] = []
 
             # Dedup: if the screen is visually identical to what the model
             # last saw and we already took at least one action, skip the
@@ -176,8 +255,9 @@ class Orchestrator:
                 self._consecutive_synthetic_waits += 1
             else:
                 self._consecutive_synthetic_waits = 0
+                _log.info("step %d: skill+ui_tree", task.step_count)
                 skill_hint = await self._lookup_skill()
-                ui_tree = await self._lookup_ui_tree()
+                ui_tree, ui_elements = await self._lookup_ui_tree()
                 loop_hint = self._loop_hint(task)
                 if loop_hint:
                     self._audit.log_action(
@@ -189,6 +269,7 @@ class Orchestrator:
                             f"stuck: detected {self._loops_detected} action loops; "
                             "the model isn't escaping. Aborting."
                         )
+                _log.info("step %d: vision call", task.step_count)
                 response = await self._vision.get_next_action(
                     screenshot_bytes=screenshot,
                     task_description=(
@@ -200,6 +281,10 @@ class Orchestrator:
                     ui_tree=ui_tree,
                 )
                 action = response.action
+                _log.info(
+                    "step %d: vision returned %s",
+                    task.step_count, action.get("action"),
+                )
                 self._record_usage(task, response.usage)
                 await self._maybe_warn_low_rpd(task)
                 # `_last_phash` records the screen the MODEL last saw. Update
@@ -214,12 +299,92 @@ class Orchestrator:
                 )
                 raise OrchestratorError(f"action validation failed: {reason}")
 
+            # Coord grounding: tap/swipe coords must map to some element in
+            # the UI tree (with a 20px forgiveness margin). If they don't,
+            # the model is hallucinating "tap on X" at coords that don't
+            # actually point to X. Reject the action, hint the model, retry
+            # next iteration.
+            mismatch = self._coords_mismatch(action, ui_elements)
+            if mismatch is not None:
+                hint = (
+                    f"REJECTED: {mismatch}. Pick coords from the UI elements "
+                    "listing — never invent or estimate coordinates."
+                )
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action, "COORD_REJECTED"
+                )
+                await self._step_status(
+                    task, f"step {task.step_count}: coords rejected, retrying"
+                )
+                # Don't let dedup short-circuit the next iteration — we need a
+                # fresh model call so it sees the rejection and adjusts.
+                self._last_phash = None
+                continue
+
+            # Intent-vs-element check: the coord lands SOMEWHERE in the tree
+            # (passed coord grounding) but on the WRONG kind of element for
+            # what the note says. Catches the search-bar-vs-location-header
+            # misclick and ADD-on-non-action hallucinations.
+            intent_problem = self._intent_mismatch(action, ui_elements)
+            if intent_problem is not None:
+                hint = (
+                    f"REJECTED: {intent_problem}. Pick a different element "
+                    "whose type matches your stated intent."
+                )
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "INTENT_MISMATCH_REJECTED",
+                )
+                await self._step_status(
+                    task,
+                    f"step {task.step_count}: intent/element mismatch, retrying",
+                )
+                self._last_phash = None
+                continue
+
+            # Giveup rejection: model emits need_approval with a "no products
+            # found"-style reason before having actually scrolled, OR while
+            # contradicting a recent ADD tap. Don't pause for the user —
+            # force a recovery attempt. This mirrors the coord-rejection
+            # shape: append a hint to history, reset dedup, continue.
+            # Legitimate need_approval (cart review, payment, no payment
+            # method, etc.) doesn't trip this.
+            giveup_reason = self._giveup_rejection(task, action)
+            if giveup_reason is not None:
+                hint = (
+                    f"REJECTED need_approval: {giveup_reason}. The "
+                    "orchestrator no longer trusts textual claims like "
+                    "'after scrolling' — only an actual executed swipe in "
+                    "history counts as proof of scrolling. Required next "
+                    "action: emit a real swipe (e.g. swipe from (540,1600) "
+                    "to (540,800)) to scroll the results. If you just "
+                    "claimed to tap ADD on a product, navigate to the cart "
+                    "icon instead of emitting need_approval — the ADD "
+                    "either landed (go to cart) or missed (retry the tap)."
+                )
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "REJECTED: giveup before scrolling",
+                )
+                await self._step_status(
+                    task,
+                    f"step {task.step_count}: need_approval rejected — "
+                    "scroll first",
+                )
+                self._last_phash = None
+                continue
+
+            _log.info("step %d: hitl gate", task.step_count)
             await self._gate_with_hitl(task, action, screenshot, screenshot_b64, current_phash)
 
             # Security rule 4: audit BEFORE execute, never after.
             self._audit.log_action(
                 task.user_id, task.description, action, "EXECUTING"
             )
+            _log.info("step %d: execute %s", task.step_count, action.get("action"))
 
             action_type = action.get("action")
             if action_type == "done":
@@ -281,28 +446,193 @@ class Orchestrator:
             return None
         return self._skills.get(pkg)
 
-    async def _lookup_ui_tree(self) -> str | None:
-        """Fetch the on-screen accessibility tree as a model-friendly text
-        block. Returns None on any failure — the model can still operate on
-        the screenshot alone, just less precisely.
+    async def _lookup_ui_tree(self) -> tuple[str | None, list[UiElement]]:
+        """Fetch the on-screen accessibility tree.
+
+        Returns a 2-tuple: (rendered prompt block, parsed element list).
+        The rendered block goes into the model prompt; the parsed list is
+        used by the coord-validation check to reject hallucinated taps.
+        Both default to (None, []) on any failure so callers can degrade.
         """
         try:
             xml = await self._adb.dump_ui_xml()
         except Exception:
-            return None
+            return None, []
         if not xml:
+            return None, []
+        elements = ui_tree_parse(xml)
+        rendered = ui_tree_to_prompt(xml) or None
+        return rendered, elements
+
+    @staticmethod
+    def _giveup_rejection(task: Task, action: dict) -> str | None:
+        """Return a rejection reason if `action` is a premature "no products
+        found"-style bail-out, else None.
+
+        Two independent rejection paths:
+
+        1. Giveup-before-scroll: the reason matches a `_GIVEUP_PATTERNS` regex
+           AND task.history shows no executed swipe. The only valid bypass is
+           an actual swipe in history — earlier versions accepted a textual
+           "after scrolling" suffix as proof, but the model learned to fake
+           that suffix, so it's been removed.
+
+        2. Giveup-contradicting-ADD: the most recent executed action is a tap
+           whose note matches `_ADD_TAP_NOTE_RE` (e.g. "tap ADD on Maggi …"),
+           and yet the model immediately emits a "no products found" giveup.
+           Those two statements can't both be true — either the tap actually
+           added a product (then the next step is cart-review, not giveup) or
+           the tap missed (then the model should retry, not bail). Block.
+
+        Genuine sensitive HITL (cart review, payment, no payment method, OTP)
+        doesn't match any of these patterns, so it passes through untouched.
+        """
+        if action.get("action") != "need_approval":
             return None
-        rendered = ui_tree_to_prompt(xml)
-        return rendered or None
+        reason = str(action.get("reason", ""))
+        if not reason:
+            return None
+        match = None
+        for p in _GIVEUP_PATTERNS:
+            m = p.search(reason)
+            if m is not None:
+                match = m
+                break
+        if match is None:
+            return None
+
+        # Contradiction check: the model's last executed action was an apparent
+        # ADD tap. The giveup can't be honest — reject regardless of whether
+        # scrolling happened. Search through history for the LAST executed
+        # tap; skip entries that were rejected at the orchestrator level.
+        last_tap = _last_executed_tap(task.history)
+        if last_tap is not None:
+            note = str(last_tap.get("note", ""))
+            if _ADD_TAP_NOTE_RE.search(note):
+                return (
+                    f"reason matches giveup pattern '{match.group(0)}' but "
+                    f"the previous tap was '{note}' — these are contradictory. "
+                    "Either the ADD landed (then the cart is the next stop) or "
+                    "it missed (then retry, don't bail)"
+                )
+
+        if _history_has_swipe(task.history):
+            return None
+        return (
+            f"reason matches giveup pattern '{match.group(0)}' but no "
+            "scroll has been attempted"
+        )
+
+    @staticmethod
+    def _intent_mismatch(action: dict, elements: list[UiElement]) -> str | None:
+        """Return a rejection reason when the tap's note disagrees with the
+        element actually under the coord, else None.
+
+        Two specific traps:
+
+        1. Search intent on a [LOCATION] element. The model's note mentions
+           "search bar / box / icon" but the coord lands on the delivery-
+           address header. This is the run-2 misclick — y=200 on Blinkit's
+           home screen.
+
+        2. ADD/cart intent on a non-[ACTION] element. The note claims
+           "tap ADD on …" / "+ button" / "checkout" but the target isn't
+           an [ACTION] element. Often the model is hallucinating: it
+           describes an action it wanted to take on a screen that doesn't
+           actually have the ADD button visible.
+
+        Passes through when no UI tree is available or the action isn't a
+        tap. Returns None on a clean tap so the loop continues normally.
+        """
+        if action.get("action") != "tap":
+            return None
+        if not elements:
+            return None
+        try:
+            x = int(action.get("x"))
+            y = int(action.get("y"))
+        except (TypeError, ValueError):
+            return None
+        note = str(action.get("note", ""))
+        target = find_smallest_element_at(x, y, elements)
+        if target is None:
+            return None  # caught by _coords_mismatch
+
+        # (1) Search intent landing on the LOCATION header.
+        if (
+            _SEARCH_INTENT_RE.search(note)
+            and not _ADDRESS_INTENT_RE.search(note)
+            and target.looks_like_location_header
+        ):
+            return (
+                f"note '{note}' implies tapping the search bar, but the "
+                f"element at ({x},{y}) is the [LOCATION] delivery/address "
+                "header. The real search bar is a separate element below — "
+                "look for class=EditText or an id containing 'search', "
+                "usually with cy in 300–400 range"
+            )
+
+        # (2) ADD/cart intent landing on a non-[ACTION] element.
+        if _ADD_INTENT_RE.search(note) and not target.is_action:
+            target_kind = (
+                "[CATEGORY?] tile"
+                if (target.clickable and target.looks_like_category_text)
+                else "non-action element"
+            )
+            return (
+                f"note '{note}' implies tapping an ADD/+/checkout button, "
+                f"but the element at ({x},{y}) is a {target_kind} (not "
+                "marked [ACTION]). Pick the exact coords of an [ACTION]-"
+                "prefixed element from the UI list. If no [ACTION] ADD "
+                "button is visible for the target product, swipe to scroll "
+                "and re-evaluate — don't tap on a category, image, or "
+                "label hoping it acts as ADD"
+            )
+
+        return None
+
+    @staticmethod
+    def _coords_mismatch(action: dict, elements: list[UiElement]) -> str | None:
+        """Return a human-readable reason if action's coords don't map to any
+        element in the UI tree, or None when the action's coords are fine.
+
+        Non-coord actions (wait / done / need_approval / type) pass through.
+        Empty element list also passes through — without a tree to compare
+        against we can't reject anything.
+        """
+        if not elements:
+            return None
+        action_type = action.get("action")
+        if action_type == "tap":
+            try:
+                x = int(action.get("x"))
+                y = int(action.get("y"))
+            except (TypeError, ValueError):
+                return None  # validator already caught malformed; don't double-fail
+            if not is_coord_in_elements(x, y, elements):
+                return f"tap at ({x}, {y}) doesn't fall on any UI element"
+        elif action_type == "swipe":
+            try:
+                x1 = int(action.get("x1"))
+                y1 = int(action.get("y1"))
+            except (TypeError, ValueError):
+                return None
+            if not is_coord_in_elements(x1, y1, elements):
+                return (
+                    f"swipe start ({x1}, {y1}) doesn't fall on any UI element"
+                )
+        return None
 
     def _loop_hint(self, task: Task) -> str:
         """Detect repeated-action and cycle patterns; return a hint or ''.
 
-        Recognised shapes (looking only at state-changing actions in history):
-          - A-A          : last two actions identical
-          - A-B-A-B      : last four actions form a two-step cycle
-        Either pattern increments self._loops_detected; the caller hard-aborts
-        when that crosses MAX_LOOPS_BEFORE_ABORT.
+        Three independent detectors:
+          1. A-A           : last two state-changing actions identical
+          2. A-B-A-B       : last four form a two-step alternation
+          3. Same-action seen 3+ times anywhere in history (catches 3-step
+             cycles like A-B-C-A-B-C and any other repetition shape)
+        Any detector firing increments self._loops_detected; the caller
+        hard-aborts when that crosses MAX_LOOPS_BEFORE_ABORT.
         """
         recent_state_changing = [
             h.get("action", {})
@@ -323,17 +653,35 @@ class Orchestrator:
             and _actions_equivalent(last_four[1], last_four[3])
             and not _actions_equivalent(last_four[0], last_four[1])
         )
+        # The most-recent action has been emitted at least 3 times somewhere
+        # in this task's history — catches longer cycles + general repetition.
+        latest = recent_state_changing[-1]
+        repeat_count = sum(
+            1 for a in recent_state_changing if _actions_equivalent(a, latest)
+        )
+        is_triplet = repeat_count >= 3
 
-        if not (is_aa or is_abab):
+        if not (is_aa or is_abab or is_triplet):
             return ""
 
         self._loops_detected += 1
-        shape = "identical" if is_aa else "alternating A↔B cycle"
+        self._last_loop_step = task.step_count
+        if is_aa:
+            shape = "identical"
+        elif is_abab:
+            shape = "alternating A↔B cycle"
+        else:
+            shape = f"repeated {repeat_count} times"
+        remaining = max(0, MAX_LOOPS_BEFORE_ABORT - self._loops_detected)
         return (
-            f"NOTE: Your last actions form an {shape} pattern that isn't "
-            "advancing the screen. STOP this loop — pick a DIFFERENT element "
-            "from the UI list, scroll to surface new options, or emit "
-            "`need_approval` if you're genuinely stuck."
+            f"NOTE: Your last action has the pattern '{shape}' and isn't "
+            "advancing the screen. STOP this loop. Required next step: pick a "
+            "DIFFERENT element from the UI list (prefer one marked [ACTION] "
+            "over a card body), or swipe to scroll, or press back to dismiss "
+            "an overlay. DO NOT emit need_approval — that's reserved for "
+            "payment/OTP/delete/permission and the cart-review handoff only. "
+            f"If you loop {remaining} more time(s) the task will be hard-"
+            "terminated."
         )
 
     # ------------------------------------------------------------------
@@ -385,6 +733,25 @@ class Orchestrator:
         if not needs_approval:
             return
 
+        # If the model emits need_approval shortly after a loop hint was
+        # injected, it's using approval as a give-up escape hatch rather
+        # than a genuine sensitive-action gate. Hard-terminate instead of
+        # pausing for human rescue.  Genuine cart-review approvals happen
+        # on clean flows where no loop was recently detected.
+        if (
+            self._last_loop_step >= 0
+            and (task.step_count - self._last_loop_step) <= LOOP_TO_GIVEUP_WINDOW
+            and action.get("action") == "need_approval"
+        ):
+            self._audit.log_action(
+                task.user_id, task.description, action,
+                "BLOCKED: need_approval used as loop escape",
+            )
+            raise OrchestratorError(
+                "model emitted need_approval to escape a detected loop; "
+                "aborting instead of pausing for approval"
+            )
+
         task.state = TaskState.AWAITING_APPROVAL
         task.pending_action = action
         self._audit.log_action(
@@ -412,6 +779,10 @@ class Orchestrator:
                 return await execute_action(action, self._adb)
             except AdbError as e:
                 last_err = e
+                _log.warning(
+                    "adb action %s failed (attempt %d): %s",
+                    action.get("action"), attempt + 1, e,
+                )
                 # Append a failure marker so the next provider call sees that
                 # the previous attempt didn't land.
                 task.history.append(
@@ -567,6 +938,46 @@ def _actions_equivalent(a: dict, b: dict) -> bool:
             for k in ("x1", "y1", "x2", "y2")
         )
     return True
+
+
+def _history_has_swipe(history: list[dict]) -> bool:
+    """True if the task has executed at least one swipe action.
+
+    Used by the giveup-rejection check to decide whether the model has
+    earned the right to emit 'no products found'. A rejected-coord or
+    rejected-giveup entry isn't a swipe; we look only at the action's
+    `action` field.
+    """
+    for entry in history:
+        action = entry.get("action") if isinstance(entry, dict) else None
+        if isinstance(action, dict) and action.get("action") == "swipe":
+            # Skip swipes that never actually executed (e.g. rejected by
+            # coord grounding). A rejected entry has a result starting
+            # with "REJECTED".
+            result = str(entry.get("result", ""))
+            if not result.startswith("REJECTED"):
+                return True
+    return False
+
+
+def _last_executed_tap(history: list[dict]) -> dict | None:
+    """Return the most recent successfully-executed tap action, or None.
+
+    Used by the giveup-rejection's contradiction check. We skip entries
+    whose result starts with "REJECTED" or "ERROR:" — those represent
+    actions that didn't actually run on the device.
+    """
+    for entry in reversed(history):
+        if not isinstance(entry, dict):
+            continue
+        action = entry.get("action")
+        if not isinstance(action, dict) or action.get("action") != "tap":
+            continue
+        result = str(entry.get("result", ""))
+        if result.startswith("REJECTED") or result.startswith("ERROR:"):
+            continue
+        return action
+    return None
 
 
 def _safe_phash(image_bytes: bytes) -> str | None:

@@ -18,6 +18,7 @@ from bot.apps import (
     render_prompt,
 )
 from bot.pairing import PairCodeIssuer
+from bot.router import Route, Router
 from bot.session import Session, SessionState, SessionStore
 from bot.users import UserPolicy, UserRecord, UserStore
 from security.hitl_gate import HitlGate
@@ -40,6 +41,7 @@ class Handlers:
         pairing: PairCodeIssuer,
         admin_id: int | None,
         repo: TaskRepository | None = None,
+        router: Router | None = None,
     ) -> None:
         self._app = application
         self._orch = orchestrator
@@ -48,6 +50,7 @@ class Handlers:
         self._pairing = pairing
         self._admin_id = admin_id
         self._repo = repo
+        self._router = router
         self._sessions = SessionStore()
         self._running: dict[int, asyncio.Task] = {}
 
@@ -122,12 +125,23 @@ class Handlers:
             await self._launch_templated_task(update, user.id, text)
             return
 
-        # Otherwise: free-form path — exactly the pre-menu behaviour.
         if self._has_running_task(user.id):
             await update.message.reply_text(
                 "A task is already running. Use /abort first or wait for it to finish."
             )
             return
+
+        # Try the router first — if the user's free text maps cleanly to a
+        # known (app, task) pair, skip the menu entirely and execute. This is
+        # the daily-driver path: one Telegram message, no taps.
+        if self._router is not None:
+            route = await self._router.route(text)
+            if route is not None:
+                await self._launch_route(update, user.id, route)
+                return
+
+        # Router didn't find a match (or isn't configured) — fall back to the
+        # free-form agent path: model figures out everything from scratch.
         await self._launch_freeform_task(update, user.id, text)
 
     # ------------------------------------------------------------------
@@ -286,6 +300,40 @@ class Handlers:
         await update.message.reply_text(f"Starting task: {text}")
         # No launch_package — the agent decides where to start.
         self._running[user_id] = asyncio.create_task(self._orch.run_task(task))
+
+    async def _launch_route(
+        self, update: Update, user_id: int, route: Route
+    ) -> None:
+        """Execute a structured route from the natural-language router.
+
+        If the route's task needs a param and the router extracted one, run
+        immediately. If it needs a param and one wasn't extracted, ask the
+        user (AWAITING_PARAM state, same as the menu path).
+        """
+        if update.message is None:
+            return
+        sess = self._sessions.get(user_id)
+        sess.app_id = route.app.id
+        sess.task_id = route.task.id
+
+        if route.task.needs_param and not route.param:
+            sess.state = SessionState.AWAITING_PARAM
+            await update.message.reply_text(
+                f"{route.app.emoji} {route.app.name} → {route.task.label}\n\n"
+                f"{route.task.param_prompt}"
+            )
+            return
+
+        # Have everything we need — execute.
+        description = render_prompt(route.task.template, route.param)
+        task = Task(user_id=user_id, description=description)
+        sess.state = SessionState.RUNNING
+        await update.message.reply_text(
+            f"{route.app.emoji} {route.app.name}: {description}"
+        )
+        self._running[user_id] = asyncio.create_task(
+            self._orch.run_task(task, launch_package=route.app.package)
+        )
 
     # ------------------------------------------------------------------
     # Other commands (unchanged from before)

@@ -11,6 +11,7 @@ from agent.providers import make_provider
 from agent.skills import SkillRegistry
 from bot.handlers import Handlers
 from bot.pairing import PairCodeIssuer
+from bot.router import Router
 from bot.telegram_bot import build_application, register_handlers
 from bot.users import UserPolicy, UserStore
 from config.settings import load_settings
@@ -140,6 +141,12 @@ def main() -> None:
         enable_vision_hitl=settings.enable_vision_hitl,
     )
 
+    # Intent router — only wire if the provider supports text completion
+    # (currently OpenRouter). Other providers fall back to menu-only flow.
+    router_instance: Router | None = None
+    if hasattr(vision, "complete_text"):
+        router_instance = Router(vision)  # type: ignore[arg-type]
+
     app = build_application(settings.telegram_bot_token)
     handlers = Handlers(
         app,
@@ -149,6 +156,7 @@ def main() -> None:
         pairing,
         repo=repo,
         admin_id=settings.telegram_admin_id,
+        router=router_instance,
     )
 
     orchestrator.on_approval_request = handlers.on_approval_request
