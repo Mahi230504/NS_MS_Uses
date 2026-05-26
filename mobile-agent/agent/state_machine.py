@@ -29,3 +29,9 @@ class Task:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     latest_rpd_remaining: int | None = None
+    # True once the user has approved a "Cart review …" need_approval whose
+    # message stated that the approval also covers payment. Subsequent
+    # payment-shaped HITL gates auto-grant on this flag so the user only
+    # confirms once per checkout. Reset implicitly per task (new Task
+    # instance = fresh flag).
+    payment_pre_approved: bool = False

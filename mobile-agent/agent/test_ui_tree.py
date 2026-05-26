@@ -1,13 +1,20 @@
 """Unit tests for the UI accessibility-tree parser."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from agent.ui_tree import (
     UiElement,
+    find_action_at,
     find_smallest_element_at,
+    has_focused_text_input,
     is_coord_in_elements,
     parse,
     to_prompt_section,
 )
+
+
+_FIXTURES = Path(__file__).parent / "fixtures"
 
 
 _SAMPLE_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
@@ -124,6 +131,50 @@ class TestIsCoordInElements:
         assert is_coord_in_elements(550, 550, els)
 
 
+class TestHasFocusedTextInput:
+    @staticmethod
+    def _el(class_name: str, focused: bool) -> UiElement:
+        return UiElement(
+            text="", desc="", resource_id="", class_name=class_name,
+            cx=0, cy=0, bounds=(0, 0, 100, 100),
+            clickable=True, focused=focused,
+        )
+
+    def test_empty_list_returns_true(self) -> None:
+        # No tree available → conservatively allow typing.
+        assert has_focused_text_input([])
+
+    def test_no_focused_input_returns_false(self) -> None:
+        els = [
+            self._el("android.widget.EditText", focused=False),
+            self._el("android.widget.Button", focused=True),  # focused but not input
+        ]
+        assert not has_focused_text_input(els)
+
+    def test_focused_edittext_returns_true(self) -> None:
+        els = [self._el("android.widget.EditText", focused=True)]
+        assert has_focused_text_input(els)
+
+    def test_focused_searchview_returns_true(self) -> None:
+        els = [self._el("androidx.appcompat.widget.SearchView", focused=True)]
+        assert has_focused_text_input(els)
+
+    def test_focused_autocomplete_returns_true(self) -> None:
+        els = [self._el("android.widget.AutoCompleteTextView", focused=True)]
+        assert has_focused_text_input(els)
+
+    def test_focused_attribute_parsed_from_xml(self) -> None:
+        xml = (
+            "<hierarchy rotation='0'>"
+            '<node text="" class="android.widget.EditText" '
+            'bounds="[0,0][100,100]" clickable="true" focused="true" />'
+            "</hierarchy>"
+        )
+        elements = parse(xml)
+        assert any(e.focused for e in elements)
+        assert has_focused_text_input(elements)
+
+
 class TestFindSmallestElementAt:
     @staticmethod
     def _el(x1: int, y1: int, x2: int, y2: int, label: str = "x") -> UiElement:
@@ -218,6 +269,66 @@ class TestActionPrefix:
         out = to_prompt_section(_ACTION_BUTTONS_XML)
         # Header explains the [ACTION] marker so the model knows to prefer it.
         assert "[ACTION]" in out.splitlines()[0]
+
+    def test_bare_add_in_content_desc_marked_action(self) -> None:
+        """Regression: Blinkit's ADD button is text='', content-desc='ADD'
+        on a custom android.view.View. Substring match against 'add to
+        cart' missed it; the exact-desc set picks it up now."""
+        xml = (
+            "<hierarchy rotation='0'>"
+            '<node text="" content-desc="ADD" '
+            'resource-id="com.grofers.customerapp:id/tv_title" '
+            'class="android.view.View" '
+            'bounds="[213,1527][348,1575]" clickable="true" />'
+            "</hierarchy>"
+        )
+        out = to_prompt_section(xml)
+        assert "[ACTION] desc=ADD" in out
+
+    def test_action_elements_never_truncated(self) -> None:
+        """Regression: Blinkit's search-results tree has ~270 elements, the
+        ADD buttons live at y>1200, and the old fixed-cap truncation
+        sorted by y dropped them entirely. The new policy reserves budget
+        for every [ACTION] element so they always appear in the prompt."""
+        # Build a tree with 80 decorative TextViews above (non-action) and
+        # 3 ADD buttons at the bottom. Cap is 60.
+        rows = []
+        for i in range(80):
+            rows.append(
+                f'<node text="Decor {i}" '
+                f'class="android.widget.TextView" '
+                f'bounds="[0,{100 + i * 5}][100,{105 + i * 5}]" />'
+            )
+        for i, x in enumerate((200, 500, 800)):
+            rows.append(
+                f'<node text="" content-desc="ADD" '
+                f'class="android.view.View" '
+                f'bounds="[{x},1500][{x + 100},1550]" clickable="true" />'
+            )
+        xml = "<hierarchy rotation='0'>" + "".join(rows) + "</hierarchy>"
+        out = to_prompt_section(xml)
+        # All three ADDs present despite cap.
+        assert out.count("[ACTION] desc=ADD") == 3
+        # The "and N more (truncated)" footer shows non-action elements
+        # were dropped, not the ADDs.
+        assert "truncated" in out
+
+    def test_add_to_wishlist_desc_NOT_marked_action(self) -> None:
+        """Counter-test: 'Add to wishlist' must NOT be tagged [ACTION].
+        Tapping wishlist is not what we want when 'add to cart' was the
+        intent."""
+        xml = (
+            "<hierarchy rotation='0'>"
+            '<node text="" content-desc="Add to wishlist" '
+            'class="android.widget.ImageView" '
+            'bounds="[612,1165][684,1237]" clickable="true" />'
+            "</hierarchy>"
+        )
+        out = to_prompt_section(xml)
+        # Wishlist must appear in the listing (it's clickable) but NOT
+        # with the [ACTION] prefix.
+        line = next(l for l in out.splitlines() if "Add to wishlist" in l)
+        assert "[ACTION]" not in line
 
 
 # A Blinkit search-results page where the first "Maggi" row is a category
@@ -327,3 +438,321 @@ class TestCategoryPrefix:
         out = to_prompt_section(xml)
         data_lines = [line for line in out.splitlines() if line.startswith("- ")]
         assert all("[CATEGORY?]" not in line for line in data_lines)
+
+
+class TestContainerLabel:
+    def test_action_inherits_ancestor_content_desc(self) -> None:
+        # A nested ADD button inside a product card whose container has the
+        # full title as content-desc should pick that up.
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.view.ViewGroup" bounds="[36,1153][348,2121]"
+        content-desc="Hen Fruit -10 Max Protein Speciality Eggs is available for 130"
+        clickable="false">
+    <node class="android.view.ViewGroup" bounds="[213,1527][348,1575]"
+          resource-id="com.x:id/stepper" clickable="false">
+      <node class="android.view.View" content-desc="ADD"
+            bounds="[213,1527][348,1575]" clickable="true" />
+    </node>
+  </node>
+</hierarchy>
+"""
+        els = parse(xml)
+        actions = [e for e in els if e.is_action]
+        assert len(actions) == 1
+        # "is available for ..." price suffix gets stripped — model only needs
+        # the brand + SKU portion to match against the user's task.
+        assert actions[0].container_label == \
+            "Hen Fruit -10 Max Protein Speciality Eggs"
+
+    def test_action_with_no_meaningful_ancestor_has_empty_label(self) -> None:
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.widget.Button" text="ADD" bounds="[100,200][300,260]"
+        clickable="true" />
+</hierarchy>
+"""
+        els = parse(xml)
+        actions = [e for e in els if e.is_action]
+        assert len(actions) == 1
+        assert actions[0].container_label == ""
+
+    def test_action_skips_screen_root_ancestor(self) -> None:
+        # A root container spanning the whole screen with a global
+        # content-desc should NOT be picked as the action's product label.
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" bounds="[0,0][1080,2400]"
+        content-desc="Some Activity Root Page" clickable="false">
+    <node class="android.widget.Button" text="ADD" bounds="[100,200][300,260]"
+          clickable="true" />
+  </node>
+</hierarchy>
+"""
+        els = parse(xml)
+        actions = [e for e in els if e.is_action]
+        assert actions[0].container_label == ""
+
+    def test_action_prefers_closest_meaningful_ancestor(self) -> None:
+        # When multiple ancestors carry content-desc, the innermost
+        # meaningful one wins (the deepest product card, not the outer
+        # carousel).
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" bounds="[0,500][1080,2000]"
+        content-desc="Beer carousel" clickable="false">
+    <node class="android.view.ViewGroup" bounds="[40,800][340,1800]"
+          content-desc="Coolberg Cranberry Non-Alcoholic Beer" clickable="false">
+      <node class="android.view.View" content-desc="ADD"
+            bounds="[100,1500][300,1570]" clickable="true" />
+    </node>
+  </node>
+</hierarchy>
+"""
+        els = parse(xml)
+        actions = [e for e in els if e.is_action]
+        assert actions[0].container_label == "Coolberg Cranberry Non-Alcoholic Beer"
+
+    def test_action_skips_ancestor_whose_desc_is_just_add(self) -> None:
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.view.ViewGroup" bounds="[40,500][340,800]"
+        content-desc="Product A Title" clickable="false">
+    <node class="android.view.ViewGroup" bounds="[100,600][300,700]"
+          content-desc="ADD" clickable="false">
+      <node class="android.view.View" content-desc="ADD"
+            bounds="[100,600][300,700]" clickable="true" />
+    </node>
+  </node>
+</hierarchy>
+"""
+        els = parse(xml)
+        actions = [e for e in els if e.is_action]
+        assert actions[0].container_label == "Product A Title"
+
+    def test_prompt_section_renders_container_label_for_action(self) -> None:
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.view.ViewGroup" bounds="[36,1153][348,2121]"
+        content-desc="Hen Fruit -10 Max Protein Speciality Eggs"
+        clickable="false">
+    <node class="android.view.View" content-desc="ADD"
+          bounds="[213,1527][348,1575]" clickable="true" />
+  </node>
+</hierarchy>
+"""
+        out = to_prompt_section(xml)
+        assert 'for "Hen Fruit -10 Max Protein Speciality Eggs"' in out
+
+
+class TestRidOnlyNoiseFilter:
+    def test_rid_only_non_clickable_dropped(self) -> None:
+        # A pure layout wrapper (FrameLayout with resource-id but no text,
+        # no desc, no clickable, no focused) should be dropped — it has no
+        # signal for the model.
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.widget.FrameLayout" resource-id="com.x:id/frame_layout"
+        bounds="[0,0][1080,400]" clickable="false" />
+  <node text="Real label" class="android.widget.TextView"
+        bounds="[100,500][500,560]" clickable="false" />
+</hierarchy>
+"""
+        els = parse(xml)
+        rids = [e.resource_id for e in els]
+        assert "com.x:id/frame_layout" not in rids
+        assert any(e.text == "Real label" for e in els)
+
+    def test_focused_unlabelled_still_kept(self) -> None:
+        # Rare but real: a focused EditText with no text yet, only a
+        # resource-id, must still appear so has_focused_text_input sees it.
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.widget.EditText" resource-id="com.x:id/search_box"
+        bounds="[100,200][900,260]" clickable="true" focused="true" />
+</hierarchy>
+"""
+        els = parse(xml)
+        assert len(els) == 1
+        assert els[0].focused is True
+
+
+class TestFindActionAt:
+    def test_returns_smallest_action_under_coords(self) -> None:
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.view.View" content-desc="ADD"
+        bounds="[200,1260][330,1310]" clickable="true" />
+  <node class="android.view.View" content-desc="ADD"
+        bounds="[500,1260][630,1310]" clickable="true" />
+</hierarchy>
+"""
+        els = parse(xml)
+        hit = find_action_at(265, 1287, els)
+        assert hit is not None
+        assert hit.bounds == (200, 1260, 330, 1310)
+        # A coord on the second ADD picks the second one.
+        hit2 = find_action_at(565, 1287, els)
+        assert hit2 is not None
+        assert hit2.bounds == (500, 1260, 630, 1310)
+
+    def test_returns_none_for_coords_off_any_action(self) -> None:
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.view.View" content-desc="ADD"
+        bounds="[200,1260][330,1310]" clickable="true" />
+</hierarchy>
+"""
+        els = parse(xml)
+        assert find_action_at(700, 700, els) is None
+
+
+class TestRealFailingRunFixture:
+    """Regression tests built from the actual failing run on the eggs
+    search-results page (2026-05-26). The model tapped ADD at (265, 1287)
+    five times claiming it was the Hen Fruit egg ADD — but that ADD is
+    structurally for Coolberg Cranberry Non-Alcoholic Beer. The label
+    enrichment must make this visible to the model.
+    """
+
+    def _xml(self) -> str:
+        return (_FIXTURES / "blinkit_eggs_search_results.xml").read_text()
+
+    def test_egg_add_label_is_correctly_attributed(self) -> None:
+        els = parse(self._xml())
+        hen_fruit_add = find_action_at(280, 1551, els)
+        assert hen_fruit_add is not None
+        assert hen_fruit_add.container_label == \
+            "Hen Fruit -10 Max Protein Speciality Eggs"
+
+    def test_beer_add_is_not_misattributed_as_egg(self) -> None:
+        els = parse(self._xml())
+        beer_add = find_action_at(265, 1287, els)
+        assert beer_add is not None
+        # The crucial assertion: this ADD is NOT Hen Fruit / Nutri Hatch /
+        # Table White — it is a beer cross-sell card.
+        assert "egg" not in beer_add.container_label.lower()
+        assert "beer" in beer_add.container_label.lower()
+        assert beer_add.container_label == \
+            "Coolberg Cranberry Non-Alcoholic Beer"
+
+    def test_all_visible_adds_have_labels(self) -> None:
+        # Every [ACTION] ADD on the eggs search-results page should have a
+        # product label attached — otherwise the model is grounded for some
+        # but flying blind for others, which is the exact hallucination
+        # surface we're closing.
+        els = parse(self._xml())
+        adds = [e for e in els if e.is_action]
+        assert len(adds) == 6
+        for a in adds:
+            assert a.container_label, (
+                f"ADD at ({a.cx},{a.cy}) has no container_label — model "
+                f"would have no way to know which product this ADD buys"
+            )
+
+    def test_prompt_includes_all_product_labels(self) -> None:
+        out = to_prompt_section(self._xml())
+        # Each of the three visible egg products must surface in the
+        # rendered prompt — otherwise the model can't pick the right ADD.
+        for product in (
+            "Hen Fruit",
+            "Nutri Hatch",
+            "Table White",
+        ):
+            assert product in out, f"missing {product!r} in prompt"
+
+    def test_rid_only_layout_noise_filtered(self) -> None:
+        # The pre-fix parse returned 272 elements (156 of which were rid-
+        # only layout wrappers); the new filter should drop those, leaving
+        # roughly half. Concrete count is brittle but a 200+ count would
+        # mean the filter regressed.
+        els = parse(self._xml())
+        assert len(els) < 200, f"{len(els)} elements — filter regressed?"
+        rid_only_noise = [
+            e for e in els
+            if not e.text and not e.desc and not e.clickable and not e.focused
+        ]
+        assert rid_only_noise == [], (
+            f"rid-only noise leaked through: {rid_only_noise[:5]}"
+        )
+
+
+class TestCartBarDetection:
+    def test_clickable_with_view_cart_text_tagged(self) -> None:
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node text="View cart" resource-id="com.x:id/view_cart"
+        class="android.widget.TextView" bounds="[465,1726][675,1785]"
+        clickable="true" />
+</hierarchy>
+"""
+        els = parse(xml)
+        cart = [e for e in els if e.is_cart_bar]
+        assert len(cart) == 1
+        out = to_prompt_section(xml)
+        assert "[CART]" in out
+
+    def test_clickable_parent_with_view_cart_child_tagged(self) -> None:
+        # The real Blinkit shape: clickable container with a non-clickable
+        # TextView child carrying the "View cart" label. The container is
+        # the tap target and must get the [CART] tag.
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.view.ViewGroup" resource-id="com.x:id/container"
+        bounds="[231,1698][849,1860]" clickable="true">
+    <node text="View cart" resource-id="com.x:id/view_cart"
+          class="android.widget.TextView" bounds="[465,1726][675,1785]"
+          clickable="false" />
+  </node>
+</hierarchy>
+"""
+        els = parse(xml)
+        # Both nodes parsed (the container is clickable, the text has a label).
+        container = next(e for e in els if e.bounds == (231, 1698, 849, 1860))
+        assert container.is_cart_bar
+        out = to_prompt_section(xml)
+        # The container line — the actual tap target — must carry [CART].
+        cart_lines = [
+            line for line in out.splitlines()
+            if "[CART]" in line and "at (540, 1779)" in line
+        ]
+        assert cart_lines, f"missing tagged container line. prompt:\n{out}"
+
+    def test_non_clickable_view_cart_label_alone_not_tagged(self) -> None:
+        # A bare text label without a clickable ancestor isn't a tap target;
+        # we shouldn't tag it as a cart bar — there's nothing to tap.
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node text="View cart" class="android.widget.TextView"
+        bounds="[100,100][300,140]" clickable="false" />
+</hierarchy>
+"""
+        els = parse(xml)
+        assert not any(e.is_cart_bar for e in els)
+
+    def test_id_token_alone_tags_element(self) -> None:
+        xml = """<?xml version='1.0' encoding='UTF-8'?>
+<hierarchy rotation="0">
+  <node class="android.view.ViewGroup" resource-id="com.x:id/mini_cart_widget"
+        bounds="[0,2000][1080,2100]" clickable="true" />
+</hierarchy>
+"""
+        els = parse(xml)
+        assert any(e.is_cart_bar for e in els)
+
+    def test_cart_bar_pinned_through_truncation(self) -> None:
+        # If a cart bar exists but the screen has 200 other elements, the
+        # cart bar must survive the 60-element truncation budget.
+        nodes = "".join(
+            f'<node text="row{i}" class="android.widget.TextView" '
+            f'bounds="[10,{50+i*5}][100,{55+i*5}]" clickable="true" />'
+            for i in range(200)
+        )
+        nodes += (
+            '<node class="android.view.ViewGroup" '
+            'resource-id="com.x:id/view_cart_widget" '
+            'bounds="[0,2200][1080,2300]" clickable="true" />'
+        )
+        xml = f"<hierarchy rotation='0'>{nodes}</hierarchy>"
+        out = to_prompt_section(xml)
+        assert "[CART]" in out, "cart bar dropped through truncation"

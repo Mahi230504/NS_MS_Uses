@@ -20,7 +20,7 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
-from agent.providers._parse import extract_json_object
+from agent.providers._parse import extract_json_object, salvage_truncated_json
 from agent.providers.base import (
     ProviderError,
     ProviderResponse,
@@ -33,7 +33,10 @@ from config import prompts
 
 DEFAULT_MODEL = "gemini-2.0-flash"
 DEFAULT_LOCATION = "us-central1"
-MAX_OUTPUT_TOKENS = 1024
+# 4096 prevents the mid-JSON truncations seen with 1024; `_parse_action`
+# still falls back to salvage if a future model emits more thinking tokens
+# than the budget allows.
+MAX_OUTPUT_TOKENS = 4096
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 1.0
 
@@ -186,11 +189,14 @@ class VertexProvider:
         except json.JSONDecodeError:
             pass
         obj = extract_json_object(text)
-        if obj is None:
-            raise ProviderError(
-                f"No JSON object found in response (first 200 chars): {text[:200]!r}"
-            )
-        return json.loads(obj)
+        if obj is not None:
+            return json.loads(obj)
+        salvaged = salvage_truncated_json(text)
+        if salvaged is not None:
+            return json.loads(salvaged)
+        raise ProviderError(
+            f"No JSON object found in response (first 200 chars): {text[:200]!r}"
+        )
 
     @staticmethod
     def _build_usage(

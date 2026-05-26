@@ -9,7 +9,7 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
-from agent.providers._parse import extract_json_object
+from agent.providers._parse import extract_json_object, salvage_truncated_json
 from agent.providers.base import (
     ProviderError,
     ProviderResponse,
@@ -21,7 +21,10 @@ from config import prompts
 
 
 DEFAULT_MODEL = "gemini-2.0-flash"
-MAX_OUTPUT_TOKENS = 1024
+# 4096 leaves room for the model's internal thinking before the JSON closes;
+# 1024 was getting cut off mid-object in production runs. `_parse_action`
+# falls back to salvage when truncation still occurs.
+MAX_OUTPUT_TOKENS = 4096
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 1.0
 
@@ -183,11 +186,17 @@ class GeminiProvider:
         # response_mime_type='application/json' should make the above succeed;
         # this branch is belt-and-suspenders for fenced/prose-wrapped output.
         obj = extract_json_object(text)
-        if obj is None:
-            raise ProviderError(
-                f"No JSON object found in response (first 200 chars): {text[:200]!r}"
-            )
-        return json.loads(obj)
+        if obj is not None:
+            return json.loads(obj)
+        # Output-token-budget truncation: close the partial object at the
+        # last complete element so the step degrades gracefully instead of
+        # crashing the entire task.
+        salvaged = salvage_truncated_json(text)
+        if salvaged is not None:
+            return json.loads(salvaged)
+        raise ProviderError(
+            f"No JSON object found in response (first 200 chars): {text[:200]!r}"
+        )
 
     @staticmethod
     def _build_usage(

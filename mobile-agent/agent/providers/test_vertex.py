@@ -63,6 +63,13 @@ class TestVertexProvider:
         with pytest.raises(ProviderError):
             await vp.get_next_action(b"x", "t", [])
 
+    async def test_truncated_json_is_salvaged(self, monkeypatch) -> None:
+        vp = _make_provider(
+            monkeypatch, '{"action": "tap", "x": 265, "y": 1287, "'
+        )
+        resp = await vp.get_next_action(b"x", "t", [])
+        assert resp.action == {"action": "tap", "x": 265, "y": 1287}
+
     async def test_classify_yes(self, monkeypatch) -> None:
         vp = _make_provider(monkeypatch, "yes")
         assert await vp.classify_yes_no(b"png", "is this a payment screen?") is True

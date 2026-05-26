@@ -142,10 +142,39 @@ RULES — order matters, top rules dominate:
    filters. Do NOT explore the product detail. If you want more quantity, tap
    the "+" stepper, then proceed to cart.
 
-8. CART REVIEW BEFORE PAYMENT: when you reach the cart screen (showing the items
-   you've added with a "Proceed to checkout" / "Place order" / "Pay" button), DO NOT
-   tap that button. Instead emit
-   {"action":"need_approval","reason":"Cart review: <items + total>"}.
+8. CART REVIEW + PAYMENT (COMBINED, single HITL):
+   STEP 1 — NAVIGATE to the cart screen FIRST. After ADD, your screen is
+   still the search results, NOT the cart. To get to the cart:
+     - Look for a `[CART]` element in the UI elements list (the mini-cart
+       / "View cart" bar). Tap its coords directly.
+     - If no `[CART]` element is visible on the current screen, press the
+       device back button to return to the app home — the home screen
+       usually has a labelled "View cart" bar / cart icon.
+     - DO NOT emit need_approval until you can SEE cart-screen markers in
+       the UI tree: "Proceed to checkout" / "Place order" / "Pay" /
+       "Select payment" / "Subtotal" / "Total" / a list of items the
+       cart actually holds.
+   STEP 2 — when you ARE on the cart screen (items list + checkout button
+   visible), emit ONE need_approval:
+     {"action":"need_approval",
+      "reason":"Cart review: <items + total>. Approving here also authorizes payment."}
+   The user only confirms once for the whole checkout. After they approve,
+   the orchestrator latches a payment_pre_approved flag, so when you later
+   tap "Proceed" / "Place order" / "Pay Now" on the payment screen, no
+   second need_approval is required — proceed straight through. Your job
+   after the cart-review approval:
+     a) tap the cart-screen "Proceed" / "Checkout" button to navigate to
+        the payment screen
+     b) on the payment screen, tap "Pay Now" / "Place Order" directly
+   OTP screens still require a separate need_approval — the cart-review
+   approval does NOT cover OTP entry.
+
+   STRUCTURAL ENFORCEMENT: the orchestrator rejects "Cart review"
+   need_approval reasons when the current screen lacks any cart-screen
+   markers AND has search-screen markers. The items in your reason field
+   must come from what the CART screen shows, not from the [ACTION]
+   product lines visible on the search results — those are cross-sell
+   items, NOT items you've added to cart.
 
 9. TYPING — read carefully, the #1 failure point:
    THE MANDATORY SEQUENCE:
@@ -156,6 +185,12 @@ RULES — order matters, top rules dominate:
         tap its coords, even if it looks focused. Cost of an unneeded tap is
         small; cost of unfocused type is total typing failure.
      d) Emit the type action.
+   STRUCTURAL ENFORCEMENT: the orchestrator checks the UI tree for a
+   focused=true EditText / SearchView / AutoCompleteTextView before
+   executing every `type`. If none is focused, the type is REJECTED before
+   it runs — the characters would go nowhere otherwise. So step (c) is not
+   optional. Always tap the new screen's text input first; only then emit
+   the type.
 
 10. WHEN AN ACTION DIDN'T ADVANCE THE SCREEN, change your approach — DO NOT
     repeat the same tap, and DO NOT emit need_approval. need_approval is ONLY
@@ -190,6 +225,16 @@ RULES — order matters, top rules dominate:
         landed (next step: go to the cart icon, not bail) or it missed
         (next step: retry the ADD at the correct [ACTION] coords). Don't
         emit need_approval to escape a confused state.
+
+    (c) tap with an ADD-style note at the SAME coords as the previous ADD-
+        style tap, but claiming a DIFFERENT product name. A single button's
+        coordinates can't be the ADD button for two different products. As
+        soon as one ADD lands, that card's button transforms into a "− 1 +"
+        stepper at those coords. Repeating the same coords with a fake new
+        product name is a hallucination — the orchestrator rejects it
+        outright. After a successful ADD, go to the cart icon. For a
+        different product, find that product's own [ACTION] ADD line in
+        the UI list (its coords WILL be different).
 
 11. AVOID CONSECUTIVE WAITS. If your previous action was a wait and the screen
     still looks the same, do something concrete (scroll, back, or pick a

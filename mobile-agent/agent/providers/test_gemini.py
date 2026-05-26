@@ -57,6 +57,16 @@ class TestGeminiProvider:
         with pytest.raises(ProviderError):
             await gp.get_next_action(b"x", "t", [])
 
+    async def test_truncated_json_is_salvaged(self, monkeypatch) -> None:
+        # The model's response ran past max_output_tokens and got cut off
+        # right where the note key was about to start. The provider should
+        # salvage the complete fields rather than crash the whole step.
+        gp = _make_provider(
+            monkeypatch, '{"action": "tap", "x": 265, "y": 1287, "'
+        )
+        resp = await gp.get_next_action(b"x", "t", [])
+        assert resp.action == {"action": "tap", "x": 265, "y": 1287}
+
     async def test_429_retries_then_succeeds(self, monkeypatch) -> None:
         # Speed-up retry backoff.
         monkeypatch.setattr("agent.providers.gemini.BASE_BACKOFF_SECONDS", 0.0)

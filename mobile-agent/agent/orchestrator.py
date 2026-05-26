@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import re
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 _log = logging.getLogger("mobile_agent.orchestrator")
@@ -18,7 +21,9 @@ from agent.skills import SkillRegistry
 from agent.state_machine import Task, TaskState
 from agent.ui_tree import (
     UiElement,
+    find_action_at,
     find_smallest_element_at,
+    has_focused_text_input,
     is_coord_in_elements,
     parse as ui_tree_parse,
     to_prompt_section as ui_tree_to_prompt,
@@ -81,6 +86,116 @@ _ADD_INTENT_RE = re.compile(
     r"checkout|place\s+order|proceed\s+to|buy\s+now|pay\s+now)\b",
     re.IGNORECASE,
 )
+# Reasons that represent a LEGITIMATE sensitive handoff to the user — cart
+# review, payment, OTP, missing payment method, address confirmation,
+# permission/delete dialogs. These must reach the user even when they happen
+# inside the post-loop window (otherwise we kill a real cart-review just
+# because the model wobbled 2 steps earlier).
+_LEGITIMATE_SENSITIVE_RE = re.compile(
+    r"\b(cart\s+review|review\s+cart|"
+    r"payment|pay\s+now|place\s+order|"
+    r"otp|verification\s+code|verify\s+(otp|pin|code)|"
+    r"no\s+payment\s+method|"
+    r"confirm\s+(location|address|delivery)|"
+    r"address\s+confirmation|"
+    r"delete|uninstall|"
+    r"permission\s+(dialog|request)?)\b",
+    re.IGNORECASE,
+)
+# Cart-review reasons specifically — used to (a) detect when the user just
+# approved a cart-review HITL so we can latch payment_pre_approved, and (b)
+# distinguish "this is the cart screen handoff" from other sensitive flows.
+_CART_REVIEW_RE = re.compile(
+    r"\bcart\s+review\b|\breview\s+cart\b",
+    re.IGNORECASE,
+)
+# Payment-flow reasons — Pay Now / Place Order / Proceed to checkout — that
+# can auto-grant after a combined cart+payment approval has been latched on
+# the Task. OTP and "no payment method" are intentionally NOT in this set:
+# OTP must always reach the user, and no-payment-method needs a separate
+# decision.
+_PAYMENT_FLOW_RE = re.compile(
+    r"\b(payment|pay\s+now|place\s+order|proceed\s+to\s+(payment|checkout))\b",
+    re.IGNORECASE,
+)
+# Text/desc tokens that indicate the current screen IS the cart-review
+# screen — used to validate that "Cart review" need_approval reasons are
+# emitted at the right moment, not while still on search-results. Any one
+# match is sufficient. Case-insensitive substring search over UI text/desc.
+_CART_SCREEN_TOKENS = (
+    "proceed to checkout",
+    "proceed to pay",
+    "place order",
+    "pay now",
+    "select payment",
+    "delivery in",
+    "delivery charge",
+    "bill total",
+    "grand total",
+    "to pay",
+    "subtotal",
+    "missing cart items",
+    "your cart",
+    "cart total",
+)
+# Text/desc tokens that mark the current screen as a search/results page
+# where a "Cart review" need_approval would be premature — model needs to
+# tap [CART] or navigate to the cart screen first. Presence + absence of
+# cart-screen tokens together = premature.
+_SEARCH_SCREEN_TOKENS = (
+    "search for atta",
+    "search for ",
+    "filters",
+    "sort by",
+    "recent searches",
+    "trending in your city",
+    "people also bought",
+    "see more like this",
+)
+# Used by the same-coords-ADD-repeat check: extract the product-name fragment
+# from a note like "tap ADD on Maggi 2-Minute Masala Noodles card" so we can
+# tell whether two consecutive ADD taps claim the same or different products.
+_ADD_NOTE_PRODUCT_RE = re.compile(
+    r"\b(?:tap\s+add\s+on|press\s+add\s+on|add\s+to\s+cart\s+for|"
+    r"add\s+to\s+cart\s*[:,-]?)\s*(.+?)(?:\s+card|\s+button|\s*$)",
+    re.IGNORECASE,
+)
+# Strict "this note is about a fresh ADD" marker — requires the literal
+# word "add". Used by repeated-ADD rejection to distinguish a fresh ADD
+# tap from a stepper-bump ("tap + on Maggi" / "tap qty + button"). After
+# one ADD lands the same coords become the stepper; a second tap noted as
+# "ADD" can't be right — it's either a redundant retry, a qty bump
+# mis-labelled, or a hallucination.
+_FRESH_ADD_NOTE_RE = re.compile(r"\badd\b", re.IGNORECASE)
+# Category/tile/banner tap intent. Forbidden per prompt rule 1 unless the
+# user's task description explicitly invites browsing.
+_CATEGORY_INTENT_RE = re.compile(
+    r"\b(category|categories|tile|banner|carousel|promo\s+card|"
+    r"shop\s+by|browse|explore|collection|landing\s+page)\b",
+    re.IGNORECASE,
+)
+# Task-description keywords that legitimize a category/browse tap. If the
+# user said "browse maggi categories" or "explore noodle collections" we
+# should NOT reject category taps.
+_BROWSE_TASK_RE = re.compile(
+    r"\b(browse|explore|category|categories|collection|"
+    r"shop\s+by|landing\s+page|see\s+all)\b",
+    re.IGNORECASE,
+)
+# How far vertically from a tap target to look for matching product-name
+# text. Grocery cards are 400–600px tall; 250px covers the title/weight/
+# price strip but doesn't leak into adjacent products.
+_PRODUCT_NEARBY_BAND_PX = 250
+# Stop-words to discard when comparing the claimed product name to nearby
+# text. Without this filter, a generic note like "tap ADD on the first egg
+# product" would compare on "first"/"product" — meaningless. After filter
+# only "egg" remains, which must actually appear in nearby text.
+_PRODUCT_NOISE_WORDS = frozenset({
+    "the", "and", "for", "with", "card", "button", "first", "second",
+    "third", "next", "last", "any", "all", "new", "best", "top",
+    "product", "item", "row", "tile", "this", "that", "from", "into",
+    "qty", "quantity", "pack", "packet", "tap", "add", "cart", "click",
+})
 # When the provider reports fewer than this many requests left for the day,
 # warn the user so they aren't surprised by a QuotaExceeded mid-task.
 LOW_RPD_WARNING_THRESHOLD = 30
@@ -127,6 +242,7 @@ class Orchestrator:
         skills: SkillRegistry | None = None,
         repo: TaskRepository | None = None,
         enable_vision_hitl: bool = False,
+        artifact_dir: Path | None = None,
     ) -> None:
         self._adb = adb
         self._hitl = hitl
@@ -137,6 +253,11 @@ class Orchestrator:
         self._skills = skills
         self._repo = repo
         self._enable_vision_hitl = enable_vision_hitl
+        # Root directory for per-task screenshot+UI-dump+action artifacts.
+        # None disables persistence (used by unit tests). When set, every
+        # step writes step_<NN>.png, step_<NN>.xml, step_<NN>.json under a
+        # per-task subdir. This is how the user post-mortems a failed run.
+        self._artifact_dir = Path(artifact_dir) if artifact_dir is not None else None
         self.on_approval_request: Optional[ApprovalCallback] = None
         self.on_status_update: Optional[StatusCallback] = None
         self._tasks: dict[int, Task] = {}
@@ -149,6 +270,14 @@ class Orchestrator:
         self._loops_detected: int = 0
         self._last_loop_step: int = -1
         self._current_task_db_id: int | None = None
+        self._current_task_artifact_dir: Path | None = None
+        # True once this task has successfully fetched at least one non-empty
+        # UI tree. We use this to distinguish "device doesn't have
+        # uiautomator at all" (tree never available — degrade gracefully)
+        # from "transient dump failure" (tree usually available — reject
+        # taps until it comes back so the model can't tap blind). Reset
+        # per task in run_task.
+        self._task_tree_ever_seen: bool = False
 
     def get_task(self, user_id: int) -> Task | None:
         return self._tasks.get(user_id)
@@ -168,9 +297,16 @@ class Orchestrator:
         self._loops_detected = 0
         self._last_loop_step = -1
         self._current_task_db_id = None
+        self._current_task_artifact_dir = self._make_task_artifact_dir(task)
+        self._task_tree_ever_seen = False
         task.state = TaskState.RUNNING
         await self._persist_insert(task)
         await self._status(task, f"starting: {task.description}")
+        if self._current_task_artifact_dir is not None:
+            await self._status(
+                task,
+                f"📸 screenshots → {self._current_task_artifact_dir}",
+            )
         # Switch the device's IME to ADBKeyboard for the duration of the task,
         # so the agent's type actions land reliably. Restore the user's normal
         # IME on exit (finally:). Returns None if ADBKeyboard isn't enabled,
@@ -253,11 +389,24 @@ class Orchestrator:
             if synthetic is not None:
                 action = synthetic
                 self._consecutive_synthetic_waits += 1
+                # Synthetic wait path doesn't fetch a fresh ui tree, but we
+                # still want a screenshot artifact for this step so the
+                # post-mortem timeline isn't missing frames.
+                self._save_step_artifacts(
+                    task.step_count, screenshot, None, action, "synthetic-wait"
+                )
             else:
                 self._consecutive_synthetic_waits = 0
                 _log.info("step %d: skill+ui_tree", task.step_count)
                 skill_hint = await self._lookup_skill()
-                ui_tree, ui_elements = await self._lookup_ui_tree()
+                ui_tree, ui_elements, ui_xml = await self._lookup_ui_tree()
+                if ui_elements:
+                    # Latch: once we've seen a real tree on this task, any
+                    # later empty result is a transient failure (mid-app
+                    # animation) rather than a "this device strips
+                    # uiautomator" situation. The rejection check below uses
+                    # this to refuse blind taps.
+                    self._task_tree_ever_seen = True
                 loop_hint = self._loop_hint(task)
                 if loop_hint:
                     self._audit.log_action(
@@ -291,6 +440,16 @@ class Orchestrator:
                 # here (after a real call) and nowhere else — the dedup check
                 # depends on this invariant.
                 self._last_phash = current_phash
+                # Persist the model-input artifacts (screenshot, raw XML,
+                # parsed UI prompt block) BEFORE we decide whether the action
+                # is acceptable. That way the post-mortem shows exactly what
+                # the model saw and what it proposed, even if we then reject
+                # it downstream. The .json update at the end of execute
+                # records the final result so you can correlate.
+                self._save_step_artifacts(
+                    task.step_count, screenshot, ui_xml, action,
+                    "(pending)", ui_prompt=ui_tree,
+                )
 
             ok, reason = validate(action)
             if not ok:
@@ -298,6 +457,37 @@ class Orchestrator:
                     task.user_id, task.description, action, f"BLOCKED: {reason}"
                 )
                 raise OrchestratorError(f"action validation failed: {reason}")
+
+            # Stale-tree rejection: this task has previously fetched a real
+            # UI tree, but now the dump returned nothing. That's a transient
+            # uiautomator failure (typically: mid-animation, autocomplete
+            # dropdown opening, app transition). Without a tree, none of our
+            # coord/intent/product-name validators can fire — the model
+            # would tap completely blind. Reject taps and swipes until the
+            # tree recovers; wait/done/need_approval still pass.
+            if (
+                self._task_tree_ever_seen
+                and not ui_elements
+                and action.get("action") in {"tap", "swipe"}
+            ):
+                hint = (
+                    "REJECTED: UI tree dump returned no elements this step "
+                    "(transient uiautomator failure during animation). "
+                    "Don't tap blind. Emit a wait action so the screen can "
+                    "settle, then re-evaluate."
+                )
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "STALE_TREE_REJECTED",
+                )
+                await self._step_status(
+                    task,
+                    f"step {task.step_count}: UI dump empty, asking for wait",
+                )
+                self._finalize_step_result(task.step_count, action, hint)
+                self._last_phash = None
+                continue
 
             # Coord grounding: tap/swipe coords must map to some element in
             # the UI tree (with a 20px forgiveness margin). If they don't,
@@ -317,6 +507,7 @@ class Orchestrator:
                 await self._step_status(
                     task, f"step {task.step_count}: coords rejected, retrying"
                 )
+                self._finalize_step_result(task.step_count, action, hint)
                 # Don't let dedup short-circuit the next iteration — we need a
                 # fresh model call so it sees the rejection and adjusts.
                 self._last_phash = None
@@ -341,6 +532,115 @@ class Orchestrator:
                     task,
                     f"step {task.step_count}: intent/element mismatch, retrying",
                 )
+                self._finalize_step_result(task.step_count, action, hint)
+                self._last_phash = None
+                continue
+
+            # Product-name vs tap-coords check: the model claimed
+            # "tap ADD on <product>" but the UI elements near the tap
+            # coords don't mention <product> at all. Real failure case:
+            # claimed eggs, actually added a Fire TV Stick. Reject so the
+            # model has to re-target.
+            name_problem = self._add_product_name_mismatch(action, ui_elements)
+            if name_problem is not None:
+                hint = f"REJECTED: {name_problem}."
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "PRODUCT_NAME_MISMATCH_REJECTED",
+                )
+                await self._step_status(
+                    task,
+                    f"step {task.step_count}: product name doesn't match coords",
+                )
+                self._finalize_step_result(task.step_count, action, hint)
+                self._last_phash = None
+                continue
+
+            # Category/tile/banner tap rejection: the model is explicitly
+            # violating prompt rule 1 (forbidden navigation for add-to-cart
+            # flows). Block early so the model has to find a real product
+            # card instead of getting lost on a landing page.
+            category_problem = self._category_tap_rejection(task, action)
+            if category_problem is not None:
+                hint = f"REJECTED: {category_problem}."
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "CATEGORY_TAP_REJECTED",
+                )
+                await self._step_status(
+                    task,
+                    f"step {task.step_count}: category tap blocked, retrying",
+                )
+                self._finalize_step_result(task.step_count, action, hint)
+                self._last_phash = None
+                continue
+
+            # Same-coords ADD-after-ADD (any product name) is wrong — see
+            # _repeated_add_rejection docstring. Reject before execution so
+            # the loop detector doesn't consume a slot on it.
+            repeat_problem = self._repeated_add_rejection(task, action)
+            if repeat_problem is not None:
+                hint = f"REJECTED: {repeat_problem}."
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "REPEATED_ADD_REJECTED",
+                )
+                await self._step_status(
+                    task,
+                    f"step {task.step_count}: repeated-ADD hallucination, retrying",
+                )
+                self._finalize_step_result(task.step_count, action, hint)
+                self._last_phash = None
+                continue
+
+            # Type-without-focused-input rejection: ADB typing only lands
+            # in a focused EditText. If the model emits `type` without
+            # having focused an input, the characters go nowhere — and
+            # the model then hallucinates over what should be a search-
+            # results page that never loaded. Catch it before execution.
+            type_focus_problem = self._type_without_focus_rejection(
+                action, ui_elements
+            )
+            if type_focus_problem is not None:
+                hint = f"REJECTED: {type_focus_problem}."
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "TYPE_WITHOUT_FOCUS_REJECTED",
+                )
+                await self._step_status(
+                    task,
+                    f"step {task.step_count}: no focused input — tap "
+                    "EditText first, then type",
+                )
+                self._finalize_step_result(task.step_count, action, hint)
+                self._last_phash = None
+                continue
+
+            # Premature-cart-review rejection: model emits a "Cart review"
+            # need_approval while still on the search-results page (with
+            # hallucinated cart items pulled from cross-sell [ACTION] lines).
+            # Reject before HITL so the cart-screen handoff doesn't auto-
+            # grant a payment latch on a stale screen.
+            premature_reason = self._premature_cart_review_rejection(
+                action, ui_elements
+            )
+            if premature_reason is not None:
+                hint = f"REJECTED need_approval: {premature_reason}"
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "REJECTED: premature cart-review",
+                )
+                await self._step_status(
+                    task,
+                    f"step {task.step_count}: premature cart-review — "
+                    "navigate to cart first",
+                )
+                self._finalize_step_result(task.step_count, action, hint)
                 self._last_phash = None
                 continue
 
@@ -374,6 +674,7 @@ class Orchestrator:
                     f"step {task.step_count}: need_approval rejected — "
                     "scroll first",
                 )
+                self._finalize_step_result(task.step_count, action, hint)
                 self._last_phash = None
                 continue
 
@@ -392,6 +693,7 @@ class Orchestrator:
                 task.final_summary = action.get("summary", "")
                 task.history.append({"action": action, "result": "done"})
                 await self._persist_step(task, action, "done")
+                self._finalize_step_result(task.step_count, action, "done")
                 await self._status(task, f"done: {task.final_summary}")
                 return
 
@@ -401,6 +703,7 @@ class Orchestrator:
                 task.user_id, task.description, action, f"RESULT: {result}"
             )
             await self._persist_step(task, action, result)
+            self._finalize_step_result(task.step_count, action, result)
             note = str(action.get("note", "")).strip()
             status_msg = (
                 f"step {task.step_count}: {result} — {note}"
@@ -446,23 +749,27 @@ class Orchestrator:
             return None
         return self._skills.get(pkg)
 
-    async def _lookup_ui_tree(self) -> tuple[str | None, list[UiElement]]:
+    async def _lookup_ui_tree(
+        self,
+    ) -> tuple[str | None, list[UiElement], str | None]:
         """Fetch the on-screen accessibility tree.
 
-        Returns a 2-tuple: (rendered prompt block, parsed element list).
-        The rendered block goes into the model prompt; the parsed list is
-        used by the coord-validation check to reject hallucinated taps.
-        Both default to (None, []) on any failure so callers can degrade.
+        Returns a 3-tuple: (rendered prompt block, parsed element list,
+        raw XML). The rendered block goes into the model prompt; the parsed
+        list is used by the coord-validation check to reject hallucinated
+        taps; the raw XML is persisted as a per-step artifact so failed
+        runs can be inspected later. All three default to None/[]/None on
+        failure so callers can degrade.
         """
         try:
             xml = await self._adb.dump_ui_xml()
         except Exception:
-            return None, []
+            return None, [], None
         if not xml:
-            return None, []
+            return None, [], None
         elements = ui_tree_parse(xml)
         rendered = ui_tree_to_prompt(xml) or None
-        return rendered, elements
+        return rendered, elements, xml
 
     @staticmethod
     def _giveup_rejection(task: Task, action: dict) -> str | None:
@@ -524,6 +831,285 @@ class Orchestrator:
         )
 
     @staticmethod
+    def _premature_cart_review_rejection(
+        action: dict, elements: list[UiElement]
+    ) -> str | None:
+        """Reject `need_approval` with a "Cart review" reason when the
+        current screen clearly isn't the cart screen.
+
+        Failure mode from production runs: after a successful ADD on the
+        search results page, the model emits
+
+            {"action":"need_approval","reason":"Cart review: <items>"}
+
+        while still on the search results, hallucinating cart contents from
+        the [ACTION] product lines of cross-sell rows. Approving this would
+        auto-grant the payment latch and let the model fly past the actual
+        cart review.
+
+        Detection: the reason matches `_CART_REVIEW_RE`, the UI tree has
+        ZERO `_CART_SCREEN_TOKENS` matches, AND has at least one
+        `_SEARCH_SCREEN_TOKENS` match. All three conditions together avoid
+        false positives on apps without explicit cart-screen text.
+
+        Pass-through (no rejection) when the UI tree is unavailable —
+        better to surface the approval than to block the flow blindly.
+        """
+        if action.get("action") != "need_approval":
+            return None
+        reason = str(action.get("reason", ""))
+        if not _CART_REVIEW_RE.search(reason):
+            return None
+        if not elements:
+            return None
+        haystack = " ".join(
+            (e.text + " " + e.desc).lower() for e in elements
+        )
+        if any(tok in haystack for tok in _CART_SCREEN_TOKENS):
+            return None
+        if not any(tok in haystack for tok in _SEARCH_SCREEN_TOKENS):
+            # No clear search-screen indicator either — don't second-guess.
+            return None
+        cart_bar = next((e for e in elements if e.is_cart_bar), None)
+        if cart_bar is not None:
+            cart_hint = (
+                f" Tap the [CART] element at ({cart_bar.cx},{cart_bar.cy}) "
+                "to navigate to the cart screen first."
+            )
+        else:
+            cart_hint = (
+                " No [CART] element is visible in the UI tree on this "
+                "screen — press back to return to the home screen and "
+                "look for the labelled 'View cart' bar there."
+            )
+        return (
+            "premature cart-review need_approval: the current screen has "
+            "search/results markers and lacks any cart-screen markers "
+            "(no 'Proceed to checkout' / 'Place order' / 'Pay' / "
+            "'Select payment' / 'subtotal' / 'total' visible). The cart "
+            "screen hasn't been reached yet, so 'Cart review: ...' is "
+            "premature and the items in the reason are likely "
+            "hallucinated from the search-results cross-sell rows."
+            + cart_hint
+        )
+
+    @staticmethod
+    def _type_without_focus_rejection(
+        action: dict, elements: list[UiElement]
+    ) -> str | None:
+        """Return a rejection reason when a `type` action is emitted with no
+        focused text-input element in the UI tree, else None.
+
+        ADB's `input text` (and ADBKeyboard's broadcast variant) only land
+        characters in whatever EditText is currently focused. If nothing is
+        focused, the keystrokes go nowhere — but the model can't tell from
+        a screenshot alone whether its previous tap landed a focus or just
+        navigated. So we structurally check the dump.
+
+        Pass-through when no tree is available (empty `elements`) — we
+        already err on the side of letting actions execute when validation
+        info is missing. See `has_focused_text_input`'s docstring.
+        """
+        if action.get("action") != "type":
+            return None
+        if has_focused_text_input(elements):
+            return None
+        return (
+            "type emitted but no focused EditText / SearchView / "
+            "AutoCompleteTextView is visible in the UI tree. ADB typing "
+            "lands characters in the focused input; without one the "
+            "keystrokes go to /dev/null. The previous tap probably "
+            "navigated to a new screen (e.g., the search page) without "
+            "focusing its input. Required next action: find the actual "
+            "EditText/SearchView on the current screen in the UI elements "
+            "list and tap its coords, then retry the type"
+        )
+
+    @staticmethod
+    def _add_product_name_mismatch(
+        action: dict, elements: list[UiElement]
+    ) -> str | None:
+        """Reject an "ADD on <product>" tap when <product> doesn't match the
+        product label attached to the [ACTION] element under those coords.
+
+        Primary signal: each [ACTION] element carries a `container_label`
+        sourced from its XML ancestor's content-desc (the product card's
+        full title — e.g. "Hen Fruit -10 Max Protein Speciality Eggs").
+        That's the ground truth for which product the ADD button buys.
+
+        If the tap lands on an [ACTION] whose container_label exists and
+        shares NO significant keyword with the model's claimed product
+        name, this is the Fire-TV-Stick-instead-of-eggs / Coolberg-Beer-
+        instead-of-Hen-Fruit failure mode and we reject with the actual
+        product name surfaced in the error.
+
+        Fall back to the prior band-based "any nearby text matches" check
+        when the action has no container_label (some apps don't expose
+        product titles in the accessibility tree).
+
+        Conservative on purpose:
+        - skips when product name can't be parsed (no rejection)
+        - skips when claimed name has no meaningful (≥3 char, non-stop)
+          words (no rejection)
+        - skips when UI tree is empty (no rejection)
+        - matches loosely (any significant word, case-insensitive)
+        """
+        if action.get("action") != "tap":
+            return None
+        if not elements:
+            return None
+        note = str(action.get("note", ""))
+        if not _FRESH_ADD_NOTE_RE.search(note):
+            return None
+        claimed = _extract_product_from_add_note(note)
+        if not claimed:
+            return None
+        words = [
+            w for w in re.split(r"[^a-z0-9]+", claimed.lower())
+            if len(w) >= 3 and w not in _PRODUCT_NOISE_WORDS
+        ]
+        if not words:
+            return None
+        try:
+            x = int(action.get("x"))
+            y = int(action.get("y"))
+        except (TypeError, ValueError):
+            return None
+        # First-line check: does the [ACTION] element under these coords
+        # have an XML-ancestor product label that contradicts the claim?
+        action_target = find_action_at(x, y, elements)
+        if action_target is not None and action_target.container_label:
+            label_lc = action_target.container_label.lower()
+            if any(w in label_lc for w in words):
+                return None
+            return (
+                f"note claims tap ADD on '{claimed}' at ({x},{y}), but "
+                f"the ADD button at those coords actually buys "
+                f"'{action_target.container_label}' (per the UI tree's "
+                f"product card label). Find the [ACTION] line whose `for "
+                f"\"...\"` annotation actually matches your target "
+                "product, and tap ITS coords"
+            )
+        # Fallback: no container label available — use the legacy
+        # vertically-banded "any nearby text" check so we still catch the
+        # mismatch on apps where product titles aren't surfaced as
+        # row-level content-desc.
+        target = find_smallest_element_at(x, y, elements)
+        if target is None:
+            return None
+        nearby = []
+        for e in elements:
+            if abs(e.cy - target.cy) > _PRODUCT_NEARBY_BAND_PX:
+                continue
+            if e.text:
+                nearby.append(e.text.lower())
+            if e.desc:
+                nearby.append(e.desc.lower())
+        if not nearby:
+            return None
+        haystack = " ".join(nearby)
+        if any(w in haystack for w in words):
+            return None
+        return (
+            f"note claims tap ADD on '{claimed}' at ({x},{y}), but none "
+            f"of the keywords {words} appear in any text near those coords "
+            f"in the UI tree. Nearest texts: {nearby[:6]}. The tap is "
+            "landing on a DIFFERENT product's ADD button. Find the row "
+            "whose title actually contains your target product name and "
+            "use ITS [ACTION] ADD coords"
+        )
+
+    @staticmethod
+    def _repeated_add_rejection(task: Task, action: dict) -> str | None:
+        """Reject ANY 'fresh ADD' tap at the same coords as a previous one.
+
+        After an ADD button is tapped, the card transforms into a "− 1 +"
+        stepper — those pixels stop being ADD. A second 'tap ADD' at the
+        same coords is therefore wrong in every plausible reading:
+          (a) it actually hits the new stepper '+' and silently bumps qty
+              (which the user almost never asked for);
+          (b) the first ADD missed, and repeating identical coords with
+              identical intent won't help — diagnose differently;
+          (c) it's a hallucination (model invented a "new product card"
+              that doesn't exist at that pixel).
+
+        We only count fresh-ADD intent (literal word "add" in note), so
+        legitimate stepper bumps ("tap + on Maggi to set qty 2") aren't
+        rejected — they don't have the word "add". Coords within 10px count
+        as "same".
+        """
+        if action.get("action") != "tap":
+            return None
+        note = str(action.get("note", ""))
+        if not _FRESH_ADD_NOTE_RE.search(note):
+            return None
+        last_tap = _last_executed_tap(task.history)
+        if last_tap is None:
+            return None
+        prev_note = str(last_tap.get("note", ""))
+        if not _FRESH_ADD_NOTE_RE.search(prev_note):
+            return None
+        try:
+            x, y = int(action.get("x")), int(action.get("y"))
+            px, py = int(last_tap.get("x")), int(last_tap.get("y"))
+        except (TypeError, ValueError):
+            return None
+        if abs(x - px) > 10 or abs(y - py) > 10:
+            return None  # different coords — no claim of "same button"
+
+        cur_product = _extract_product_from_add_note(note)
+        prev_product = _extract_product_from_add_note(prev_note)
+        # Custom message for the two sub-cases. Both are rejected; we just
+        # hint differently so the model knows what to do next.
+        if cur_product and prev_product and cur_product != prev_product:
+            return (
+                f"previous tap at ({px},{py}) claimed ADD on "
+                f"'{prev_product}'; this tap at ({x},{y}) claims ADD on "
+                f"'{cur_product}'. Same coords cannot be the ADD button for "
+                "two different products. After one ADD lands, the card "
+                "becomes a '− 1 +' stepper at those coords (not a new ADD). "
+                "Go to the cart icon (the previous ADD likely landed), or "
+                "find a different product card's [ACTION] ADD at different "
+                "coords"
+            )
+        return (
+            f"previous tap at ({px},{py}) was already a fresh ADD; this tap "
+            f"at ({x},{y}) repeats it at the same coords with another ADD "
+            "note. After one ADD lands, the card's button becomes '− 1 +' "
+            "— those pixels are no longer ADD. If you wanted quantity 2, "
+            "emit a tap with note 'tap + on stepper' (no word 'add'). If "
+            "you wanted to proceed, tap the cart icon. Don't retry the "
+            "same ADD"
+        )
+
+    @staticmethod
+    def _category_tap_rejection(task: Task, action: dict) -> str | None:
+        """Reject category/tile/banner taps unless the task asked for browsing.
+
+        Prompt rule 1 forbids tapping category tiles for add-to-cart flows
+        because they navigate AWAY from the search results into a landing
+        page. The model is told this but sometimes ignores it (this run:
+        step 8 'tap maggi noodles category'). Structural enforcement:
+        if the note self-identifies as a category/tile/banner tap and the
+        task description doesn't ask for browsing → reject.
+        """
+        if action.get("action") != "tap":
+            return None
+        note = str(action.get("note", ""))
+        if not _CATEGORY_INTENT_RE.search(note):
+            return None
+        if _BROWSE_TASK_RE.search(task.description):
+            return None
+        return (
+            f"note '{note}' is a category/tile/banner tap. The task "
+            f"'{task.description}' is an add-to-cart flow, not a browse "
+            "flow — tapping a category leaves the product results and "
+            "lands on a landing page (often gated by a 'Confirm Location' "
+            "sheet). Stay on the search results: tap the [ACTION] ADD on "
+            "a real product card, or swipe to scroll if none is visible"
+        )
+
+    @staticmethod
     def _intent_mismatch(action: dict, elements: list[UiElement]) -> str | None:
         """Return a rejection reason when the tap's note disagrees with the
         element actually under the coord, else None.
@@ -558,19 +1144,40 @@ class Orchestrator:
         if target is None:
             return None  # caught by _coords_mismatch
 
-        # (1) Search intent landing on the LOCATION header.
+        # Search intent: target MUST look like a search target. This is a
+        # positive rule — the LOCATION-marker check is one symptom; the
+        # broader truth is "if the note says search, the element must say
+        # search". On Blinkit the location header is a TextView showing
+        # city/address text with no 'search' token anywhere, so the
+        # LOCATION-token heuristic missed it. The positive rule below
+        # catches it regardless of any app-specific token vocabulary.
         if (
             _SEARCH_INTENT_RE.search(note)
             and not _ADDRESS_INTENT_RE.search(note)
-            and target.looks_like_location_header
         ):
-            return (
-                f"note '{note}' implies tapping the search bar, but the "
-                f"element at ({x},{y}) is the [LOCATION] delivery/address "
-                "header. The real search bar is a separate element below — "
-                "look for class=EditText or an id containing 'search', "
-                "usually with cy in 300–400 range"
-            )
+            if target.looks_like_location_header:
+                return (
+                    f"note '{note}' implies tapping the search bar, but the "
+                    f"element at ({x},{y}) is the [LOCATION] delivery/"
+                    "address header. The real search bar is a separate "
+                    "element below — look for class=EditText or an id "
+                    "containing 'search', usually with cy in 300–400 range"
+                )
+            if not _looks_like_search_target(target):
+                return (
+                    f"note '{note}' implies tapping a search bar/box/icon, "
+                    f"but the element at ({x},{y}) is "
+                    f"class='{target.class_name}' text='{target.text}' "
+                    f"id='{target.resource_id}' — none of those say 'search' "
+                    "and the class isn't an EditText/SearchView. The real "
+                    "search target's class will contain 'EditText' / "
+                    "'SearchView' / 'AutoCompleteTextView', OR its id/text/"
+                    "content-desc will contain the word 'search' (e.g., "
+                    "hint text 'Search for atta, butter…'). Find THAT "
+                    "element in the UI elements list and use ITS coords. "
+                    "Don't tap a city-name / address / banner just because "
+                    "it sits near the top of the screen"
+                )
 
         # (2) ADD/cart intent landing on a non-[ACTION] element.
         if _ADD_INTENT_RE.search(note) and not target.is_action:
@@ -733,23 +1340,55 @@ class Orchestrator:
         if not needs_approval:
             return
 
+        # Combined cart+payment approval: if the user already approved the
+        # cart review (which the prompt explicitly tells the model to phrase
+        # as covering payment too), payment-flow gates further down the
+        # checkout (Pay Now / Place Order / proceed to payment) auto-grant.
+        # This keeps the user to one approval per order while preserving the
+        # audit trail. OTP, "no payment method", and other separate sensitive
+        # categories don't match _PAYMENT_FLOW_RE so still prompt.
+        reason_text = str(action.get("reason", ""))
+        action_note = str(action.get("note", ""))
+        payment_haystack = f"{reason_text} {action_note}"
+        if (
+            task.payment_pre_approved
+            and _PAYMENT_FLOW_RE.search(payment_haystack)
+            and not _CART_REVIEW_RE.search(reason_text)
+        ):
+            self._audit.log_action(
+                task.user_id, task.description, action,
+                "AUTO_APPROVED: payment pre-approved at cart review",
+            )
+            return
+
         # If the model emits need_approval shortly after a loop hint was
-        # injected, it's using approval as a give-up escape hatch rather
-        # than a genuine sensitive-action gate. Hard-terminate instead of
-        # pausing for human rescue.  Genuine cart-review approvals happen
-        # on clean flows where no loop was recently detected.
+        # injected, it's *usually* using approval as a give-up escape hatch
+        # rather than a genuine sensitive-action gate. EXCEPTION: a
+        # legitimate-sensitive reason (cart review, payment, OTP, no
+        # payment method, address confirmation, delete, permission) is a
+        # real handoff even if a wobble happened a couple of steps before.
+        # We previously killed all post-loop need_approval indiscriminately,
+        # which dropped real cart-review handoffs on the floor.
         if (
             self._last_loop_step >= 0
             and (task.step_count - self._last_loop_step) <= LOOP_TO_GIVEUP_WINDOW
             and action.get("action") == "need_approval"
         ):
+            reason = str(action.get("reason", ""))
+            if not _LEGITIMATE_SENSITIVE_RE.search(reason):
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "BLOCKED: need_approval used as loop escape",
+                )
+                raise OrchestratorError(
+                    "model emitted need_approval to escape a detected loop; "
+                    "aborting instead of pausing for approval"
+                )
+            # Legitimate handoff inside the loop window — log and fall
+            # through to normal HITL flow.
             self._audit.log_action(
                 task.user_id, task.description, action,
-                "BLOCKED: need_approval used as loop escape",
-            )
-            raise OrchestratorError(
-                "model emitted need_approval to escape a detected loop; "
-                "aborting instead of pausing for approval"
+                "LOOP_WINDOW: legitimate sensitive reason — passing through",
             )
 
         task.state = TaskState.AWAITING_APPROVAL
@@ -764,6 +1403,20 @@ class Orchestrator:
                 task.user_id, task.description, action, "DENIED"
             )
             raise OrchestratorError("user denied approval")
+        # If the user just approved a Cart-review need_approval, latch the
+        # combined-approval flag so the downstream Pay Now / Place Order
+        # gate auto-grants. The prompt instructs the model to phrase the
+        # cart-review reason as covering payment, so a single user tap on
+        # Approve covers the whole checkout. (We still HITL OTPs and other
+        # unrelated sensitive categories separately.)
+        if action.get("action") == "need_approval" and _CART_REVIEW_RE.search(
+            str(action.get("reason", ""))
+        ):
+            task.payment_pre_approved = True
+            self._audit.log_action(
+                task.user_id, task.description, action,
+                "CART_APPROVED: payment_pre_approved=True",
+            )
         task.state = TaskState.RUNNING
         task.pending_action = None
 
@@ -889,6 +1542,97 @@ class Orchestrator:
             pass
 
 
+    def _make_task_artifact_dir(self, task: Task) -> Path | None:
+        """Create a per-task directory under self._artifact_dir and return it.
+
+        Returns None when persistence is disabled (`artifact_dir` None at
+        construction) or when the directory can't be created — in either
+        case the loop will silently skip per-step saves. Never raises.
+        """
+        if self._artifact_dir is None:
+            return None
+        try:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+            slug = _safe_slug(task.description)
+            sub = self._artifact_dir / f"{stamp}_user{task.user_id}_{slug}"
+            sub.mkdir(parents=True, exist_ok=True)
+            # Drop a task.json so reviewers know what the user asked for.
+            try:
+                (sub / "task.json").write_text(
+                    json.dumps(
+                        {
+                            "user_id": task.user_id,
+                            "description": task.description,
+                            "started_at": stamp,
+                        },
+                        indent=2,
+                    )
+                )
+            except OSError:
+                pass
+            return sub
+        except OSError:
+            return None
+
+    def _finalize_step_result(
+        self, step: int, action: dict | None, result: str
+    ) -> None:
+        """Overwrite the step's .json with its FINAL action+result.
+
+        Called at every exit of an iteration (rejection or execution). The
+        initial save happened right after the vision call with
+        result='(pending)'; this updates it once we know what actually
+        happened. Screenshot and XML are not re-saved — they're already on
+        disk from the pending write.
+        """
+        self._save_step_artifacts(step, None, None, action, result)
+
+    def _save_step_artifacts(
+        self,
+        step: int,
+        screenshot: bytes | None,
+        ui_xml: str | None,
+        action: dict | None,
+        result: str | None,
+        ui_prompt: str | None = None,
+    ) -> None:
+        """Write screenshot/XML/action JSON for `step`. Best-effort.
+
+        Files: step_NN.png, step_NN.xml, step_NN.json, step_NN.ui_prompt.txt
+        Anything that fails to write is silently skipped — debugging
+        artifacts must never abort a live task.
+        """
+        sub = self._current_task_artifact_dir
+        if sub is None:
+            return
+        prefix = f"step_{step:02d}"
+        if screenshot:
+            try:
+                (sub / f"{prefix}.png").write_bytes(screenshot)
+            except OSError:
+                pass
+        if ui_xml:
+            try:
+                (sub / f"{prefix}.xml").write_text(ui_xml)
+            except OSError:
+                pass
+        if ui_prompt:
+            try:
+                (sub / f"{prefix}.ui_prompt.txt").write_text(ui_prompt)
+            except OSError:
+                pass
+        if action is not None or result is not None:
+            try:
+                (sub / f"{prefix}.json").write_text(
+                    json.dumps(
+                        {"action": action, "result": result},
+                        indent=2,
+                        default=str,
+                    )
+                )
+            except OSError:
+                pass
+
     async def _persist_insert(self, task: Task) -> None:
         if self._repo is None:
             return
@@ -960,6 +1704,60 @@ def _history_has_swipe(history: list[dict]) -> bool:
     return False
 
 
+# Class-name substrings that mark an element as the real search target.
+# Used by `_looks_like_search_target` to validate that a "search bar"-noted
+# tap actually lands on something that can accept a search query.
+_SEARCH_CLASS_TOKENS = ("edittext", "searchview", "autocompletetextview")
+
+
+def _looks_like_search_target(e: UiElement) -> bool:
+    """True if `e` is plausibly THE search input on screen.
+
+    Positive heuristic — must satisfy at least one of:
+      - class contains EditText / SearchView / AutoCompleteTextView
+      - resource-id contains 'search' (e.g., search_box, search_button)
+      - visible text contains 'search' (typically hint text like
+        'Search for atta, butter…' — present on home-screen launchers
+        that aren't real inputs but DO navigate to a search screen)
+      - content-desc contains 'search' (icon-only search buttons)
+
+    Anything that satisfies NONE of the above is not a search target — it
+    might be a location header, a banner, a category tile, the user's
+    profile chip, etc.
+    """
+    cls = e.class_name.lower()
+    if any(tok in cls for tok in _SEARCH_CLASS_TOKENS):
+        return True
+    if "search" in e.resource_id.lower():
+        return True
+    if "search" in e.text.lower():
+        return True
+    if "search" in e.desc.lower():
+        return True
+    return False
+
+
+def _extract_product_from_add_note(note: str) -> str | None:
+    """Pull the product-name fragment out of a 'tap ADD on …' note.
+
+    Returns a normalized lowercase string (whitespace-collapsed, trailing
+    'card'/'button' trimmed) or None if the note doesn't match the shape.
+    Used by `_repeated_add_rejection` to tell whether two consecutive ADD
+    taps name the SAME product (legitimate retry — let loop detector
+    handle) or DIFFERENT products (hallucination — reject immediately).
+    """
+    m = _ADD_NOTE_PRODUCT_RE.search(note)
+    if not m:
+        return None
+    name = m.group(1).strip().strip(",.:;\"'")
+    name = re.sub(r"\s+", " ", name).lower()
+    # Trim common trailing fluff so "Maggi Noodles card" == "Maggi Noodles".
+    for tail in (" card", " button", " row", " item"):
+        if name.endswith(tail):
+            name = name[: -len(tail)].rstrip()
+    return name or None
+
+
 def _last_executed_tap(history: list[dict]) -> dict | None:
     """Return the most recent successfully-executed tap action, or None.
 
@@ -978,6 +1776,19 @@ def _last_executed_tap(history: list[dict]) -> dict | None:
             continue
         return action
     return None
+
+
+def _safe_slug(s: str, max_len: int = 32) -> str:
+    """Filesystem-safe slug for use in directory names.
+
+    Keeps letters / digits / dashes; collapses other runs to a single '-'.
+    Truncates at `max_len` so deeply-nested directories stay reasonable.
+    Falls back to 'task' for entirely-non-alphanumeric inputs.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9-]+", "-", s).strip("-").lower()
+    if not cleaned:
+        return "task"
+    return cleaned[:max_len].rstrip("-") or "task"
 
 
 def _safe_phash(image_bytes: bytes) -> str | None:

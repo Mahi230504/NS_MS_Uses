@@ -153,11 +153,64 @@ class AdbController:
         return original
 
     async def restore_ime(self, ime_id: str | None) -> None:
-        """Restore the IME previously captured by use_adbkeyboard_for_task."""
+        """Restore the IME previously captured by use_adbkeyboard_for_task.
+
+        If `ime_id` is None (e.g., we couldn't capture the original, or
+        ADBKeyboard was already active before the task started), falls
+        through to `force_off_adbkeyboard` so the device doesn't stay on
+        ADBKeyboard forever — the user's normal keyboard always wins on
+        task exit regardless of what we captured at start.
+        """
         if not ime_id:
+            await self.force_off_adbkeyboard()
             return
         try:
             await self._run("shell", "ime", "set", ime_id)
+        except AdbError:
+            # Captured IME failed to apply (e.g., it was uninstalled
+            # mid-task). Fall back to any other enabled IME.
+            await self.force_off_adbkeyboard()
+
+    async def force_off_adbkeyboard(self) -> None:
+        """Switch IME to any non-ADBKeyboard enabled IME, if needed.
+
+        No-op when ADBKeyboard isn't the current IME. Otherwise lists all
+        enabled IMEs and picks the first one that isn't ADBKeyboard. This
+        is the safety net for:
+          1. Crashed prior bot runs (Ctrl+C / kill / OS reboot before our
+             `finally` block ran) — called on bot startup to clean up.
+          2. In-process restoration when the original IME wasn't captured
+             because ADBKeyboard was already active at task start, or the
+             query failed.
+
+        Best-effort: any adb hiccup is swallowed — never raises.
+        """
+        try:
+            current = await self._current_ime()
+        except Exception:
+            return
+        if current != _ADBKEYBOARD_IME:
+            return
+        try:
+            enabled_raw = await self._run("shell", "ime", "list", "-s")
+        except AdbError:
+            return
+        enabled = [
+            line.strip()
+            for line in enabled_raw.decode("utf-8", errors="replace").splitlines()
+            if line.strip()
+        ]
+        fallback = next(
+            (ime for ime in enabled if ime != _ADBKEYBOARD_IME),
+            None,
+        )
+        if fallback is None:
+            # No alternative enabled. We could try `ime reset` here but
+            # that requires the right permission. Leave it; user can
+            # manually switch in Settings.
+            return
+        try:
+            await self._run("shell", "ime", "set", fallback)
         except AdbError:
             pass
 
@@ -232,20 +285,96 @@ class AdbController:
         what a vision model can extract from pixels. Feeding this alongside
         the screenshot is the single biggest reliability win for grounding.
 
-        Returns None (not raises) so callers can degrade gracefully when the
-        tool isn't available (e.g. some OEM ROMs strip it).
+        Hybrid strategy. The default `uiautomator dump` (no flags) produces
+        a *complete* tree but requires the screen to be "idle" — it errors
+        out with "could not get idle state" on apps with constant
+        animations (banners, carousels, skeleton loaders). The
+        `--compressed` variant bypasses the idle check, but on real
+        devices it has been observed to STRIP elements we care about
+        (specifically: EditText on Blinkit's search screen disappears
+        from the compressed dump, even though it's visible in the
+        screenshot and the user can tap it). So:
+
+          1. Try the normal dump first → best case, get a clean complete
+             tree with all EditTexts/SearchViews present.
+          2. If normal returns nothing (idle-state error), retry once
+             after a 250ms pause — small animations may have finished.
+          3. If normal still fails, fall back to `--compressed` so we at
+             least get *something* the model can act on. The tree may be
+             missing inputs, but it'll still have ADD buttons / nav
+             elements, which is better than tapping blind.
+
+        Returns None only if all attempts fail (e.g., OEM strips
+        uiautomator entirely).
+        """
+        # Pass 1+2: normal dump (with one retry). Best fidelity.
+        for attempt in range(2):
+            text = await self._try_dump(compressed=False)
+            extracted = self._extract_hierarchy(text)
+            if extracted is not None:
+                return extracted
+            if attempt == 0:
+                await asyncio.sleep(0.25)
+        # Pass 3: compressed fallback. Lower fidelity (missing some
+        # element types) but works on non-idle screens.
+        text = await self._try_dump(compressed=True)
+        return self._extract_hierarchy(text)
+
+    async def _try_dump(self, *, compressed: bool) -> str:
+        """Run one uiautomator dump invocation, return decoded output.
+
+        Each invocation spawns a ~110MB `uiautomator` process on the device.
+        If a previous invocation hung or got OOM-killed, its pid lingers and
+        the next dump returns "Killed" (because Android refuses to launch
+        another while one is still around or because OOM-killer reaped the
+        new one to keep memory low).
+
+        Mitigation: best-effort `killall uiautomator` before each dump so
+        only one ever exists at a time. Real fix for the long-running case
+        would be to use UIAutomator2 (server APK), but that requires an
+        install step we'd rather avoid.
+        """
+        await self._kill_stale_uiautomator()
+        args = ["exec-out", "uiautomator", "dump"]
+        if compressed:
+            args.append("--compressed")
+        args.append("/dev/tty")
+        try:
+            out = await self._run(*args)
+        except AdbError:
+            return ""
+        return out.decode("utf-8", errors="replace").strip()
+
+    async def _kill_stale_uiautomator(self) -> None:
+        """Reap any leftover uiautomator processes before spawning a new one.
+
+        Errors are swallowed: `killall` returns non-zero when no matching
+        process exists (the normal case on a fresh device), and we don't
+        care if the kill itself fails — the worst outcome is a stuck dump,
+        which is what we already have.
         """
         try:
-            out = await self._run("exec-out", "uiautomator", "dump", "/dev/tty")
+            await self._run("shell", "killall", "uiautomator")
         except AdbError:
+            pass
+
+    @staticmethod
+    def _extract_hierarchy(text: str) -> str | None:
+        """Pull the <?xml ... </hierarchy> chunk out of raw dump output.
+
+        uiautomator prepends "ERROR: could not get idle state." in failure
+        cases (and sometimes appends "UI hierchary dumped to: ..." after
+        success). Locate the XML by tag, not by line index.
+        """
+        if not text:
             return None
-        text = out.decode("utf-8", errors="replace").strip()
-        # uiautomator dump sometimes appends "UI hierchary dumped to: ..." after
-        # the XML. Strip anything past the closing </hierarchy> tag.
+        start = text.find("<?xml")
+        if start == -1:
+            start = text.find("<hierarchy")
         end = text.rfind("</hierarchy>")
-        if end == -1:
+        if start == -1 or end == -1 or end <= start:
             return None
-        return text[: end + len("</hierarchy>")]
+        return text[start : end + len("</hierarchy>")]
 
     async def get_foreground_package(self) -> str | None:
         """Return the package name of the foregrounded activity, or None.

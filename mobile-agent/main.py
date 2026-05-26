@@ -85,6 +85,13 @@ def main() -> None:
         )
 
     adb = AdbController(settings.android_device_id)
+    # If a previous bot run was killed before its finally-block could
+    # restore the IME, the device may still be on ADBKeyboard. Switch off
+    # before we start so the user's normal keyboard works while idle.
+    try:
+        asyncio.run(adb.force_off_adbkeyboard())
+    except Exception:
+        log.warning("startup IME cleanup failed; user may need to switch in Settings")
     hitl = HitlGate()
     audit = AuditLogger(settings.log_dir)
     vision = make_provider(
@@ -139,6 +146,7 @@ def main() -> None:
         skills=skills,
         repo=repo,
         enable_vision_hitl=settings.enable_vision_hitl,
+        artifact_dir=settings.log_dir / "screenshots",
     )
 
     # Intent router — only wire if the provider supports text completion

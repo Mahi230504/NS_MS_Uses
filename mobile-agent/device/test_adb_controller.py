@@ -179,3 +179,88 @@ class TestUseAdbkeyboardForTask:
 
         monkeypatch.setattr(adb, "_run", fake_run)
         assert await adb.use_adbkeyboard_for_task() is None
+
+
+class TestForceOffAdbkeyboard:
+    """Safety net for crashed prior runs / uncaptured original IME — when
+    the device is stuck on ADBKeyboard, switch to anything else enabled."""
+
+    async def test_switches_to_first_non_adbkeyboard_enabled(
+        self, monkeypatch
+    ) -> None:
+        adb = AdbController("emulator-5554")
+        gboard = "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+        calls: list[tuple[str, ...]] = []
+
+        async def fake_run(*args: str) -> bytes:
+            calls.append(args)
+            if args[:5] == ("shell", "settings", "get", "secure", "default_input_method"):
+                return b"com.android.adbkeyboard/.AdbIME\n"
+            if args[:4] == ("shell", "ime", "list", "-s"):
+                return f"com.android.adbkeyboard/.AdbIME\n{gboard}\n".encode()
+            return b""
+
+        monkeypatch.setattr(adb, "_run", fake_run)
+        await adb.force_off_adbkeyboard()
+
+        ime_sets = [c for c in calls if c[:3] == ("shell", "ime", "set")]
+        assert ime_sets == [("shell", "ime", "set", gboard)]
+
+    async def test_noop_when_already_off_adbkeyboard(self, monkeypatch) -> None:
+        adb = AdbController("emulator-5554")
+        gboard = "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+        calls: list[tuple[str, ...]] = []
+
+        async def fake_run(*args: str) -> bytes:
+            calls.append(args)
+            if args[:5] == ("shell", "settings", "get", "secure", "default_input_method"):
+                return f"{gboard}\n".encode()
+            return b""
+
+        monkeypatch.setattr(adb, "_run", fake_run)
+        await adb.force_off_adbkeyboard()
+
+        # Current IME isn't ADBKeyboard — no list query, no ime set.
+        assert not [c for c in calls if c[:3] == ("shell", "ime", "set")]
+        assert not [c for c in calls if c[:4] == ("shell", "ime", "list", "-s")]
+
+    async def test_noop_when_no_alternative_enabled(self, monkeypatch) -> None:
+        adb = AdbController("emulator-5554")
+        calls: list[tuple[str, ...]] = []
+
+        async def fake_run(*args: str) -> bytes:
+            calls.append(args)
+            if args[:5] == ("shell", "settings", "get", "secure", "default_input_method"):
+                return b"com.android.adbkeyboard/.AdbIME\n"
+            if args[:4] == ("shell", "ime", "list", "-s"):
+                # Only ADBKeyboard enabled — nothing to swap to.
+                return b"com.android.adbkeyboard/.AdbIME\n"
+            return b""
+
+        monkeypatch.setattr(adb, "_run", fake_run)
+        await adb.force_off_adbkeyboard()
+        # No ime set called because there's nothing else to swap to.
+        assert not [c for c in calls if c[:3] == ("shell", "ime", "set")]
+
+    async def test_restore_ime_falls_back_when_id_is_none(
+        self, monkeypatch
+    ) -> None:
+        """restore_ime(None) should now invoke the force-off safety net,
+        not just return early. Otherwise a task that started with
+        ADBKeyboard already active never switches off."""
+        adb = AdbController("emulator-5554")
+        gboard = "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+        calls: list[tuple[str, ...]] = []
+
+        async def fake_run(*args: str) -> bytes:
+            calls.append(args)
+            if args[:5] == ("shell", "settings", "get", "secure", "default_input_method"):
+                return b"com.android.adbkeyboard/.AdbIME\n"
+            if args[:4] == ("shell", "ime", "list", "-s"):
+                return f"com.android.adbkeyboard/.AdbIME\n{gboard}\n".encode()
+            return b""
+
+        monkeypatch.setattr(adb, "_run", fake_run)
+        await adb.restore_ime(None)
+        ime_sets = [c for c in calls if c[:3] == ("shell", "ime", "set")]
+        assert ime_sets == [("shell", "ime", "set", gboard)]

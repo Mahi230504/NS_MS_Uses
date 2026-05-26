@@ -21,7 +21,7 @@ from typing import Any
 
 from openai import AsyncOpenAI, APIError, RateLimitError
 
-from agent.providers._parse import extract_json_object
+from agent.providers._parse import extract_json_object, salvage_truncated_json
 from agent.providers.base import (
     ProviderError,
     ProviderResponse,
@@ -34,7 +34,13 @@ from config import prompts
 
 DEFAULT_MODEL = "google/gemini-2.5-flash"
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
-MAX_OUTPUT_TOKENS = 1024
+# 4096 is well within Gemini-2.5-Flash's 8K output budget and gives plenty of
+# headroom for the model's "thinking" tokens (which OpenRouter counts against
+# this budget for reasoning models) before the JSON action is emitted. 1024
+# was too tight in practice: real runs got cut off mid-JSON
+# (e.g. '{"action":"tap","x":265,"y":1287, "...'). When truncation still
+# happens despite the bump, `_parse_action` falls back to salvage.
+MAX_OUTPUT_TOKENS = 4096
 MAX_RETRIES = 3
 BASE_BACKOFF_SECONDS = 1.0
 
@@ -240,11 +246,19 @@ class OpenRouterProvider:
         except json.JSONDecodeError:
             pass
         obj = extract_json_object(text)
-        if obj is None:
-            raise ProviderError(
-                f"No JSON object found in response (first 200 chars): {text[:200]!r}"
-            )
-        return json.loads(obj)
+        if obj is not None:
+            return json.loads(obj)
+        # Last resort: the response was truncated by the output token budget
+        # (a Gemini-via-OpenRouter failure mode where "thinking" tokens eat
+        # the budget before the JSON closes). Try to close the partial object
+        # at the last complete element boundary so the step degrades instead
+        # of failing the whole task.
+        salvaged = salvage_truncated_json(text)
+        if salvaged is not None:
+            return json.loads(salvaged)
+        raise ProviderError(
+            f"No JSON object found in response (first 200 chars): {text[:200]!r}"
+        )
 
     @staticmethod
     def _build_usage(
