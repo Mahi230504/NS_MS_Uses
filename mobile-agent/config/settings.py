@@ -42,6 +42,12 @@ class Settings:
     db_path: Path
     allow_physical_device: bool
     enable_vision_hitl: bool
+    # External trigger webhook (iOS Siri Shortcut, etc.). Disabled when the
+    # secret is empty.
+    webhook_secret: str
+    webhook_owner_user_id: int | None
+    webhook_host: str
+    webhook_port: int
 
 
 def _resolve_config_dir() -> Path:
@@ -149,6 +155,24 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
     raw_log_dir = os.environ.get("LOG_DIR", "").strip()
     log_dir = Path(raw_log_dir) if raw_log_dir else (config_dir / "logs")
 
+    # External-trigger webhook. The secret gates the endpoint; an empty secret
+    # disables the server entirely (no port is opened). A trigger maps to a
+    # single owner user — explicit WEBHOOK_OWNER_USER_ID, else the admin.
+    webhook_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
+    raw_owner = os.environ.get("WEBHOOK_OWNER_USER_ID", "").strip()
+    if raw_owner:
+        try:
+            webhook_owner_user_id: int | None = int(raw_owner)
+        except ValueError as e:
+            raise RuntimeError(f"WEBHOOK_OWNER_USER_ID must be an integer: {e}")
+    else:
+        webhook_owner_user_id = admin_id
+    webhook_host = os.environ.get("WEBHOOK_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        webhook_port = int(os.environ.get("WEBHOOK_PORT", "8765"))
+    except ValueError as e:
+        raise RuntimeError(f"WEBHOOK_PORT must be an integer: {e}")
+
     # Opt-in override of the emulator-only safety rule. Set to "1" / "true" /
     # "yes" to run on a physical device. Leave empty (default) to refuse.
     allow_physical = os.environ.get("ALLOW_PHYSICAL_DEVICE", "").strip().lower() in (
@@ -182,4 +206,8 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
         db_path=config_dir / "tasks.db",
         allow_physical_device=allow_physical,
         enable_vision_hitl=enable_vision_hitl,
+        webhook_secret=webhook_secret,
+        webhook_owner_user_id=webhook_owner_user_id,
+        webhook_host=webhook_host,
+        webhook_port=webhook_port,
     )

@@ -172,7 +172,66 @@ def main() -> None:
 
     register_handlers(app, handlers)
 
-    app.run_polling()
+    _wire_webhook(app, handlers, settings, adb)
+
+    # bootstrap_retries: on a throttled link the first getMe can still time
+    # out even with the bumped timeouts; retry a handful of times (with PTB's
+    # backoff) instead of aborting the whole process on the first miss.
+    app.run_polling(bootstrap_retries=5)
+
+
+def _wire_webhook(app, handlers, settings, adb) -> None:
+    """Start an aiohttp trigger server alongside polling, if configured.
+
+    Runs inside Telegram's own event loop via post_init / post_shutdown so we
+    don't spawn a second loop. No-op unless WEBHOOK_SECRET is set.
+    """
+    if not settings.webhook_secret:
+        return
+    if settings.webhook_owner_user_id is None:
+        log.warning(
+            "WEBHOOK_SECRET is set but no owner resolved "
+            "(set WEBHOOK_OWNER_USER_ID or TELEGRAM_ADMIN_ID). Webhook disabled."
+        )
+        return
+
+    from aiohttp import web
+
+    from bot.webhook import build_webhook_app
+
+    async def _start(application) -> None:
+        # Tunnel the device's localhost:<port> to ours over USB so an
+        # on-device trigger reaches the webhook with nothing on the network.
+        if await adb.reverse_tcp(settings.webhook_port):
+            log.info(
+                "adb reverse tcp:%d active — device localhost:%d -> host",
+                settings.webhook_port,
+                settings.webhook_port,
+            )
+        web_app = build_webhook_app(
+            handlers,
+            secret=settings.webhook_secret,
+            owner_user_id=settings.webhook_owner_user_id,
+        )
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, settings.webhook_host, settings.webhook_port)
+        await site.start()
+        application.bot_data["_webhook_runner"] = runner
+        log.info(
+            "Trigger webhook listening on http://%s:%d/trigger (owner=%s)",
+            settings.webhook_host,
+            settings.webhook_port,
+            settings.webhook_owner_user_id,
+        )
+
+    async def _stop(application) -> None:
+        runner = application.bot_data.get("_webhook_runner")
+        if runner is not None:
+            await runner.cleanup()
+
+    app.post_init = _start
+    app.post_shutdown = _stop
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from dataclasses import dataclass
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, ContextTypes
@@ -28,6 +30,20 @@ from security.hitl_gate import HitlGate
 _APP_BUTTONS_PER_ROW = 3
 _TASK_BUTTONS_PER_ROW = 2
 
+# An external trigger (Android voice/widget) proposes a task and waits for a
+# spoken yes/no. The proposal expires after this long so a stale "yes" can't
+# fire something the user said minutes ago.
+_PENDING_TTL_SECONDS = 90
+
+
+@dataclass
+class _PendingIntent:
+    """A parsed-but-not-yet-launched task awaiting voice confirmation."""
+
+    description: str
+    launch_package: str | None
+    created_at: float
+
 
 class Handlers:
     """Bundles all Telegram callbacks. One instance per running bot."""
@@ -53,6 +69,8 @@ class Handlers:
         self._router = router
         self._sessions = SessionStore()
         self._running: dict[int, asyncio.Task] = {}
+        # External-trigger proposals awaiting a spoken yes/no, keyed by user.
+        self._pending: dict[int, _PendingIntent] = {}
 
     # ------------------------------------------------------------------
     # Auth helpers
@@ -334,6 +352,115 @@ class Handlers:
         self._running[user_id] = asyncio.create_task(
             self._orch.run_task(task, launch_package=route.app.package)
         )
+
+    # ------------------------------------------------------------------
+    # External trigger (Android voice / widget -> webhook)
+    #
+    # Two phases so the user hears what was understood before anything runs:
+    #   handle_external_trigger -> parse + stash a pending intent, speak it back
+    #   handle_external_confirm -> launch it (yes) or drop it (no)
+    # Either way, status / HITL approval / payment+OTP gates / final result all
+    # still flow to the owner's Telegram chat — voice only confirms the intent.
+
+    async def handle_external_trigger(self, user_id: int, text: str) -> str:
+        """Phase 1: parse the spoken text and propose it, without launching.
+
+        Stores a pending intent and returns a short line to be spoken back so
+        the user can catch a mis-hear or wrong-app before the agent acts. The
+        caller must then call handle_external_confirm. Returns never leak task
+        internals.
+        """
+        if not self._is_paired(user_id):
+            return "That user isn't paired with the bot."
+        text = text.strip()
+        if not text:
+            return "I didn't catch a task — try again."
+        if self._has_running_task(user_id):
+            return "A task is already running. Finish or abort it first."
+
+        description = text
+        launch_package: str | None = None
+        spoken = text
+
+        if self._router is not None:
+            route = await self._router.route(text)
+            if route is not None:
+                if route.task.needs_param and not route.param:
+                    # A missing slot can't be gathered over voice (we cancel on
+                    # "no", no re-listen) — defer to the Telegram param prompt.
+                    sess = self._sessions.get(user_id)
+                    sess.app_id = route.app.id
+                    sess.task_id = route.task.id
+                    sess.state = SessionState.AWAITING_PARAM
+                    await self._app.bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"{route.app.emoji} {route.app.name} → {route.task.label}\n\n"
+                            f"{route.task.param_prompt}"
+                        ),
+                    )
+                    return f"{route.app.name} needs a detail — check Telegram to continue."
+                description = render_prompt(route.task.template, route.param)
+                launch_package = route.app.package
+                spoken = f"{route.app.name}: {description}"
+
+        self._pending[user_id] = _PendingIntent(
+            description=description,
+            launch_package=launch_package,
+            created_at=time.monotonic(),
+        )
+        # The literal "Confirm?" is a contract with the Android HTTP-Shortcuts
+        # client: its on-success script does `data.message.includes("Confirm?")`
+        # to decide whether to prompt for a spoken yes/no and re-trigger with a
+        # {"confirm": ...} payload. Keep that token in this (and only this)
+        # proposal message — confirm/cancel/error replies must NOT contain it,
+        # or the phone would loop asking to confirm a confirmation.
+        return f"Got it — {spoken}. Confirm?"
+
+    async def handle_external_run(self, user_id: int, text: str) -> str:
+        """Single-shot: propose AND launch in one call, no confirm round-trip.
+
+        For trigger clients that can't reliably show a confirmation prompt
+        (some Android HTTP-Shortcuts builds have a broken `prompt()`/`tts()`),
+        the two-phase voice confirm is unusable. This collapses it: parse +
+        launch immediately, returning the launch message. Safety is
+        unchanged — payment/OTP/delete still gate on Telegram, and a
+        mis-heard product is caught at the cart-review HITL.
+
+        Reuses the proposal path so routing, brand matching, and the
+        param-needed deferral all behave identically; it only auto-confirms
+        when a pending intent was actually created (i.e. not the
+        param-needed / error cases, which return their own guidance).
+        """
+        msg = await self.handle_external_trigger(user_id, text)
+        if user_id in self._pending:
+            return await self.handle_external_confirm(user_id, True)
+        return msg
+
+    async def handle_external_confirm(self, user_id: int, approve: bool) -> str:
+        """Phase 2: act on the spoken yes/no for the pending proposal."""
+        pending = self._pending.pop(user_id, None)
+        if pending is None or (
+            time.monotonic() - pending.created_at > _PENDING_TTL_SECONDS
+        ):
+            return "There's nothing to confirm — say the task first."
+        if not approve:
+            return "Okay, cancelled."
+        if self._has_running_task(user_id):
+            return "A task is already running. Finish or abort it first."
+
+        sess = self._sessions.get(user_id)
+        sess.state = SessionState.RUNNING
+        sess.app_id = None
+        sess.task_id = None
+        task = Task(user_id=user_id, description=pending.description)
+        await self._app.bot.send_message(
+            chat_id=user_id, text=f"Starting: {pending.description}"
+        )
+        self._running[user_id] = asyncio.create_task(
+            self._orch.run_task(task, launch_package=pending.launch_package)
+        )
+        return "On it — I'll confirm on Telegram."
 
     # ------------------------------------------------------------------
     # Other commands (unchanged from before)

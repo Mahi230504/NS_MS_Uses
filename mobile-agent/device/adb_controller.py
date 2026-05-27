@@ -16,6 +16,14 @@ _log = logging.getLogger("mobile_agent.adb")
 # or device is stuck and bail rather than freezing the whole agent loop for
 # the full session timeout. The orchestrator catches AdbError and retries.
 _ADB_CALL_TIMEOUT_SECONDS = 25.0
+# `uiautomator dump` gets a much shorter timeout. A dump that's going to
+# succeed returns in ~2-3s; if it hasn't returned by 8s it's stuck waiting
+# for an idle state that never comes (Blinkit's cart/product screens animate
+# continuously) and would only hang to the full 25s. The dump_ui_xml hybrid
+# does up to three passes, so capping each at 8s bounds the worst case at
+# ~24s instead of ~75s — the difference between "one slow step" and "the
+# whole session times out with socket-closed errors".
+_DUMP_TIMEOUT_SECONDS = 8.0
 
 _WM_SIZE_RE = re.compile(r"(\d+)x(\d+)")
 # Special shell metacharacters that `adb shell input text` and the surrounding
@@ -217,6 +225,21 @@ class AdbController:
     async def key_event(self, keycode: int) -> None:
         await self._run("shell", "input", "keyevent", str(keycode))
 
+    async def reverse_tcp(self, port: int) -> bool:
+        """Map the device's localhost:<port> to the host's localhost:<port>.
+
+        Lets an on-device trigger (e.g. an HTTP Shortcuts POST) reach the
+        agent's webhook over the USB cable, with nothing exposed on any
+        network. Best-effort: returns True on success, False on any adb
+        failure — never raises, so a missing reverse can't block startup.
+        """
+        try:
+            await self._run("reverse", f"tcp:{port}", f"tcp:{port}")
+            return True
+        except AdbError:
+            _log.warning("adb reverse tcp:%d failed; on-device trigger won't reach the webhook", port)
+            return False
+
     async def recover(self) -> None:
         """Back-button — the standard "undo whatever I just did" gesture."""
         await self.key_event(KEYCODE_BACK)
@@ -340,7 +363,7 @@ class AdbController:
             args.append("--compressed")
         args.append("/dev/tty")
         try:
-            out = await self._run(*args)
+            out = await self._run(*args, timeout=_DUMP_TIMEOUT_SECONDS)
         except AdbError:
             return ""
         return out.decode("utf-8", errors="replace").strip()

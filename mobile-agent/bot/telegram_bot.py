@@ -13,8 +13,31 @@ from telegram.ext import (
 from bot.handlers import Handlers
 
 
+# Generous network timeouts. On throttled networks (ISP-level Telegram
+# throttling is common in some regions) the TLS connect to api.telegram.org
+# can take 5-10s — well past python-telegram-bot's 5s default, which makes
+# the bootstrap get_me() time out and the whole process abort. 30s absorbs
+# that. read timeout must comfortably exceed the long-poll timeout (10s).
+_CONNECT_TIMEOUT = 30.0
+_READ_TIMEOUT = 30.0
+_WRITE_TIMEOUT = 30.0
+_POOL_TIMEOUT = 30.0
+
+
 def build_application(token: str) -> Application:
-    return ApplicationBuilder().token(token).build()
+    return (
+        ApplicationBuilder()
+        .token(token)
+        .connect_timeout(_CONNECT_TIMEOUT)
+        .read_timeout(_READ_TIMEOUT)
+        .write_timeout(_WRITE_TIMEOUT)
+        .pool_timeout(_POOL_TIMEOUT)
+        # The long-poll getUpdates calls get their own (also generous) limits
+        # so a slow link doesn't kill the polling loop mid-session.
+        .get_updates_connect_timeout(_CONNECT_TIMEOUT)
+        .get_updates_read_timeout(_READ_TIMEOUT)
+        .build()
+    )
 
 
 def register_handlers(app: Application, handlers: Handlers) -> None:
