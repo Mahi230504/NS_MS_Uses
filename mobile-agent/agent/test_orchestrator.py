@@ -1115,6 +1115,185 @@ class TestStaleTreeRejection:
         assert adb.taps == [(100, 100)]
         assert task.state is TaskState.DONE
 
+    async def test_override_lets_tap_through_after_dump_stuck_empty(
+        self, audit: AuditLogger
+    ) -> None:
+        """Reproduces the 2026-05-27 Blinkit egg-order dead loop.
+
+        From the saved run artifacts (120737Z / 122034Z): step 1 dumped the
+        splash screen (5523-byte tree → latch flips True), then the home
+        screen NEVER dumped again — uiautomator returned empty every step
+        because Blinkit's home animates continuously and never reaches idle.
+        On `main` (pre-fix) the stale-tree guard rejected the search-bar tap
+        on every step forever, so the loop detector aborted the task
+        ("detected 4 action loops") and the egg order never happened — even
+        though the search bar was plainly visible in the screenshot.
+
+        With MAX_STALE_TREE_REJECTS=2 the guard rejects the first two empty
+        steps (asking the model to wait), then on the third consecutive
+        empty dump it stops rejecting and lets the screenshot-grounded tap
+        execute. Assert the tap actually fires and the task completes instead
+        of dead-looping."""
+
+        class _AdbSplashThenForeverEmpty(_FakeAdb):
+            def __init__(self) -> None:
+                super().__init__()
+                self._dump_count = 0
+
+            async def dump_ui_xml(self) -> str | None:
+                self._dump_count += 1
+                # Step 1: splash tree present (latches _task_tree_ever_seen).
+                # Every step after: empty, exactly like the failing runs.
+                if self._dump_count == 1:
+                    return (
+                        "<hierarchy rotation='0'>"
+                        '<node text="Everything you need, delivered" '
+                        'class="android.widget.TextView" '
+                        'bounds="[0,1200][1080,1382]" clickable="false" />'
+                        "</hierarchy>"
+                    )
+                return None
+
+        # The model keeps proposing the same search-bar tap — it can see the
+        # bar in the screenshot but the tree is empty. (540,326) is nowhere
+        # near the splash TextView, so this is a genuine blind tap until the
+        # override trusts the screenshot.
+        search_tap = {"action": "tap", "x": 540, "y": 326,
+                      "note": "tap search bar"}
+        vision = _ScriptedVision(
+            [
+                # step1: splash tree present → model waits (as in the real
+                # runs). The wait latches _task_tree_ever_seen=True.
+                ({"action": "wait", "reason": "app loading"}, _usage()),
+                (search_tap, _usage()),   # step2: empty dump → reject #1
+                (search_tap, _usage()),   # step3: empty dump → reject #2
+                (search_tap, _usage()),   # step4: empty dump → OVERRIDE, tap fires
+                ({"action": "done", "summary": "searched"}, _usage()),
+            ]
+        )
+        adb = _AdbSplashThenForeverEmpty()
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10
+        )
+        task = Task(user_id=1, description="add eggs to cart")
+        await orch.run_task(task)
+
+        # The tap escaped the guard exactly once (on the 3rd empty dump)
+        # and the task completed rather than aborting on a loop. With an
+        # empty tree and the latch set, the override branch is the ONLY path
+        # that lets a tap execute — so a recorded tap proves the override.
+        assert adb.taps == [(540, 326)]
+        assert task.state is TaskState.DONE
+        # Exactly MAX_STALE_TREE_REJECTS rejections preceded the override
+        # (these are the only entries appended to history; the override
+        # itself goes to the audit log + Telegram status, not history).
+        rejections = [
+            h for h in task.history
+            if "dump returned no elements" in str(h.get("result", ""))
+        ]
+        assert len(rejections) == 2
+
+
+class TestEggOrderEndToEnd:
+    """Full Blinkit egg-order replay built from the REAL captured artifacts
+    of the 2026-05-26 successful run (133721Z): search → type → ADD → View
+    Cart → done. Exercises the whole fixed pipeline together:
+
+      * coordinate grounding against a real UI tree — the recorded search
+        tap (517,457) lands inside the real search-bar node
+        (`search_bar_view_flipper`, bounds [153,391][882,523]); a
+        hallucinated (50,50) tap is rejected,
+      * the stale-tree escape hatch — the ADD / View-Cart taps fire on an
+        empty dump (Blinkit's home/cart never reaches uiautomator idle),
+      * loop-detector reconciliation — the rejected-then-retried ADD taps do
+        NOT trip the 4-loop abort (the exact failure mode of the 120737Z /
+        122034Z / 124524Z runs), so the task runs through to `done`.
+
+    This is the regression guard for "logs/screenshots match, correct
+    coordinates clicked, proceeds to done"."""
+
+    # Real search screen: a single focused EditText whose bounds match the
+    # actual `search_bar_view_flipper` node from step_02.xml of the recorded
+    # run. Focused so the `type` action passes the focused-input check; its
+    # bounds ground the (517,457) tap. The TextView sits well away from both
+    # (517,457) and the hallucinated (50,50).
+    SEARCH_TREE = (
+        "<hierarchy rotation='0'>"
+        '<node class="android.widget.EditText" '
+        'resource-id="com.grofers.customerapp:id/search_bar_view_flipper" '
+        'text="" content-desc="Search for products" '
+        'bounds="[153,391][882,523]" clickable="true" focused="true" />'
+        '<node class="android.widget.TextView" text="Grocery delivery" '
+        'bounds="[0,200][400,300]" clickable="false" focused="false" />'
+        "</hierarchy>"
+    )
+
+    async def test_full_egg_order_reaches_done(self, audit: AuditLogger) -> None:
+        # Tree available for the 3 search-screen steps, then empty forever —
+        # exactly the dump pattern from the failing afternoon runs.
+        trees = [self.SEARCH_TREE, self.SEARCH_TREE, self.SEARCH_TREE,
+                 None, None, None, None, None]
+
+        class _AdbReplay(_FakeAdb):
+            def __init__(self) -> None:
+                super().__init__()
+                self._trees = list(trees)
+
+            async def dump_ui_xml(self) -> str | None:
+                return self._trees.pop(0) if self._trees else None
+
+        add_tap = {"action": "tap", "x": 874, "y": 650,
+                   "note": "tap ADD on eggs"}
+        vision = _ScriptedVision(
+            [
+                # 1: tap the real search bar — grounded by SEARCH_TREE.
+                ({"action": "tap", "x": 517, "y": 457,
+                  "note": "tap search bar"}, _usage()),
+                # 2: type into the focused EditText.
+                ({"action": "type", "text": "eggs",
+                  "note": "type eggs into search"}, _usage()),
+                # 3: hallucinated tap in dead space → must be REJECTED.
+                ({"action": "tap", "x": 50, "y": 50,
+                  "note": "tap nothing"}, _usage()),
+                # 4-6: ADD on empty dump → reject, reject, OVERRIDE fires.
+                (add_tap, _usage()),
+                (add_tap, _usage()),
+                (add_tap, _usage()),
+                # 7: View Cart on empty dump → override fires immediately.
+                ({"action": "tap", "x": 904, "y": 2205,
+                  "note": "tap View Cart"}, _usage()),
+                # 8: finish.
+                ({"action": "done", "summary": "eggs in cart"}, _usage()),
+            ]
+        )
+        adb = _AdbReplay()
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=30
+        )
+        task = Task(user_id=1, description="add eggs to cart and proceed")
+        await orch.run_task(task)
+
+        # Reached done — NOT aborted on "action loops" or timed out.
+        assert task.state is TaskState.DONE, task.failure_reason
+        assert task.failure_reason is None
+        # Exactly the three grounded/override taps fired, in order. The
+        # hallucinated (50,50) never executed.
+        assert adb.taps == [(517, 457), (874, 650), (904, 2205)]
+        assert (50, 50) not in adb.taps
+        assert adb.texts == ["eggs"]
+        # The hallucinated tap was caught by coord grounding...
+        assert any(
+            "doesn't fall on any UI element" in str(h.get("result", ""))
+            for h in task.history
+        )
+        # ...and the ADD tap was rejected twice before the override let it
+        # through (proving the escape hatch, not a lucky early dump).
+        stale_rejects = [
+            h for h in task.history
+            if "dump returned no elements" in str(h.get("result", ""))
+        ]
+        assert len(stale_rejects) == 2
+
 
 class TestArtifactPersistence:
     """Per-step screenshots / UI dumps / actions are written under
@@ -1431,6 +1610,76 @@ class TestAddProductNameMismatch:
             f"correct course; got: {result_text!r}"
         )
         assert task.state is TaskState.DONE
+
+    async def test_variant_options_sheet_add_not_falsely_rejected(
+        self, audit: AuditLogger
+    ) -> None:
+        """Real failing-run reproduction (2026-05-27 Abhi-eggs, steps 5-8).
+
+        Tapping ADD on a multi-variant product opens an options bottom-sheet.
+        Each option's ADD button sits inside a row whose content-desc is the
+        OPTION's price/offer line (the real tree had
+        `content-desc="quantity  ₹301 rupees , offer 20% OFF"`), NOT the
+        product name — the product name is the sheet's title above the rows.
+
+        Pre-fix, `_find_container_label` returned that price line as the ADD
+        button's container_label, the keyword check found no overlap with the
+        claimed product, and the legitimate variant ADD was rejected 4 times
+        until the model gave up and abandoned the product. The fix: a label
+        made only of price/offer/quantity tokens is not trustworthy ground
+        truth, so when the claimed product appears on screen (the sheet
+        title) the ADD is allowed.
+
+        This drives real XML through the actual container_label extraction —
+        it is NOT a hand-fed label.
+        """
+        xml = (
+            "<hierarchy rotation='0'>"
+            '<node class="android.view.ViewGroup" bounds="[0,1300][1080,2000]" '
+            'clickable="false">'
+            # Sheet title (the only place the product name appears).
+            '<node class="android.widget.TextView" '
+            'text="Abhi Vitamin D3 White Protein Rich Eggs Box" '
+            'bounds="[36,1400][1044,1480]" clickable="false" />'
+            # Option row: its content-desc is price/offer noise; the ADD
+            # button lives inside it, so this becomes the container_label.
+            '<node class="android.view.ViewGroup" bounds="[36,1800][1000,1920]" '
+            'content-desc="quantity  ₹301 rupees , offer 20% OFF" '
+            'clickable="false">'
+            '<node class="android.view.View" content-desc="ADD" '
+            'bounds="[828,1815][1008,1911]" clickable="true" />'
+            "</node>"
+            "</node>"
+            "</hierarchy>"
+        )
+
+        class _AdbWithTree(_FakeAdb):
+            async def dump_ui_xml(self) -> str | None:
+                return xml
+
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 918, "y": 1863,
+                  "note": "tap ADD on Abhi Vitamin D3 White Protein Rich Eggs Box"},
+                 _usage()),
+                ({"action": "done", "summary": "added 24-pack"}, _usage()),
+            ]
+        )
+        adb = _AdbWithTree()
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10
+        )
+        task = Task(user_id=1, description="add eggs to cart")
+        await orch.run_task(task)
+
+        # The variant ADD fired (not rejected), and the run completed.
+        assert adb.taps == [(918, 1863)]
+        assert task.state is TaskState.DONE
+        assert not any(
+            "actually buys" in str(h.get("result", ""))
+            or "DIFFERENT product" in str(h.get("result", ""))
+            for h in task.history
+        )
 
 
 class TestCategoryTapRejection:

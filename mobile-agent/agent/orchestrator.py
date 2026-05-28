@@ -36,6 +36,13 @@ from security.hitl_gate import HitlGate, ReadOnlyViolation
 
 
 MAX_LOOP_ITERATIONS = 30
+# After this many consecutive empty-dump steps (following at least one good
+# tree), the stale-tree guard stops rejecting and lets the model act on the
+# screenshot alone. Prevents an infinite reject loop on screens where
+# uiautomator never reaches idle (animated cart / product-detail pages).
+# Two rejections give the screen a chance to settle; the third attempt
+# goes through.
+MAX_STALE_TREE_REJECTS = 2
 # Minimum gap between mid-loop step status messages sent to Telegram. Lifecycle
 # messages (starting / done / failed / timeout) bypass this throttle.
 STEP_STATUS_MIN_INTERVAL_SECONDS = 2.0
@@ -196,6 +203,18 @@ _PRODUCT_NOISE_WORDS = frozenset({
     "product", "item", "row", "tile", "this", "that", "from", "into",
     "qty", "quantity", "pack", "packet", "tap", "add", "cart", "click",
 })
+# Words that mark a string as price / offer / measurement text rather than a
+# product name. On a multi-variant product's options bottom-sheet, each ADD
+# button's ancestor content-desc is the OPTION (e.g. "quantity ₹301 rupees,
+# offer 20% OFF"), not the product title — so a label made only of these
+# tokens is NOT trustworthy ground truth for "which product this ADD buys".
+# See _looks_like_product_label / _add_product_name_mismatch.
+_PRICE_OFFER_NOISE_WORDS = frozenset({
+    "quantity", "qty", "rupee", "rupees", "rs", "inr", "offer", "off",
+    "mrp", "price", "save", "discount", "deal", "pack", "pcs", "pc",
+    "piece", "pieces", "unit", "units", "each", "per", "inclusive",
+    "taxes", "tax", "free", "flat", "upto", "extra",
+})
 # When the provider reports fewer than this many requests left for the day,
 # warn the user so they aren't surprised by a QuotaExceeded mid-task.
 LOW_RPD_WARNING_THRESHOLD = 30
@@ -278,6 +297,16 @@ class Orchestrator:
         # taps until it comes back so the model can't tap blind). Reset
         # per task in run_task.
         self._task_tree_ever_seen: bool = False
+        # Count of consecutive steps where the dump came back empty AFTER a
+        # real tree had been seen. The stale-tree guard rejects blind taps,
+        # but some screens (Blinkit's cart / product-detail with permanent
+        # carousel animation) NEVER return to idle, so the dump never
+        # recovers. If we kept rejecting forever the task would loop until
+        # hard-terminate ("socket closed / timeout"). After
+        # MAX_STALE_TREE_REJECTS consecutive empties we stop rejecting and
+        # let the model act on the screenshot alone — a possibly-imperfect
+        # tap beats a guaranteed dead loop. Reset whenever a tree is seen.
+        self._consecutive_stale_tree: int = 0
 
     def get_task(self, user_id: int) -> Task | None:
         return self._tasks.get(user_id)
@@ -299,6 +328,7 @@ class Orchestrator:
         self._current_task_db_id = None
         self._current_task_artifact_dir = self._make_task_artifact_dir(task)
         self._task_tree_ever_seen = False
+        self._consecutive_stale_tree = 0
         task.state = TaskState.RUNNING
         await self._persist_insert(task)
         await self._status(task, f"starting: {task.description}")
@@ -407,6 +437,7 @@ class Orchestrator:
                     # uiautomator" situation. The rejection check below uses
                     # this to refuse blind taps.
                     self._task_tree_ever_seen = True
+                    self._consecutive_stale_tree = 0
                 loop_hint = self._loop_hint(task)
                 if loop_hint:
                     self._audit.log_action(
@@ -470,24 +501,45 @@ class Orchestrator:
                 and not ui_elements
                 and action.get("action") in {"tap", "swipe"}
             ):
-                hint = (
-                    "REJECTED: UI tree dump returned no elements this step "
-                    "(transient uiautomator failure during animation). "
-                    "Don't tap blind. Emit a wait action so the screen can "
-                    "settle, then re-evaluate."
-                )
-                task.history.append({"action": action, "result": hint})
+                self._consecutive_stale_tree += 1
+                if self._consecutive_stale_tree <= MAX_STALE_TREE_REJECTS:
+                    hint = (
+                        "REJECTED: UI tree dump returned no elements this step "
+                        "(transient uiautomator failure during animation). "
+                        "Don't tap blind. Emit a wait action so the screen can "
+                        "settle, then re-evaluate."
+                    )
+                    task.history.append({"action": action, "result": hint})
+                    self._audit.log_action(
+                        task.user_id, task.description, action,
+                        "STALE_TREE_REJECTED",
+                    )
+                    await self._step_status(
+                        task,
+                        f"step {task.step_count}: UI dump empty, asking for wait",
+                    )
+                    self._finalize_step_result(task.step_count, action, hint)
+                    self._last_phash = None
+                    continue
+                # Dump has been stuck for MAX_STALE_TREE_REJECTS+1 consecutive
+                # steps — this screen never reaches idle (e.g. Blinkit's cart
+                # with a permanent carousel). Stop rejecting: a screenshot-
+                # grounded tap is far better than looping until the session
+                # dies with a socket-closed/timeout error. Fall through to
+                # execute. Coord/intent/product checks below also no-op on an
+                # empty tree, so the action runs as the model intended.
                 self._audit.log_action(
                     task.user_id, task.description, action,
-                    "STALE_TREE_REJECTED",
+                    f"STALE_TREE_OVERRIDE: dump empty "
+                    f"{self._consecutive_stale_tree} steps running; allowing "
+                    "screenshot-grounded action through",
                 )
                 await self._step_status(
                     task,
-                    f"step {task.step_count}: UI dump empty, asking for wait",
+                    f"step {task.step_count}: UI dump still empty after "
+                    f"{self._consecutive_stale_tree} tries — proceeding on "
+                    "screenshot",
                 )
-                self._finalize_step_result(task.step_count, action, hint)
-                self._last_phash = None
-                continue
 
             # Coord grounding: tap/swipe coords must map to some element in
             # the UI tree (with a 20px forgiveness margin). If they don't,
@@ -982,14 +1034,28 @@ class Orchestrator:
             label_lc = action_target.container_label.lower()
             if any(w in label_lc for w in words):
                 return None
-            return (
-                f"note claims tap ADD on '{claimed}' at ({x},{y}), but "
-                f"the ADD button at those coords actually buys "
-                f"'{action_target.container_label}' (per the UI tree's "
-                f"product card label). Find the [ACTION] line whose `for "
-                f"\"...\"` annotation actually matches your target "
-                "product, and tap ITS coords"
-            )
+            # The label under these coords doesn't match the claim. Only
+            # treat that as a real mismatch when the label is itself a
+            # product name. On a multi-variant options bottom-sheet the ADD
+            # button's ancestor content-desc is the option's price/offer
+            # line ("quantity ₹301 rupees, offer 20% OFF"), NOT the product
+            # — rejecting on it falsely blocks a legitimate variant ADD (the
+            # 2026-05-27 Abhi-eggs run, rejected 4x on steps 5-8). When the
+            # label is price/offer noise, trust the on-screen product title
+            # instead: if the claimed product appears anywhere in the tree
+            # (the sheet header), the ADD is for that product — allow it.
+            if _looks_like_product_label(action_target.container_label):
+                return (
+                    f"note claims tap ADD on '{claimed}' at ({x},{y}), but "
+                    f"the ADD button at those coords actually buys "
+                    f"'{action_target.container_label}' (per the UI tree's "
+                    f"product card label). Find the [ACTION] line whose `for "
+                    f"\"...\"` annotation actually matches your target "
+                    "product, and tap ITS coords"
+                )
+            tree_text = " ".join(f"{e.text} {e.desc}" for e in elements).lower()
+            if any(w in tree_text for w in words):
+                return None
         # Fallback: no container label available — use the legacy
         # vertically-banded "any nearby text" check so we still catch the
         # mismatch on apps where product titles aren't surfaced as
@@ -1241,11 +1307,22 @@ class Orchestrator:
         Any detector firing increments self._loops_detected; the caller
         hard-aborts when that crosses MAX_LOOPS_BEFORE_ABORT.
         """
+        # Only actions that actually EXECUTED count toward loop detection.
+        # Rejected actions (stale-tree / coord / intent rejections) get
+        # re-emitted by the model precisely because WE refused to run them —
+        # counting those as "loops" makes the loop detector fight the
+        # stale-tree escape hatch: on an un-dumpable screen the model is
+        # forced to repeat the same (correct) tap, and the 4-loop abort
+        # trips at almost the exact step the escape hatch would finally let
+        # the tap through (the 2026-05-27 "detected 4 action loops" Blinkit
+        # aborts). A genuine loop is repeated *executed* actions that don't
+        # advance the screen, so skip entries whose result was a rejection.
         recent_state_changing = [
             h.get("action", {})
             for h in task.history
             if isinstance(h.get("action"), dict)
             and h["action"].get("action") in _STATE_CHANGING
+            and not str(h.get("result", "")).strip().upper().startswith("REJECTED")
         ]
         if len(recent_state_changing) < 2:
             return ""
@@ -1734,6 +1811,29 @@ def _looks_like_search_target(e: UiElement) -> bool:
         return True
     if "search" in e.desc.lower():
         return True
+    return False
+
+
+def _looks_like_product_label(label: str) -> bool:
+    """True if `label` reads like a product name, not price/offer/qty text.
+
+    A real product label has at least one alphabetic word (≥3 chars) that
+    isn't a pricing/measurement/offer keyword:
+      "Coolberg Cranberry Non-Alcoholic Beer" → True
+      "Abhi Vitamin D3 White Protein Rich Eggs Box" → True
+      "quantity  ₹301 rupees , offer 20% OFF" → False  (variant-sheet noise)
+
+    Used by `_add_product_name_mismatch` to avoid rejecting a legitimate ADD
+    on a multi-variant options sheet, where the ADD button's ancestor
+    content-desc is the option's price/offer line rather than the product.
+    """
+    for w in re.split(r"[^a-z]+", label.lower()):
+        if (
+            len(w) >= 3
+            and w not in _PRICE_OFFER_NOISE_WORDS
+            and w not in _PRODUCT_NOISE_WORDS
+        ):
+            return True
     return False
 
 
