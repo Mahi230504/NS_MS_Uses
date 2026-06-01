@@ -84,6 +84,16 @@ def build_webhook_app(
         if not hmac.compare_digest(provided, secret):
             return web.json_response({"ok": False, "message": "unauthorized"}, status=401)
 
+        # Temporary diagnostic (Phase 5): log the literal recognized text so we can
+        # see exactly what STT produced when chasing wake-word / filter mismatches.
+        # Remove once the trigger client is stable.
+        log.info(
+            "trigger body: text=%r confirm=%r autorun=%r",
+            body.get("text"),
+            body.get("confirm"),
+            body.get("autorun"),
+        )
+
         # A confirm payload answers a previous proposal; otherwise it's a new
         # spoken task to propose. A BLANK confirm ("" / whitespace) counts as
         # absent: the Android client sends a single static body

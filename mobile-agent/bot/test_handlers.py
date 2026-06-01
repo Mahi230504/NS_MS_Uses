@@ -9,7 +9,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from bot.apps import get_app, get_task
-from bot.handlers import Handlers
+from bot.handlers import Handlers, _strip_wake_word
 from bot.router import Route
 from bot.session import SessionState
 
@@ -187,3 +187,77 @@ class TestRun:
         msg = await h.handle_external_run(42, "order milk")
         orch.run_task.assert_not_called()
         assert "paired" in msg
+
+
+class TestStripWakeWord:
+    """Wake-word stripping unit tests — applied before the router sees text."""
+
+    def test_strips_bare_atlas(self) -> None:
+        assert _strip_wake_word("atlas order milk") == "order milk"
+
+    def test_case_insensitive(self) -> None:
+        # STT usually lowercases but a capitalized 'Atlas' still gets stripped.
+        assert _strip_wake_word("Atlas order milk") == "order milk"
+        assert _strip_wake_word("ATLAS order milk") == "order milk"
+
+    def test_strips_compound_wake_words(self) -> None:
+        assert _strip_wake_word("hey atlas order milk") == "order milk"
+        assert _strip_wake_word("ok atlas order milk") == "order milk"
+        assert _strip_wake_word("okay atlas order milk") == "order milk"
+
+    def test_strips_trailing_punctuation(self) -> None:
+        # STT occasionally inserts commas/periods after the wake word.
+        assert _strip_wake_word("atlas, order milk") == "order milk"
+        assert _strip_wake_word("atlas. order milk") == "order milk"
+        assert _strip_wake_word("hey atlas,  order milk") == "order milk"
+
+    def test_preserves_case_of_remainder(self) -> None:
+        # The router downstream sometimes cares about proper nouns.
+        assert _strip_wake_word("atlas Order on Blinkit") == "Order on Blinkit"
+
+    def test_no_match_when_word_boundary_violated(self) -> None:
+        # Don't eat 'atlas' as a prefix of a longer word.
+        assert _strip_wake_word("atlassian outage") == "atlassian outage"
+        # And don't strip if there's no wake word at all.
+        assert _strip_wake_word("order milk on blinkit") == "order milk on blinkit"
+
+    def test_only_wake_word_returns_empty(self) -> None:
+        # When the user says just the wake word with no command, callers
+        # should treat the result as empty (handlers turns this into the
+        # "didn't catch a task" reply).
+        assert _strip_wake_word("atlas") == ""
+        assert _strip_wake_word("atlas.") == ""
+        assert _strip_wake_word("  atlas  ") == ""
+
+    def test_leading_whitespace_tolerated(self) -> None:
+        assert _strip_wake_word("   atlas order milk") == "order milk"
+
+    def test_empty_input_returns_empty(self) -> None:
+        assert _strip_wake_word("") == ""
+        assert _strip_wake_word("   ") == "   "  # all whitespace, no wake word
+
+
+class TestProposeStripsWakeWord:
+    """End-to-end: wake-word prefix doesn't leak into pending intent / spoken reply."""
+
+    async def test_freeform_with_wake_word(self) -> None:
+        h, app, orch = _make(router=None)
+        msg = await h.handle_external_trigger(42, "atlas play jazz")
+        assert h._pending[42].description == "play jazz"
+        # The spoken-back confirm should NOT echo the wake word.
+        assert "atlas" not in msg.lower()
+        assert "play jazz" in msg
+        assert "Confirm?" in msg
+
+    async def test_route_with_wake_word(self) -> None:
+        h, app, orch = _make(router=_FixedRouter(_route("milk")))
+        msg = await h.handle_external_trigger(42, "hey atlas order milk on blinkit")
+        # Same routing outcome as the no-wake-word version of this test.
+        assert h._pending[42].launch_package == "com.grofers.customerapp"
+        assert "Blinkit" in msg
+
+    async def test_only_wake_word_treated_as_empty(self) -> None:
+        h, app, orch = _make(router=None)
+        msg = await h.handle_external_trigger(42, "atlas")
+        assert 42 not in h._pending
+        assert "didn't catch" in msg.lower()

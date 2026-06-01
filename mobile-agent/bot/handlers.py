@@ -35,6 +35,43 @@ _TASK_BUTTONS_PER_ROW = 2
 # fire something the user said minutes ago.
 _PENDING_TTL_SECONDS = 90
 
+# Wake-word prefixes the trigger client (AutoVoice "Atlas") prepends to every
+# spoken task. We strip them here so the router prompt sees just the command
+# (e.g. "order milk on blinkit" instead of "atlas order milk on blinkit").
+# Longer variants must come first — for matching they don't overlap, but the
+# order keeps the obvious "longest first" reading. STT delivers lowercase
+# without punctuation; case-insensitive matching is in the helper.
+_WAKE_PREFIXES: tuple[str, ...] = (
+    "okay atlas",
+    "ok atlas",
+    "hey atlas",
+    "atlas",
+)
+
+
+def _strip_wake_word(text: str) -> str:
+    """Strip a leading wake word (atlas / hey atlas / ok atlas / okay atlas).
+
+    Case-insensitive; requires a word boundary so we don't eat 'atlas' inside
+    'atlassian'. Drops any trailing punctuation/whitespace between the wake
+    word and the command. Returns the input unchanged when no wake word is
+    detected — so phone-side filter changes don't require a code change.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return text
+    lower = stripped.lower()
+    for prefix in _WAKE_PREFIXES:
+        if not lower.startswith(prefix):
+            continue
+        after = stripped[len(prefix):]
+        # Word-boundary: end-of-string or a non-alphanumeric next char.
+        # Otherwise "atlas" would be stripped from "atlassian".
+        if after and after[0].isalnum():
+            continue
+        return after.lstrip(" ,.\t")
+    return text
+
 
 @dataclass
 class _PendingIntent:
@@ -375,6 +412,22 @@ class Handlers:
         text = text.strip()
         if not text:
             return "I didn't catch a task — try again."
+        # Strip the wake word the phone-side client prefixes ("atlas order milk"
+        # -> "order milk") so the router scores the actual command. Falls
+        # through unchanged when the wake word isn't present, e.g. for the
+        # widget/Test Command paths which already POST a clean phrase.
+        text = _strip_wake_word(text)
+        if not text:
+            return "I didn't catch a task — try again."
+        # Echo the recognized command to Telegram so the owner sees exactly what
+        # the voice trigger heard — visualization for voice-driven runs. This is
+        # non-critical chrome: a failed echo must never abort the trigger.
+        try:
+            await self._app.bot.send_message(
+                chat_id=user_id, text=f'🎙️ Heard: "{text}"'
+            )
+        except Exception:
+            pass
         if self._has_running_task(user_id):
             return "A task is already running. Finish or abort it first."
 
