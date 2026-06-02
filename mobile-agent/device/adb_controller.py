@@ -358,13 +358,31 @@ class AdbController:
         install step we'd rather avoid.
         """
         await self._kill_stale_uiautomator()
-        args = ["exec-out", "uiautomator", "dump"]
+        # Dump to a file on /sdcard, then `cat` it back — do NOT stream to
+        # /dev/tty. On this ColorOS build `uiautomator dump … /dev/tty` (via
+        # exec-out) BLOCKS to the full timeout every pass; writing to a file
+        # returns immediately. Verified live: compressed file-dump pulls a
+        # real 30+ node tree off an animated Blinkit screen in <1s.
+        remote = "/sdcard/atlas_ui_dump.xml"
+        # Clear any stale dump first: a dump that fails the idle check writes
+        # NOTHING, so a leftover file from a prior pass must not be read back
+        # as if it were the current screen.
+        try:
+            await self._run("shell", "rm", "-f", remote)
+        except AdbError:
+            pass
+        args = ["shell", "uiautomator", "dump"]
         if compressed:
             args.append("--compressed")
-        args.append("/dev/tty")
+        args.append(remote)
         try:
-            out = await self._run(*args, timeout=_DUMP_TIMEOUT_SECONDS)
+            await self._run(*args, timeout=_DUMP_TIMEOUT_SECONDS)
+            out = await self._run(
+                "exec-out", "cat", remote, timeout=_DUMP_TIMEOUT_SECONDS
+            )
         except AdbError:
+            # Non-idle screen → normal dump wrote no file → `cat` fails here;
+            # the caller falls through to the --compressed pass.
             return ""
         return out.decode("utf-8", errors="replace").strip()
 
