@@ -550,11 +550,26 @@ class Orchestrator:
                             f"stuck: detected {self._loops_detected} action loops; "
                             "the model isn't escaping. Aborting."
                         )
+                # Post-ADD cart-reveal hint: an item is in the cart but no
+                # [CART] element is in the tree (the floating View-cart bar
+                # isn't surfaced on the results screen until you scroll/back).
+                # Steer the model to reveal it instead of floundering. Commerce
+                # apps only.
+                cart_hint = (
+                    self._cart_reveal_hint(task, ui_elements)
+                    if self._active_profile.enforce_shopping_guards else ""
+                )
+                if cart_hint:
+                    self._audit.log_action(
+                        task.user_id, task.description, {"action": "cart_reveal_hint"},
+                        f"INJECTED: {cart_hint}",
+                    )
+                injected = "\n\n".join(h for h in (loop_hint, cart_hint) if h)
                 _log.info("step %d: vision call", task.step_count)
                 response = await self._vision.get_next_action(
                     screenshot_bytes=screenshot,
                     task_description=(
-                        f"{task.description}\n\n{loop_hint}" if loop_hint else task.description
+                        f"{task.description}\n\n{injected}" if injected else task.description
                     ),
                     step_history=task.history[-PROMPT_HISTORY_WINDOW:],
                     screen_size=screen_size,
@@ -1017,6 +1032,56 @@ class Orchestrator:
         elements = ui_tree_parse(xml, profile)
         rendered = ui_tree_render(elements, profile) or None
         return rendered, elements, xml
+
+    @staticmethod
+    def _cart_reveal_hint(task: Task, elements: list[UiElement]) -> str:
+        """Proactive hint when an item is added but no cart path is visible.
+
+        Production finding (2026-06-08 live Blinkit run): after a successful
+        ADD, the floating "View cart" bar is NOT in the accessibility tree on
+        the search-results screen — verified zero cart nodes across the whole
+        run. With no [CART] element to tap (and coord-grounding rejecting taps
+        that don't hit a tree node), the model floundered: it gave up, fiddled
+        the stepper, and added more products. The bar only enters the tree
+        after you scroll, or after pressing back to the app home.
+
+        So once an ADD has landed and there's STILL no cart element in the
+        tree — and we're not already on a cart/checkout screen — nudge the
+        model to reveal the bar instead of acting on the product again. The
+        nudge escalates: swipe up first; if a swipe was already tried since
+        the ADD and the bar still isn't here, press back to the home screen.
+        Returns "" when no nudge is warranted. Caller gates on the commerce
+        profile.
+        """
+        if not _history_has_executed_add(task.history):
+            return ""
+        # A cart path is already visible — nothing to reveal.
+        if any(e.is_cart_bar for e in elements):
+            return ""
+        # Already on a cart/checkout screen — the bar's job is done.
+        haystack = " ".join((e.text + " " + e.desc).lower() for e in elements)
+        if any(tok in haystack for tok in _CART_SCREEN_TOKENS):
+            return ""
+        if _swipe_after_last_add(task.history):
+            return (
+                "NOTE: the item is already in your cart, you've scrolled, and "
+                "there is STILL no 'View cart' / [CART] element in the UI list. "
+                "On this app the cart bar isn't surfaced on the results screen. "
+                "Press the device BACK button to return to the app home screen, "
+                "which has a labelled cart icon / 'View cart' bar — tap that to "
+                "open the cart. Do NOT tap ADD or the +/- stepper again; the "
+                "item is already added."
+            )
+        return (
+            "NOTE: the item is already in your cart, but there is no 'View cart' "
+            "/ [CART] element in the UI list — on this app the floating cart bar "
+            "often isn't surfaced on the results screen until you scroll. SWIPE "
+            "UP (start the swipe on a product card, e.g. drag from the lower "
+            "third of the screen toward the top) to reveal the cart bar, then "
+            "tap it. Do NOT tap ADD or the +/- stepper again; the item is "
+            "already added — if scrolling doesn't reveal a cart bar, press back "
+            "to the home screen and use its cart icon."
+        )
 
     @staticmethod
     def _giveup_rejection(task: Task, action: dict) -> str | None:
@@ -2022,6 +2087,54 @@ def _history_has_swipe(history: list[dict]) -> bool:
             # with "REJECTED".
             result = str(entry.get("result", ""))
             if not result.startswith("REJECTED"):
+                return True
+    return False
+
+
+def _is_executed_tap(entry: object) -> bool:
+    """True if `entry` is a history record of a tap that actually ran."""
+    if not isinstance(entry, dict):
+        return False
+    action = entry.get("action")
+    if not isinstance(action, dict) or action.get("action") != "tap":
+        return False
+    result = str(entry.get("result", ""))
+    return not (result.startswith("REJECTED") or result.startswith("ERROR"))
+
+
+def _history_has_executed_add(history: list[dict]) -> bool:
+    """True if an add/increment tap has actually executed in this task.
+
+    Signals an item is in the cart, so the post-ADD cart-reveal hint can fire.
+    Uses the add/increment note vocabulary (`_ADD_TAP_NOTE_RE`); rejected and
+    errored taps don't count.
+    """
+    for entry in history:
+        if _is_executed_tap(entry) and _ADD_TAP_NOTE_RE.search(
+            str(entry["action"].get("note", ""))
+        ):
+            return True
+    return False
+
+
+def _swipe_after_last_add(history: list[dict]) -> bool:
+    """True if an executed swipe came AFTER the last executed add/increment tap.
+
+    Lets the cart-reveal hint escalate: swipe-up first, and only switch to
+    "press back to home" once a scroll has already been tried since the ADD.
+    """
+    last_add_idx = -1
+    for i, entry in enumerate(history):
+        if _is_executed_tap(entry) and _ADD_TAP_NOTE_RE.search(
+            str(entry["action"].get("note", ""))
+        ):
+            last_add_idx = i
+    if last_add_idx < 0:
+        return False
+    for entry in history[last_add_idx + 1:]:
+        action = entry.get("action") if isinstance(entry, dict) else None
+        if isinstance(action, dict) and action.get("action") == "swipe":
+            if not str(entry.get("result", "")).startswith("REJECTED"):
                 return True
     return False
 

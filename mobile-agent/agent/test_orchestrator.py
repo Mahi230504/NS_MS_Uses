@@ -16,6 +16,7 @@ from agent.persistence import TaskRepository
 from agent.profiles import resolve_profile
 from agent.providers.base import ProviderResponse, RequestUsage
 from agent.state_machine import Task, TaskState
+from agent.ui_tree import UiElement
 from bot.users import UserPolicy, UserRecord, UserStore
 from security.audit_logger import AuditLogger
 from security.hitl_gate import HitlGate
@@ -3139,3 +3140,82 @@ class TestExcessQuantityGuardArmedWithCheckoutClause:
         # ADD executed (qty 1); the increment was rejected (guard now armed).
         assert adb.taps == [(600, 900)]
         assert any("over-add" in str(h.get("result", "")) for h in task.history)
+
+
+def _add_hist(note: str = "tap ADD on Amul milk", result: str = "tapped (1,2)"):
+    return [{"action": {"action": "tap", "x": 1, "y": 2, "note": note}, "result": result}]
+
+
+class TestCartRevealHint:
+    """Live-run fix: after an ADD with no [CART] element in the tree (the
+    floating cart bar isn't surfaced on the results screen), nudge the model
+    to reveal it (swipe up → then back to home) instead of floundering."""
+
+    def _el(self, **kw) -> UiElement:
+        base = dict(
+            text="", desc="", resource_id="", class_name="",
+            cx=0, cy=0, bounds=(0, 0, 10, 10), clickable=True,
+        )
+        base.update(kw)
+        return UiElement(**base)
+
+    def test_no_hint_before_any_add(self) -> None:
+        t = Task(user_id=1, description="add milk")
+        assert Orchestrator._cart_reveal_hint(t, []) == ""
+
+    def test_swipe_hint_after_add_when_no_cart(self) -> None:
+        t = Task(user_id=1, description="add milk")
+        t.history = _add_hist()
+        assert "SWIPE UP" in Orchestrator._cart_reveal_hint(t, [])
+
+    def test_no_hint_when_cart_element_present(self) -> None:
+        t = Task(user_id=1, description="add milk")
+        t.history = _add_hist()
+        cart = self._el(text="View cart", is_cart_bar=True)
+        assert Orchestrator._cart_reveal_hint(t, [cart]) == ""
+
+    def test_no_hint_on_cart_screen(self) -> None:
+        t = Task(user_id=1, description="add milk")
+        t.history = _add_hist()
+        el = self._el(text="Proceed to checkout")
+        assert Orchestrator._cart_reveal_hint(t, [el]) == ""
+
+    def test_escalates_to_back_after_swipe(self) -> None:
+        t = Task(user_id=1, description="add milk")
+        t.history = _add_hist() + [
+            {"action": {"action": "swipe", "x1": 5, "y1": 9, "x2": 5, "y2": 1},
+             "result": "swiped (5,9)->(5,1)"},
+        ]
+        assert "BACK" in Orchestrator._cart_reveal_hint(t, [])
+
+    async def test_injected_into_prompt_after_add(self, audit: AuditLogger) -> None:
+        adb = _FakeAdb(foreground_package="com.grofers.customerapp")
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 600, "y": 900,
+                  "note": "tap ADD on Amul milk"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            profile_resolver=resolve_profile,
+        )
+        await orch.run_task(Task(user_id=1, description="add milk"))
+        # Step 2's prompt carries the cart-reveal hint (ADD landed, no cart).
+        assert "SWIPE UP" in vision.calls[1]["task_description"]
+
+    async def test_not_injected_under_generic(self, audit: AuditLogger) -> None:
+        adb = _FakeAdb(foreground_package="com.whatsapp")  # GENERIC
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 600, "y": 900, "note": "tap add"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            profile_resolver=resolve_profile,
+        )
+        await orch.run_task(Task(user_id=1, description="add thing"))
+        assert "SWIPE UP" not in vision.calls[1]["task_description"]
