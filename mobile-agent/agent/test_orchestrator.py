@@ -9,6 +9,7 @@ import pytest
 
 from agent.orchestrator import Orchestrator
 from agent.persistence import TaskRepository
+from agent.profiles import resolve_profile
 from agent.providers.base import ProviderResponse, RequestUsage
 from agent.state_machine import Task, TaskState
 from bot.users import UserPolicy, UserRecord, UserStore
@@ -436,8 +437,11 @@ class TestSkillInjection:
             [({"action": "done", "summary": "ok"}, _usage())]
         )
         adb = _FakeAdb(foreground_package="com.example.app")
+        # com.example.app is non-commerce → GENERIC (no addendum), so the
+        # guidance block is just the per-app skill markdown.
         orch = Orchestrator(
-            adb, HitlGate(), audit, vision, session_timeout_seconds=10, skills=skills
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            skills=skills, profile_resolver=resolve_profile,
         )
         await orch.run_task(Task(user_id=1, description="t"))
 
@@ -453,8 +457,10 @@ class TestSkillInjection:
             [({"action": "done", "summary": "ok"}, _usage())]
         )
         adb = _FakeAdb(foreground_package="com.unknown")
+        # Unknown package → GENERIC: no addendum and no skill → no guidance.
         orch = Orchestrator(
-            adb, HitlGate(), audit, vision, session_timeout_seconds=10, skills=skills
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            skills=skills, profile_resolver=resolve_profile,
         )
         await orch.run_task(Task(user_id=1, description="t"))
 
@@ -2822,3 +2828,116 @@ class TestPolicyEnforcement:
         assert task.state is TaskState.FAILED
         assert "read-only" in (task.failure_reason or "").lower()
         assert adb.taps == []
+
+
+class TestProfileGatingActivation:
+    """A.3: with a profile_resolver wired (production), the shopping-flow
+    validators must fire ONLY for commerce packages. The same category-tap
+    that COMMERCE rejects must execute untouched under GENERIC — proving the
+    de-hardcoded guards no longer run on non-commerce apps."""
+
+    _XML = (
+        "<hierarchy rotation='0'>"
+        '<node text="Maggi Noodles category" '
+        'resource-id="com.x:id/cat_maggi" class="android.widget.TextView" '
+        'bounds="[40,400][520,700]" clickable="true" />'
+        "</hierarchy>"
+    )
+
+    def _adb(self, pkg: str):
+        xml = self._XML
+
+        class _AdbWithTree(_FakeAdb):
+            async def dump_ui_xml(self) -> str | None:
+                return xml
+
+        return _AdbWithTree(foreground_package=pkg)
+
+    async def test_commerce_package_rejects_category_tap(
+        self, audit: AuditLogger
+    ) -> None:
+        adb = self._adb("com.grofers.customerapp")  # → COMMERCE
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 280, "y": 550,
+                  "note": "tap maggi noodles category"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            profile_resolver=resolve_profile,
+        )
+        task = await orch.run_task(Task(user_id=1, description="add maggi to cart"))
+        # Guard fired: the category tap was rejected, never executed.
+        assert adb.taps == []
+        assert any(
+            "category" in str(h.get("result", "")).lower()
+            and "REJECTED" in str(h.get("result", ""))
+            for h in task.history
+        )
+
+    async def test_generic_package_executes_same_category_tap(
+        self, audit: AuditLogger
+    ) -> None:
+        adb = self._adb("com.whatsapp")  # → GENERIC (not commerce)
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 280, "y": 550,
+                  "note": "tap maggi noodles category"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            profile_resolver=resolve_profile,
+        )
+        await orch.run_task(Task(user_id=1, description="add maggi to cart"))
+        # Shopping guard is disarmed under GENERIC → the tap executes.
+        assert adb.taps == [(280, 550)]
+
+    async def test_no_resolver_defaults_to_commerce(
+        self, audit: AuditLogger
+    ) -> None:
+        # Back-compat: omitting the resolver keeps the pre-generalization
+        # behaviour (every app treated as commerce → guard fires).
+        adb = self._adb("com.whatsapp")
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 280, "y": 550,
+                  "note": "tap maggi noodles category"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        orch = Orchestrator(adb, HitlGate(), audit, vision, session_timeout_seconds=10)
+        await orch.run_task(Task(user_id=1, description="add maggi to cart"))
+        assert adb.taps == []  # guard fired despite non-commerce package
+
+
+class TestCommerceAddendumInjection:
+    """A.4: the COMMERCE shopping rules ride the per-app guidance channel —
+    injected for commerce packages, absent for generic ones."""
+
+    async def test_addendum_injected_for_commerce(self, audit: AuditLogger) -> None:
+        vision = _ScriptedVision([({"action": "done", "summary": "ok"}, _usage())])
+        adb = _FakeAdb(foreground_package="com.grofers.customerapp")
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            profile_resolver=resolve_profile,
+        )
+        await orch.run_task(Task(user_id=1, description="add milk"))
+        guidance = vision.calls[0]["skill_hint"] or ""
+        assert "FORBIDDEN TAPS" in guidance       # from the COMMERCE addendum
+        assert "Cart review" in guidance
+
+    async def test_no_addendum_for_generic(self, audit: AuditLogger) -> None:
+        vision = _ScriptedVision([({"action": "done", "summary": "ok"}, _usage())])
+        adb = _FakeAdb(foreground_package="com.whatsapp")  # → GENERIC
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            profile_resolver=resolve_profile,
+        )
+        await orch.run_task(Task(user_id=1, description="reply to mom"))
+        guidance = vision.calls[0]["skill_hint"]
+        # GENERIC + no skill → no guidance at all, and zero shopping rules.
+        assert guidance is None or "FORBIDDEN TAPS" not in guidance

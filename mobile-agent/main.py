@@ -7,6 +7,7 @@ from pathlib import Path
 
 from agent.orchestrator import Orchestrator
 from agent.persistence import TaskRepository
+from agent.profiles import resolve_profile
 from agent.providers import make_provider
 from agent.skills import SkillRegistry
 from bot.handlers import Handlers
@@ -147,6 +148,11 @@ def main() -> None:
         repo=repo,
         enable_vision_hitl=settings.enable_vision_hitl,
         artifact_dir=settings.log_dir / "screenshots",
+        # Activate per-app grounding: commerce packages → COMMERCE profile
+        # (shopping validators + [ACTION]/[CART]/... tags), everything else →
+        # GENERIC (lean structural-only path). Without this the orchestrator
+        # treats every app as commerce (the pre-generalization default).
+        profile_resolver=resolve_profile,
     )
 
     # Intent router — only wire if the provider supports text completion

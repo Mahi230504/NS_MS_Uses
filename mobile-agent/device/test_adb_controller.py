@@ -1,6 +1,7 @@
 """Unit tests for pure-logic AdbController helpers + cached lookups."""
 from __future__ import annotations
 
+import asyncio
 import base64
 
 import pytest
@@ -264,3 +265,140 @@ class TestForceOffAdbkeyboard:
         await adb.restore_ime(None)
         ime_sets = [c for c in calls if c[:3] == ("shell", "ime", "set")]
         assert ime_sets == [("shell", "ime", "set", gboard)]
+
+
+_VALID_DUMP = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<hierarchy rotation="0">'
+    '<node bounds="[0,0][100,100]" text="OK" '
+    'class="android.widget.Button" clickable="true" />'
+    '</hierarchy>'
+)
+
+
+async def _no_sleep(_seconds: float) -> None:
+    """Drop the 250ms inter-pass retry sleep so dump tests run instantly."""
+    return None
+
+
+class TestDumpUiXml:
+    """The UI dump is fused into ONE `adb exec-out sh -c` round-trip per pass
+    (was four: killall + rm + uiautomator dump + cat). These pin that shape and
+    the 3-pass hybrid (uncompressed, uncompressed-after-retry, compressed)."""
+
+    async def test_single_round_trip_on_clean_dump(self, monkeypatch) -> None:
+        adb = AdbController("emulator-5554")
+        calls: list[tuple[str, ...]] = []
+
+        async def fake_run(*args: str, timeout: float | None = None) -> bytes:
+            calls.append(args)
+            return _VALID_DUMP.encode("utf-8")
+
+        monkeypatch.setattr(adb, "_run", fake_run)
+        out = await adb.dump_ui_xml()
+
+        # One adb invocation total — not four — when pass 1 succeeds.
+        assert len(calls) == 1
+        assert calls[0][:3] == ("exec-out", "sh", "-c")
+        script = calls[0][3]
+        assert "killall uiautomator" in script
+        assert "rm -f /sdcard/atlas_ui_dump.xml" in script
+        assert "uiautomator dump /sdcard/atlas_ui_dump.xml" in script
+        assert "cat /sdcard/atlas_ui_dump.xml" in script
+        assert "--compressed" not in script  # pass 1 is full fidelity
+        assert out is not None
+        assert out.startswith("<?xml")
+        assert out.endswith("</hierarchy>")
+
+    async def test_falls_back_to_compressed_when_uncompressed_empty(
+        self, monkeypatch
+    ) -> None:
+        adb = AdbController("emulator-5554")
+        calls: list[tuple[str, ...]] = []
+
+        async def fake_run(*args: str, timeout: float | None = None) -> bytes:
+            calls.append(args)
+            script = args[3]
+            # Uncompressed passes 1 & 2 hit the idle-state error (no file
+            # written → empty read); the compressed pass 3 returns a tree.
+            if "--compressed" in script:
+                return _VALID_DUMP.encode("utf-8")
+            return b"ERROR: could not get idle state."
+
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        monkeypatch.setattr(adb, "_run", fake_run)
+        out = await adb.dump_ui_xml()
+
+        assert len(calls) == 3
+        assert "--compressed" not in calls[0][3]
+        assert "--compressed" not in calls[1][3]
+        assert "--compressed" in calls[2][3]
+        assert out is not None and out.endswith("</hierarchy>")
+
+    async def test_returns_none_when_every_pass_empty(self, monkeypatch) -> None:
+        adb = AdbController("emulator-5554")
+
+        async def fake_run(*args: str, timeout: float | None = None) -> bytes:
+            return b""  # nothing ever written
+
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        monkeypatch.setattr(adb, "_run", fake_run)
+        assert await adb.dump_ui_xml() is None
+
+    async def test_pipeline_adb_error_is_swallowed_as_empty(
+        self, monkeypatch
+    ) -> None:
+        adb = AdbController("emulator-5554")
+
+        async def fake_run(*args: str, timeout: float | None = None) -> bytes:
+            raise AdbError("cat: /sdcard/atlas_ui_dump.xml: No such file")
+
+        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+        monkeypatch.setattr(adb, "_run", fake_run)
+        # Each pass raises → each returns "" → extraction yields None overall.
+        assert await adb.dump_ui_xml() is None
+
+
+class TestGetForegroundPackage:
+    """Foreground-app resolution must survive OEM quirks. On realme/ColorOS,
+    mCurrentFocus pins to `NotificationShade` whenever an overlay (shade, IME,
+    dialog) holds focus; mFocusedApp / ResumedActivity still name the real app.
+    Without the fallback chain every app would resolve to None → GENERIC
+    profile, silently disabling all per-app grounding."""
+
+    async def _pkg_for(self, monkeypatch, dump: str) -> str | None:
+        adb = AdbController("emulator-5554")
+
+        async def fake_run(*args: str, timeout: float | None = None) -> bytes:
+            assert args[:2] == ("shell", "dumpsys")
+            return dump.encode("utf-8")
+
+        monkeypatch.setattr(adb, "_run", fake_run)
+        return await adb.get_foreground_package()
+
+    async def test_current_focus_preferred_when_present(self, monkeypatch) -> None:
+        dump = (
+            "  mCurrentFocus=Window{abc u0 com.grofers.customerapp/.MainActivity}\n"
+            "  mFocusedApp=ActivityRecord{def u0 com.android.launcher/.Launcher t5}\n"
+        )
+        assert await self._pkg_for(monkeypatch, dump) == "com.grofers.customerapp"
+
+    async def test_falls_back_to_focused_app_when_overlay_focused(
+        self, monkeypatch
+    ) -> None:
+        # The real ColorOS shape that returned None before the fix.
+        dump = (
+            "  mCurrentFocus=Window{ae751d4 u0 NotificationShade}\n"
+            "  mFocusedApp=ActivityRecord{77ed4e2 u0 com.android.launcher/.Launcher t5}\n"
+        )
+        assert await self._pkg_for(monkeypatch, dump) == "com.android.launcher"
+
+    async def test_falls_back_to_resumed_activity(self, monkeypatch) -> None:
+        dump = (
+            "  mCurrentFocus=Window{ae751d4 u0 NotificationShade}\n"
+            "  ResumedActivity: ActivityRecord{77ed4e2 u0 in.swiggy.android/.MainActivity}\n"
+        )
+        assert await self._pkg_for(monkeypatch, dump) == "in.swiggy.android"
+
+    async def test_returns_none_when_nothing_matches(self, monkeypatch) -> None:
+        assert await self._pkg_for(monkeypatch, "no focus info here") is None

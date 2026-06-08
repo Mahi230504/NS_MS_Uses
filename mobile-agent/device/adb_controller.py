@@ -34,6 +34,19 @@ _ADBKEYBOARD_IME = "com.android.adbkeyboard/.AdbIME"
 #   mCurrentFocus=Window{abc123 u0 com.blinkit.markets/.MainActivity}
 # We pull the package out of the slash-separated component name.
 _CURRENT_FOCUS_RE = re.compile(r"mCurrentFocus=Window\{[^}]*\s+([\w.]+)/")
+# Fallbacks for when mCurrentFocus carries no package. Verified on a real
+# realme/ColorOS build (RMX3392): when ANY overlay holds input focus — the
+# notification shade, an IME, a system dialog, recents — mCurrentFocus reads
+# `Window{... NotificationShade}` (no `pkg/component`), so the regex above
+# misses and we'd wrongly resolve the app as "unknown" (→ GENERIC profile,
+# losing all per-app grounding). mFocusedApp / ResumedActivity still name the
+# real underlying Activity, so we fall back to them. Matches
+#   mFocusedApp=ActivityRecord{77ed4e2 u0 com.android.launcher/.Launcher t5}
+#   ResumedActivity: ActivityRecord{77ed4e2 u0 com.android.launcher/.Launcher}
+_FOCUSED_APP_RE = re.compile(r"mFocusedApp=ActivityRecord\{[^}]*\s+([\w.]+)/")
+_RESUMED_ACTIVITY_RE = re.compile(
+    r"ResumedActivity:?\s*ActivityRecord\{[^}]*\s+([\w.]+)/"
+)
 
 # Android KEYCODE_BACK; used by the recovery path in the orchestrator.
 KEYCODE_BACK = 4
@@ -350,54 +363,50 @@ class AdbController:
         If a previous invocation hung or got OOM-killed, its pid lingers and
         the next dump returns "Killed" (because Android refuses to launch
         another while one is still around or because OOM-killer reaped the
-        new one to keep memory low).
+        new one to keep memory low). So we reap stale processes first.
 
-        Mitigation: best-effort `killall uiautomator` before each dump so
-        only one ever exists at a time. Real fix for the long-running case
-        would be to use UIAutomator2 (server APK), but that requires an
-        install step we'd rather avoid.
+        Performance: the four device interactions this pass needs — reap stale
+        uiautomator, clear the previous file, dump, stream the file back — are
+        fused into ONE `adb exec-out sh -c` round-trip instead of four
+        separate `adb` invocations. Each `adb` spawn is a process fork plus a
+        USB round-trip (tens of ms on a healthy link, much more on a flaky
+        ColorOS one); collapsing 4→1 removes three spawns and three round-trips
+        per pass, and the hybrid does up to three passes per step. exec-out
+        keeps the XML binary-clean (no CRLF translation), same as the old
+        `exec-out cat`.
+
+        Dump to a file on /sdcard, then `cat` it back — do NOT stream to
+        /dev/tty. On this ColorOS build `uiautomator dump … /dev/tty` (via
+        exec-out) BLOCKS to the full timeout every pass; writing to a file
+        returns immediately. Verified live: compressed file-dump pulls a
+        real 30+ node tree off an animated Blinkit screen in <1s.
+
+        The `rm -f` before the dump is load-bearing: a dump that fails the
+        idle check writes NOTHING, so a leftover file from a prior pass must
+        not be read back as if it were the current screen. The dump's own
+        stdout/stderr is discarded (`>/dev/null 2>&1`) — we don't trust its
+        exit code; `_extract_hierarchy` validates the XML we `cat` back, so a
+        non-idle pass simply yields an empty/garbage read that the caller
+        falls through on to the --compressed pass.
         """
-        await self._kill_stale_uiautomator()
-        # Dump to a file on /sdcard, then `cat` it back — do NOT stream to
-        # /dev/tty. On this ColorOS build `uiautomator dump … /dev/tty` (via
-        # exec-out) BLOCKS to the full timeout every pass; writing to a file
-        # returns immediately. Verified live: compressed file-dump pulls a
-        # real 30+ node tree off an animated Blinkit screen in <1s.
         remote = "/sdcard/atlas_ui_dump.xml"
-        # Clear any stale dump first: a dump that fails the idle check writes
-        # NOTHING, so a leftover file from a prior pass must not be read back
-        # as if it were the current screen.
+        flag = " --compressed" if compressed else ""
+        script = (
+            "killall uiautomator 2>/dev/null; "
+            f"rm -f {remote} 2>/dev/null; "
+            f"uiautomator dump{flag} {remote} >/dev/null 2>&1; "
+            f"cat {remote} 2>/dev/null"
+        )
         try:
-            await self._run("shell", "rm", "-f", remote)
-        except AdbError:
-            pass
-        args = ["shell", "uiautomator", "dump"]
-        if compressed:
-            args.append("--compressed")
-        args.append(remote)
-        try:
-            await self._run(*args, timeout=_DUMP_TIMEOUT_SECONDS)
             out = await self._run(
-                "exec-out", "cat", remote, timeout=_DUMP_TIMEOUT_SECONDS
+                "exec-out", "sh", "-c", script, timeout=_DUMP_TIMEOUT_SECONDS
             )
         except AdbError:
-            # Non-idle screen → normal dump wrote no file → `cat` fails here;
-            # the caller falls through to the --compressed pass.
+            # Whole pipeline failed (e.g. cat of a never-written file exits
+            # non-zero) → treat as an empty dump; the caller falls through to
+            # the --compressed pass.
             return ""
         return out.decode("utf-8", errors="replace").strip()
-
-    async def _kill_stale_uiautomator(self) -> None:
-        """Reap any leftover uiautomator processes before spawning a new one.
-
-        Errors are swallowed: `killall` returns non-zero when no matching
-        process exists (the normal case on a fresh device), and we don't
-        care if the kill itself fails — the worst outcome is a stuck dump,
-        which is what we already have.
-        """
-        try:
-            await self._run("shell", "killall", "uiautomator")
-        except AdbError:
-            pass
 
     @staticmethod
     def _extract_hierarchy(text: str) -> str | None:
@@ -418,10 +427,19 @@ class AdbController:
         return text[start : end + len("</hierarchy>")]
 
     async def get_foreground_package(self) -> str | None:
-        """Return the package name of the foregrounded activity, or None.
+        """Return the package name of the foregrounded app, or None.
 
-        Uses `dumpsys window`'s mCurrentFocus line. Returns None if parsing
-        fails so callers can degrade gracefully (e.g. no skill injection).
+        Reads `dumpsys window` and tries three sources in order:
+          1. mCurrentFocus — the window with literal input focus. Most precise
+             when a real app is focused, but on some OEMs (verified ColorOS)
+             it reads `NotificationShade` / an IME / a dialog with no package
+             whenever an overlay is up.
+          2. mFocusedApp — the focused ActivityRecord. Survives overlays and
+             names the real underlying app, so it's the reliable fallback.
+          3. ResumedActivity — last-resort on builds that omit mFocusedApp.
+
+        Returns None only if none match, so callers degrade gracefully
+        (skill/profile resolution falls back to GENERIC rather than crashing).
         """
         try:
             out = (await self._run("shell", "dumpsys", "window")).decode(
@@ -429,8 +447,13 @@ class AdbController:
             )
         except AdbError:
             return None
-        m = _CURRENT_FOCUS_RE.search(out)
-        return m.group(1) if m else None
+        for pattern in (
+            _CURRENT_FOCUS_RE, _FOCUSED_APP_RE, _RESUMED_ACTIVITY_RE,
+        ):
+            m = pattern.search(out)
+            if m:
+                return m.group(1)
+        return None
 
     async def _adbkeyboard_is_enabled(self) -> bool:
         """Cached: is ADBKeyboard listed as an enabled IME?"""

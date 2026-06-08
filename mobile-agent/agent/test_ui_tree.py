@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agent.profiles import COMMERCE, GENERIC
 from agent.ui_tree import (
     UiElement,
     find_action_at,
@@ -15,6 +16,65 @@ from agent.ui_tree import (
 
 
 _FIXTURES = Path(__file__).parent / "fixtures"
+
+
+# A screen carrying every shopping signal: an ADD button, a View-cart bar, a
+# category tile, and a delivery-location header. Used to prove that the same
+# tree is fully annotated under COMMERCE but carries ZERO shopping semantics
+# under GENERIC (the lean path non-commerce apps take).
+_COMMERCE_SCREEN_XML = """<?xml version='1.0' encoding='UTF-8' ?>
+<hierarchy rotation="0">
+  <node text="Delivering to Home" resource-id="com.x:id/location_header"
+        class="android.widget.TextView" bounds="[0,120][1080,260]" clickable="true" />
+  <node text="Maggi N Maggi House" resource-id="com.x:id/category_tile"
+        class="android.widget.TextView" bounds="[0,300][1080,440]" clickable="true" />
+  <node content-desc="Maggi 2-Minute Noodles 70g" class="android.view.ViewGroup"
+        bounds="[0,700][1080,1300]" clickable="true">
+    <node text="ADD" resource-id="com.x:id/add_to_cart"
+          class="android.widget.Button" bounds="[880,1100][1040,1220]" clickable="true" />
+  </node>
+  <node text="View cart" resource-id="com.x:id/view_cart"
+        class="android.view.ViewGroup" bounds="[0,2280][1080,2400]" clickable="true" />
+</hierarchy>
+"""
+
+
+class TestProfileDrivenAnnotation:
+    """The de-hardcoding contract: shopping annotations are a function of the
+    active profile, not a global. COMMERCE annotates; GENERIC does not."""
+
+    def test_commerce_profile_annotates_all_signals(self) -> None:
+        els = parse(_COMMERCE_SCREEN_XML, COMMERCE)
+        assert any(e.is_action for e in els)
+        assert any(e.is_cart_bar for e in els)
+        assert any(e.is_category_like for e in els)
+        assert any(e.is_location_header for e in els)
+
+    def test_generic_profile_carries_no_shopping_semantics(self) -> None:
+        # The whole point of generalization: a non-commerce app gets the
+        # structural tree (elements still parsed) but ZERO shopping flags, so
+        # none of the shopping validators can mis-fire on it.
+        els = parse(_COMMERCE_SCREEN_XML, GENERIC)
+        assert els, "structural parse must still return elements"
+        assert not any(e.is_action for e in els)
+        assert not any(e.is_cart_bar for e in els)
+        assert not any(e.is_category_like for e in els)
+        assert not any(e.is_location_header for e in els)
+
+    def test_generic_render_has_no_tags(self) -> None:
+        out = to_prompt_section(_COMMERCE_SCREEN_XML, GENERIC)
+        for tag in ("[ACTION]", "[CART]", "[CATEGORY?]", "[LOCATION]"):
+            assert tag not in out, f"{tag} leaked into GENERIC render"
+
+    def test_commerce_render_has_tags(self) -> None:
+        out = to_prompt_section(_COMMERCE_SCREEN_XML, COMMERCE)
+        assert "[ACTION]" in out
+        assert "[CART]" in out
+
+    def test_default_profile_is_commerce(self) -> None:
+        # Back-compat: callers that omit the profile get COMMERCE, matching
+        # pre-refactor behaviour.
+        assert parse(_COMMERCE_SCREEN_XML) == parse(_COMMERCE_SCREEN_XML, COMMERCE)
 
 
 _SAMPLE_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>

@@ -16,6 +16,7 @@ _log = logging.getLogger("mobile_agent.orchestrator")
 from agent.action_executor import execute as execute_action
 from agent.persistence import TaskRepository
 from agent.phash import compute as compute_phash
+from agent.profiles import COMMERCE, AppProfile
 from agent.providers.base import VisionProvider
 from agent.skills import SkillRegistry
 from agent.state_machine import Task, TaskState
@@ -26,7 +27,7 @@ from agent.ui_tree import (
     has_focused_text_input,
     is_coord_in_elements,
     parse as ui_tree_parse,
-    to_prompt_section as ui_tree_to_prompt,
+    render_elements as ui_tree_render,
 )
 from bot.users import UserStore
 from device.adb_controller import KEYCODE_BACK, AdbController, AdbError
@@ -36,6 +37,14 @@ from security.hitl_gate import HitlGate, ReadOnlyViolation
 
 
 MAX_LOOP_ITERATIONS = 30
+# Only the most recent N history entries are sent to the model each step.
+# Loop/giveup detection still scans the FULL task.history orchestrator-side;
+# the model simply doesn't need the entire transcript re-tokenised every step.
+# Sending it whole grows the prompt — and thus per-step latency and token cost
+# — roughly quadratically over a long task (each step re-sends all prior
+# steps, and rejection hints are verbose). The recent tail carries what the
+# model actually needs: its last few actions and any rejection it must correct.
+PROMPT_HISTORY_WINDOW = 12
 # After this many consecutive empty-dump steps (following at least one good
 # tree), the stale-tree guard stops rejecting and lets the model act on the
 # screenshot alone. Prevents an infinite reject loop on screens where
@@ -241,6 +250,12 @@ _STATE_CHANGING = frozenset({"tap", "type", "swipe"})
 
 ApprovalCallback = Callable[[Task, dict], Awaitable[None]]
 StatusCallback = Callable[[Task, str], Awaitable[None]]
+# Maps a foreground package name (or None) → the AppProfile that supplies the
+# UI-tree annotation vocabulary and arms/disarms the shopping-flow validators.
+# main.py injects agent.profiles.resolve_profile; when omitted (unit tests,
+# ad-hoc callers) the orchestrator keeps its pre-generalization behaviour by
+# defaulting every screen to COMMERCE.
+ProfileResolver = Callable[[Optional[str]], AppProfile]
 
 
 class OrchestratorError(RuntimeError):
@@ -262,6 +277,7 @@ class Orchestrator:
         repo: TaskRepository | None = None,
         enable_vision_hitl: bool = False,
         artifact_dir: Path | None = None,
+        profile_resolver: ProfileResolver | None = None,
     ) -> None:
         self._adb = adb
         self._hitl = hitl
@@ -272,6 +288,12 @@ class Orchestrator:
         self._skills = skills
         self._repo = repo
         self._enable_vision_hitl = enable_vision_hitl
+        # Per-app grounding. With a resolver wired (production), each step
+        # resolves the foreground package to GENERIC/COMMERCE/... and gates
+        # the shopping validators accordingly. Without one (tests / ad-hoc),
+        # `_active_profile` stays COMMERCE so behaviour is unchanged.
+        self._profile_resolver = profile_resolver
+        self._active_profile: AppProfile = COMMERCE
         # Root directory for per-task screenshot+UI-dump+action artifacts.
         # None disables persistence (used by unit tests). When set, every
         # step writes step_<NN>.png, step_<NN>.xml, step_<NN>.json under a
@@ -327,6 +349,9 @@ class Orchestrator:
         self._last_loop_step = -1
         self._current_task_db_id = None
         self._current_task_artifact_dir = self._make_task_artifact_dir(task)
+        # Reset to the default; the first real step resolves it from the
+        # foreground package. (Stays COMMERCE if no resolver was injected.)
+        self._active_profile = COMMERCE
         self._task_tree_ever_seen = False
         self._consecutive_stale_tree = 0
         task.state = TaskState.RUNNING
@@ -401,7 +426,7 @@ class Orchestrator:
             _log.info("step %d: screencap", task.step_count)
             screenshot = await self._adb.screencap()
             screenshot_b64 = base64.standard_b64encode(screenshot).decode("ascii")
-            current_phash = _safe_phash(screenshot)
+            current_phash = await _safe_phash(screenshot)
 
             # The UI tree is fetched once per iteration. We use it for two
             # purposes: (1) inject into the model prompt for accurate
@@ -428,8 +453,14 @@ class Orchestrator:
             else:
                 self._consecutive_synthetic_waits = 0
                 _log.info("step %d: skill+ui_tree", task.step_count)
-                skill_hint = await self._lookup_skill()
-                ui_tree, ui_elements, ui_xml = await self._lookup_ui_tree()
+                # One foreground-package read per step, shared by skill lookup
+                # AND profile resolution (was a separate dumpsys per concern).
+                pkg = await self._foreground_package()
+                self._active_profile = self._resolve_profile(pkg)
+                skill_hint = self._compose_guidance(self._active_profile, pkg)
+                ui_tree, ui_elements, ui_xml = await self._lookup_ui_tree(
+                    self._active_profile
+                )
                 if ui_elements:
                     # Latch: once we've seen a real tree on this task, any
                     # later empty result is a transient failure (mid-app
@@ -455,7 +486,7 @@ class Orchestrator:
                     task_description=(
                         f"{task.description}\n\n{loop_hint}" if loop_hint else task.description
                     ),
-                    step_history=task.history,
+                    step_history=task.history[-PROMPT_HISTORY_WINDOW:],
                     screen_size=screen_size,
                     skill_hint=skill_hint,
                     ui_tree=ui_tree,
@@ -569,7 +600,10 @@ class Orchestrator:
             # (passed coord grounding) but on the WRONG kind of element for
             # what the note says. Catches the search-bar-vs-location-header
             # misclick and ADD-on-non-action hallucinations.
-            intent_problem = self._intent_mismatch(action, ui_elements)
+            intent_problem = (
+                self._intent_mismatch(action, ui_elements)
+                if self._active_profile.enforce_shopping_guards else None
+            )
             if intent_problem is not None:
                 hint = (
                     f"REJECTED: {intent_problem}. Pick a different element "
@@ -593,7 +627,10 @@ class Orchestrator:
             # coords don't mention <product> at all. Real failure case:
             # claimed eggs, actually added a Fire TV Stick. Reject so the
             # model has to re-target.
-            name_problem = self._add_product_name_mismatch(action, ui_elements)
+            name_problem = (
+                self._add_product_name_mismatch(action, ui_elements)
+                if self._active_profile.enforce_shopping_guards else None
+            )
             if name_problem is not None:
                 hint = f"REJECTED: {name_problem}."
                 task.history.append({"action": action, "result": hint})
@@ -613,7 +650,10 @@ class Orchestrator:
             # violating prompt rule 1 (forbidden navigation for add-to-cart
             # flows). Block early so the model has to find a real product
             # card instead of getting lost on a landing page.
-            category_problem = self._category_tap_rejection(task, action)
+            category_problem = (
+                self._category_tap_rejection(task, action)
+                if self._active_profile.enforce_shopping_guards else None
+            )
             if category_problem is not None:
                 hint = f"REJECTED: {category_problem}."
                 task.history.append({"action": action, "result": hint})
@@ -632,7 +672,10 @@ class Orchestrator:
             # Same-coords ADD-after-ADD (any product name) is wrong — see
             # _repeated_add_rejection docstring. Reject before execution so
             # the loop detector doesn't consume a slot on it.
-            repeat_problem = self._repeated_add_rejection(task, action)
+            repeat_problem = (
+                self._repeated_add_rejection(task, action)
+                if self._active_profile.enforce_shopping_guards else None
+            )
             if repeat_problem is not None:
                 hint = f"REJECTED: {repeat_problem}."
                 task.history.append({"action": action, "result": hint})
@@ -677,8 +720,9 @@ class Orchestrator:
             # hallucinated cart items pulled from cross-sell [ACTION] lines).
             # Reject before HITL so the cart-screen handoff doesn't auto-
             # grant a payment latch on a stale screen.
-            premature_reason = self._premature_cart_review_rejection(
-                action, ui_elements
+            premature_reason = (
+                self._premature_cart_review_rejection(action, ui_elements)
+                if self._active_profile.enforce_shopping_guards else None
             )
             if premature_reason is not None:
                 hint = f"REJECTED need_approval: {premature_reason}"
@@ -703,7 +747,10 @@ class Orchestrator:
             # shape: append a hint to history, reset dedup, continue.
             # Legitimate need_approval (cart review, payment, no payment
             # method, etc.) doesn't trip this.
-            giveup_reason = self._giveup_rejection(task, action)
+            giveup_reason = (
+                self._giveup_rejection(task, action)
+                if self._active_profile.enforce_shopping_guards else None
+            )
             if giveup_reason is not None:
                 hint = (
                     f"REJECTED need_approval: {giveup_reason}. The "
@@ -792,26 +839,60 @@ class Orchestrator:
             return None
         return {"action": "wait", "reason": "screen unchanged"}
 
-    async def _lookup_skill(self) -> str | None:
-        if self._skills is None:
-            return None
+    async def _foreground_package(self) -> str | None:
+        """Best-effort foreground package; None on any adb hiccup."""
         try:
-            pkg = await self._adb.get_foreground_package()
+            return await self._adb.get_foreground_package()
         except Exception:
             return None
-        return self._skills.get(pkg)
+
+    def _compose_guidance(
+        self, profile: AppProfile, package: str | None
+    ) -> str | None:
+        """Per-app guidance block for the prompt: profile addendum + skill md.
+
+        The profile's addendum (e.g. COMMERCE's shopping-flow rules) leads,
+        followed by the package-specific `skills/<pkg>.md` text if any. Under
+        GENERIC the addendum is empty, so a non-commerce app contributes only
+        its own skill (usually none) — the shopping rules never reach it.
+        Returns None when there's nothing to add, so the provider omits the
+        whole block.
+        """
+        parts: list[str] = []
+        if profile.prompt_addendum:
+            parts.append(profile.prompt_addendum)
+        skill = self._skills.get(package) if self._skills else None
+        if skill:
+            parts.append(skill)
+        return "\n\n".join(parts) if parts else None
+
+    def _resolve_profile(self, package: str | None) -> AppProfile:
+        """Resolve the active grounding profile for a foreground package.
+
+        With a resolver injected (production), maps the package to
+        GENERIC/COMMERCE/... With none (tests / ad-hoc callers), keeps the
+        pre-generalization behaviour of treating every screen as COMMERCE.
+        """
+        if self._profile_resolver is None:
+            return COMMERCE
+        try:
+            return self._profile_resolver(package)
+        except Exception:
+            return COMMERCE
 
     async def _lookup_ui_tree(
-        self,
+        self, profile: AppProfile,
     ) -> tuple[str | None, list[UiElement], str | None]:
-        """Fetch the on-screen accessibility tree.
+        """Fetch the on-screen accessibility tree under the active profile.
 
         Returns a 3-tuple: (rendered prompt block, parsed element list,
         raw XML). The rendered block goes into the model prompt; the parsed
         list is used by the coord-validation check to reject hallucinated
         taps; the raw XML is persisted as a per-step artifact so failed
         runs can be inspected later. All three default to None/[]/None on
-        failure so callers can degrade.
+        failure so callers can degrade. `profile` supplies the annotation
+        vocabulary — GENERIC yields a structural-only tree with no shopping
+        tags.
         """
         try:
             xml = await self._adb.dump_ui_xml()
@@ -819,8 +900,12 @@ class Orchestrator:
             return None, [], None
         if not xml:
             return None, [], None
-        elements = ui_tree_parse(xml)
-        rendered = ui_tree_to_prompt(xml) or None
+        # Parse the dump XML ONCE and render the prompt block from the same
+        # element list. The previous code called parse(xml) here and
+        # to_prompt_section(xml) — which parsed the XML a second time — so
+        # every step re-ran ElementTree + the full candidate walk twice.
+        elements = ui_tree_parse(xml, profile)
+        rendered = ui_tree_render(elements, profile) or None
         return rendered, elements, xml
 
     @staticmethod
@@ -1221,7 +1306,7 @@ class Orchestrator:
             _SEARCH_INTENT_RE.search(note)
             and not _ADDRESS_INTENT_RE.search(note)
         ):
-            if target.looks_like_location_header:
+            if target.is_location_header:
                 return (
                     f"note '{note}' implies tapping the search bar, but the "
                     f"element at ({x},{y}) is the [LOCATION] delivery/"
@@ -1249,7 +1334,7 @@ class Orchestrator:
         if _ADD_INTENT_RE.search(note) and not target.is_action:
             target_kind = (
                 "[CATEGORY?] tile"
-                if (target.clickable and target.looks_like_category_text)
+                if (target.clickable and target.is_category_like)
                 else "non-action element"
             )
             return (
@@ -1531,7 +1616,7 @@ class Orchestrator:
         except AdbError:
             # Flaky adb shouldn't kill the task — let the next iter retake.
             return
-        post_phash = _safe_phash(post)
+        post_phash = await _safe_phash(post)
         if pre_phash is None or post_phash is None or post_phash != pre_phash:
             self._unchanged_streak = 0
             return
@@ -1891,8 +1976,16 @@ def _safe_slug(s: str, max_len: int = 32) -> str:
     return cleaned[:max_len].rstrip("-") or "task"
 
 
-def _safe_phash(image_bytes: bytes) -> str | None:
+async def _safe_phash(image_bytes: bytes) -> str | None:
+    """Compute the screenshot phash off the event loop.
+
+    phash decodes the full PNG and runs a DCT — tens to >100ms of pure CPU on
+    a multi-megapixel screenshot, twice per step (dedup + outcome verify).
+    Running it inline blocks the single asyncio loop that also drives Telegram
+    polling, the trigger webhook, and any concurrent user's task, so offload it
+    to a worker thread. The hash value is identical to the inline computation.
+    """
     try:
-        return compute_phash(image_bytes)
+        return await asyncio.to_thread(compute_phash, image_bytes)
     except ValueError:
         return None
