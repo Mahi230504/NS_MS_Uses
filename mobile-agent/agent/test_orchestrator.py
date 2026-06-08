@@ -7,7 +7,11 @@ from typing import Any
 
 import pytest
 
-from agent.orchestrator import Orchestrator
+from agent.orchestrator import (
+    Orchestrator,
+    _is_single_item_task,
+    _requested_quantity,
+)
 from agent.persistence import TaskRepository
 from agent.profiles import resolve_profile
 from agent.providers.base import ProviderResponse, RequestUsage
@@ -30,6 +34,7 @@ class _FakeAdb:
         self.screen_size = screen_size
         self.texts: list[str] = []
         self.key_events: list[int] = []
+        self.woke: int = 0
         # If `screencaps` is provided, calls pop sequentially (last entry
         # repeats). Otherwise each call synthesizes a fresh unique PNG so
         # phash-based dedup / outcome verification doesn't engage. Tests that
@@ -63,6 +68,9 @@ class _FakeAdb:
 
     async def key_event(self, keycode: int) -> None:
         self.key_events.append(keycode)
+
+    async def wake_screen(self) -> None:
+        self.woke += 1
 
     async def get_screen_size(self) -> tuple[int, int]:
         if self.screen_size is None:
@@ -2941,3 +2949,193 @@ class TestCommerceAddendumInjection:
         guidance = vision.calls[0]["skill_hint"]
         # GENERIC + no skill → no guidance at all, and zero shopping rules.
         assert guidance is None or "FORBIDDEN TAPS" not in guidance
+
+
+class TestRequestedQuantityParsing:
+    def test_default_one(self) -> None:
+        assert _requested_quantity("add amul milk to cart") == 1
+
+    def test_ignores_size_numbers(self) -> None:
+        # 500ml / 70g are sizes, not counts → default 1.
+        assert _requested_quantity("add amul milk 500ml") == 1
+        assert _requested_quantity("buy maggi 70g masala noodles") == 1
+
+    def test_digit_plus_unit(self) -> None:
+        assert _requested_quantity("add 2 packs of milk") == 2
+        assert _requested_quantity("3 bottles of coke") == 3
+
+    def test_imperative_number(self) -> None:
+        assert _requested_quantity("add 3 amul milk") == 3
+
+    def test_qty_keyword(self) -> None:
+        assert _requested_quantity("amul milk qty 4") == 4
+        assert _requested_quantity("milk quantity: 5") == 5
+
+    def test_number_word(self) -> None:
+        assert _requested_quantity("two packets of bread") == 2
+        assert _requested_quantity("a couple of beers") == 2
+
+    def test_clamped_to_max(self) -> None:
+        assert _requested_quantity("add 99 packs of milk") == 20
+
+
+class TestSingleItemDetection:
+    def test_single_item(self) -> None:
+        assert _is_single_item_task("add amul milk")
+
+    def test_multi_item_and(self) -> None:
+        assert not _is_single_item_task("add milk and bread")
+
+    def test_multi_item_comma(self) -> None:
+        assert not _is_single_item_task("milk, eggs, bread")
+
+
+class TestExcessQuantityGuard:
+    """Live-run finding: 'one pack of Amul milk' → agent added 3. The guard
+    allows up to the requested quantity of add/increment taps, then rejects."""
+
+    async def test_blocks_increment_past_qty_one(self, audit: AuditLogger) -> None:
+        adb = _FakeAdb(foreground_package="com.grofers.customerapp")  # COMMERCE
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 600, "y": 900,
+                  "note": "tap ADD on Amul Gold Full Cream Milk"}, _usage()),
+                ({"action": "tap", "x": 670, "y": 560,
+                  "note": "tap the plus button to increase quantity"}, _usage()),
+                ({"action": "done", "summary": "in cart"}, _usage()),
+            ]
+        )
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            profile_resolver=resolve_profile,
+        )
+        task = await orch.run_task(
+            Task(user_id=1, description="add one pack of Amul milk to the cart")
+        )
+        # ADD executed (qty 1); the + was rejected, never tapped.
+        assert adb.taps == [(600, 900)]
+        assert any("over-add" in str(h.get("result", "")) for h in task.history)
+
+    async def test_allows_increment_up_to_requested_qty(
+        self, audit: AuditLogger
+    ) -> None:
+        adb = _FakeAdb(foreground_package="com.grofers.customerapp")
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 600, "y": 900,
+                  "note": "tap ADD on Amul milk"}, _usage()),
+                ({"action": "tap", "x": 670, "y": 560,
+                  "note": "tap + to increase quantity to 2"}, _usage()),
+                ({"action": "done", "summary": "two in cart"}, _usage()),
+            ]
+        )
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            profile_resolver=resolve_profile,
+        )
+        await orch.run_task(
+            Task(user_id=1, description="add 2 packs of Amul milk")
+        )
+        # qty 2 requested → ADD + one + both execute.
+        assert adb.taps == [(600, 900), (670, 560)]
+
+    async def test_disarmed_under_generic_profile(self, audit: AuditLogger) -> None:
+        adb = _FakeAdb(foreground_package="com.whatsapp")  # GENERIC
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 600, "y": 900, "note": "tap add"}, _usage()),
+                ({"action": "tap", "x": 670, "y": 560,
+                  "note": "tap plus to increase"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            profile_resolver=resolve_profile,
+        )
+        await orch.run_task(Task(user_id=1, description="add one thing"))
+        # Non-commerce: shopping guard disarmed → both taps execute.
+        assert adb.taps == [(600, 900), (670, 560)]
+
+
+class TestWakeAndWaitGuards:
+    """Robustness fixes from the live black-screen run: wake the display at
+    task start, and fail fast on a run that only ever waits."""
+
+    async def test_wakes_screen_at_task_start(self, audit: AuditLogger) -> None:
+        adb = _FakeAdb()
+        vision = _ScriptedVision([({"action": "done", "summary": "ok"}, _usage())])
+        orch = Orchestrator(adb, HitlGate(), audit, vision, session_timeout_seconds=10)
+        await orch.run_task(Task(user_id=1, description="t"))
+        assert adb.woke >= 1  # display woken before the loop ran
+
+    async def test_aborts_after_too_many_consecutive_waits(
+        self, audit: AuditLogger
+    ) -> None:
+        # Model waits forever (black/frozen screen). Unique screencaps mean no
+        # synthetic-wait dedup, so each is a real model wait — must fail fast.
+        adb = _FakeAdb()
+        vision = _ScriptedVision([({"action": "wait", "reason": "loading"}, _usage())] * 12)
+        orch = Orchestrator(adb, HitlGate(), audit, vision, session_timeout_seconds=30)
+        task = await orch.run_task(Task(user_id=1, description="t"))
+        assert task.state is TaskState.FAILED
+        assert "consecutive waits" in (task.failure_reason or "")
+        # Bailed at the cap, not after burning all 30 iterations.
+        assert task.step_count <= 7
+
+    async def test_waits_reset_on_progress(self, audit: AuditLogger) -> None:
+        # A few waits interleaved with real actions must NOT trip the cap.
+        adb = _FakeAdb()
+        script = []
+        for _ in range(3):
+            script.append(({"action": "wait", "reason": "loading"}, _usage()))
+            script.append(({"action": "tap", "x": 5, "y": 5, "note": "tap"}, _usage()))
+        script.append(({"action": "done", "summary": "ok"}, _usage()))
+        vision = _ScriptedVision(script)
+        orch = Orchestrator(adb, HitlGate(), audit, vision, session_timeout_seconds=30)
+        task = await orch.run_task(Task(user_id=1, description="t"))
+        assert task.state is TaskState.DONE  # never hit the consecutive-wait cap
+
+
+class TestSingleItemActionClauseStripping:
+    """Live-run fix: a trailing checkout-action clause must NOT make a
+    single-item task look multi-item (which disarmed the quantity guard)."""
+
+    def test_checkout_clause_stays_single_item(self) -> None:
+        assert _is_single_item_task("Add milk to the cart and proceed to checkout.")
+        assert _is_single_item_task("add coke then checkout")
+        assert _is_single_item_task("add milk, then pay")
+        assert _is_single_item_task("buy bread and go to cart")
+        assert _is_single_item_task("add amul milk and place order")
+
+    def test_genuine_multi_item_still_disarms(self) -> None:
+        assert not _is_single_item_task("add milk and bread")
+        assert not _is_single_item_task("milk, eggs, bread")
+        # 2nd product BEFORE the action clause → still multi.
+        assert not _is_single_item_task("add milk and bread and proceed to checkout")
+
+
+class TestExcessQuantityGuardArmedWithCheckoutClause:
+    """The exact live phrasing must now keep the guard armed and cap over-adds."""
+
+    async def test_guard_fires_for_add_and_proceed(self, audit: AuditLogger) -> None:
+        adb = _FakeAdb(foreground_package="com.grofers.customerapp")
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 600, "y": 900,
+                  "note": "tap ADD for Pride of Cows Milk"}, _usage()),
+                ({"action": "tap", "x": 670, "y": 560,
+                  "note": "tap increase quantity for Pride of Cows Milk"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=10,
+            profile_resolver=resolve_profile,
+        )
+        task = await orch.run_task(
+            Task(user_id=1, description="Add milk to the cart and proceed to checkout.")
+        )
+        # ADD executed (qty 1); the increment was rejected (guard now armed).
+        assert adb.taps == [(600, 900)]
+        assert any("over-add" in str(h.get("result", "")) for h in task.history)

@@ -50,6 +50,9 @@ _RESUMED_ACTIVITY_RE = re.compile(
 
 # Android KEYCODE_BACK; used by the recovery path in the orchestrator.
 KEYCODE_BACK = 4
+# KEYCODE_WAKEUP turns the screen ON if it's off and is a no-op if already on
+# (unlike KEYCODE_POWER, which toggles — so it'd switch an on screen OFF).
+KEYCODE_WAKEUP = 224
 
 
 class AdbError(DeviceError):
@@ -237,6 +240,16 @@ class AdbController:
 
     async def key_event(self, keycode: int) -> None:
         await self._run("shell", "input", "keyevent", str(keycode))
+
+    async def wake_screen(self) -> None:
+        """Turn the display on if it's asleep (no-op if already on).
+
+        A sleeping screen returns all-black screenshots, which the agent can't
+        act on. Uses KEYCODE_WAKEUP (not POWER, which would toggle an already-on
+        screen off). Does NOT unlock the keyguard — a PIN-locked device still
+        needs the user; this just guarantees the pixels are live.
+        """
+        await self.key_event(KEYCODE_WAKEUP)
 
     async def reverse_tcp(self, port: int) -> bool:
         """Map the device's localhost:<port> to the host's localhost:<port>.

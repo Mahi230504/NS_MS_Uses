@@ -183,6 +183,59 @@ _ADD_NOTE_PRODUCT_RE = re.compile(
 # "ADD" can't be right — it's either a redundant retry, a qty bump
 # mis-labelled, or a hallucination.
 _FRESH_ADD_NOTE_RE = re.compile(r"\badd\b", re.IGNORECASE)
+# A tap whose note describes a quantity-INCREASING action — either a fresh ADD
+# (reaches qty 1) or a stepper bump (+/plus/increment/increase). Used by the
+# excess-quantity guard to count how many units the model has tried to add.
+# Word-boundaried so "address" doesn't match "add". "+" is matched literally.
+_QTY_INCREASE_NOTE_RE = re.compile(
+    r"(\badd\b|\badd to cart\b|\bplus\b|\bincrement\b|\bincrease\b|"
+    r"\bone more\b|\banother\b|\+)",
+    re.IGNORECASE,
+)
+# Words → integer for parsing an explicit requested quantity from the task.
+_QTY_WORDS = {
+    "one": 1, "a": 1, "an": 1, "single": 1, "two": 2, "couple": 2, "pair": 2,
+    "three": 3, "four": 4, "five": 5, "six": 6, "dozen": 12,
+}
+# Quantity units that disambiguate "2 packs" (a count) from "500ml"/"70g"
+# (a size). Only a number followed by one of these — or an imperative like
+# "add 3" — is treated as a requested quantity.
+_QTY_UNIT = (
+    r"(?:x|packs?|packets?|pcs?|pieces?|units?|bottles?|cans?|boxes?|"
+    r"jars?|tins?|nos?|qty|quantities|quantity)"
+)
+_QTY_DIGIT_UNIT_RE = re.compile(rf"\b(\d{{1,2}})\s*{_QTY_UNIT}\b", re.IGNORECASE)
+_QTY_WORD_UNIT_RE = re.compile(
+    rf"\b({'|'.join(_QTY_WORDS)})\b\s+(?:{_QTY_UNIT}|of\b)", re.IGNORECASE
+)
+_QTY_IMPERATIVE_RE = re.compile(
+    r"\b(?:add|buy|get|order|want|need|put)\s+(\d{1,2})\b", re.IGNORECASE
+)
+_QTY_OF_RE = re.compile(r"\b(\d{1,2})\s+of\b", re.IGNORECASE)
+# "qty 4" / "quantity: 3" — the count keyword BEFORE the number.
+_QTY_KEYWORD_RE = re.compile(
+    r"\b(?:qty|quantity)\s*[:=]?\s*(\d{1,2})\b", re.IGNORECASE
+)
+# A task that names more than one item — detected by a conjunction/list
+# separator. The excess-quantity guard counts add/increment actions across the
+# whole task, which only equals one product's quantity for a SINGLE-item task;
+# so it disarms itself on multi-item tasks to avoid blocking the 2nd item.
+_MULTI_ITEM_RE = re.compile(r"(\band\b|\balso\b|,|;|&|\bplus\b)", re.IGNORECASE)
+# Trailing CHECKOUT-ACTION clause, e.g. "...and proceed to checkout" / ", then
+# pay". The conjunction here joins an action, NOT a second product, so it must
+# be stripped before the multi-item test — otherwise "add milk and proceed to
+# checkout" reads as multi-item and wrongly DISARMS the quantity guard (the
+# live RMX3392 run where milk over-added because of exactly this). Only the
+# unambiguous checkout verbs are listed (proceed/checkout/pay/place order/go to
+# cart) so a product named "order"/"review" isn't mistaken for an action.
+_TRAILING_ACTION_CLAUSE_RE = re.compile(
+    r"[\s,;&]*(?:and\s+|then\s+|&\s+)?"
+    r"(?:proceed|checkout|check\s*out|pay|place\s+(?:the\s+)?order|"
+    r"go\s+to\s+(?:the\s+)?cart)\b.*$",
+    re.IGNORECASE,
+)
+# Sanity ceiling so a stray big number in the task can't set an absurd target.
+_MAX_REQUESTED_QTY = 20
 # Category/tile/banner tap intent. Forbidden per prompt rule 1 unless the
 # user's task description explicitly invites browsing.
 _CATEGORY_INTENT_RE = re.compile(
@@ -230,6 +283,13 @@ LOW_RPD_WARNING_THRESHOLD = 30
 # Cap consecutive synthetic waits emitted by dedup. After this many in a row,
 # fall through to a real provider call so a frozen UI eventually gets noticed.
 MAX_CONSECUTIVE_SYNTHETIC_WAITS = 3
+# Cap TOTAL consecutive waits (model-chosen + synthetic). Loop detection only
+# considers state-changing actions, so a model that keeps emitting `wait` on a
+# blank/frozen screen (e.g. a screen that never loads, or the device asleep)
+# isn't otherwise caught — a live run burned all 30 iterations / 264k tokens
+# waiting on a black screen. Fail fast after this many so we don't spend a
+# whole session (and quota) waiting on a screen that will never change.
+MAX_CONSECUTIVE_WAITS = 6
 # After this many loop-detected events in a single task we give up — the model
 # isn't going to escape on its own. Hard-fail with a clear reason.
 MAX_LOOPS_BEFORE_ABORT = 4
@@ -307,6 +367,7 @@ class Orchestrator:
         # Per-task scratch state, reset at run_task() entry.
         self._last_phash: str | None = None
         self._consecutive_synthetic_waits: int = 0
+        self._consecutive_waits: int = 0
         self._unchanged_streak: int = 0
         self._loops_detected: int = 0
         self._last_loop_step: int = -1
@@ -344,6 +405,7 @@ class Orchestrator:
         self._low_rpd_warned = False
         self._last_phash = None
         self._consecutive_synthetic_waits = 0
+        self._consecutive_waits = 0
         self._unchanged_streak = 0
         self._loops_detected = 0
         self._last_loop_step = -1
@@ -357,6 +419,14 @@ class Orchestrator:
         task.state = TaskState.RUNNING
         await self._persist_insert(task)
         await self._status(task, f"starting: {task.description}")
+        # Wake the screen before anything else. A sleeping display returns
+        # all-black screenshots, on which the model can only ever emit "wait"
+        # — a live run wasted its whole session that way after the device dozed
+        # off mid-session. Best-effort: a wake failure must never block a task.
+        try:
+            await self._adb.wake_screen()
+        except Exception:
+            pass
         if self._current_task_artifact_dir is not None:
             await self._status(
                 task,
@@ -512,6 +582,23 @@ class Orchestrator:
                     task.step_count, screenshot, ui_xml, action,
                     "(pending)", ui_prompt=ui_tree,
                 )
+
+            # Consecutive-wait cap: a model that keeps waiting on a screen that
+            # never changes (frozen app, or a sleeping/blank display) makes no
+            # progress and burns a provider call every iteration. Loop
+            # detection ignores `wait` (it only tracks tap/type/swipe), so cap
+            # it here and fail fast with an actionable reason.
+            if action.get("action") == "wait":
+                self._consecutive_waits += 1
+                if self._consecutive_waits >= MAX_CONSECUTIVE_WAITS:
+                    raise OrchestratorError(
+                        f"screen did not change after {self._consecutive_waits} "
+                        "consecutive waits — the app is frozen or the screen is "
+                        "blank (is the device awake and unlocked?). Aborting "
+                        "instead of waiting out the session."
+                    )
+            else:
+                self._consecutive_waits = 0
 
             ok, reason = validate(action)
             if not ok:
@@ -686,6 +773,29 @@ class Orchestrator:
                 await self._step_status(
                     task,
                     f"step {task.step_count}: repeated-ADD hallucination, retrying",
+                )
+                self._finalize_step_result(task.step_count, action, hint)
+                self._last_phash = None
+                continue
+
+            # Excess-quantity rejection: the requested number of units is
+            # already in the cart; another ADD/+ would over-add (the live
+            # "3 milks instead of 1" finding). Reject so the model goes to
+            # the cart instead of bumping the stepper again.
+            excess_problem = (
+                self._excess_quantity_rejection(task, action)
+                if self._active_profile.enforce_shopping_guards else None
+            )
+            if excess_problem is not None:
+                hint = f"REJECTED: {excess_problem}"
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "EXCESS_QUANTITY_REJECTED",
+                )
+                await self._step_status(
+                    task,
+                    f"step {task.step_count}: quantity already met, go to cart",
                 )
                 self._finalize_step_result(task.step_count, action, hint)
                 self._last_phash = None
@@ -1168,6 +1278,56 @@ class Orchestrator:
             "landing on a DIFFERENT product's ADD button. Find the row "
             "whose title actually contains your target product name and "
             "use ITS [ACTION] ADD coords"
+        )
+
+    @staticmethod
+    def _excess_quantity_rejection(task: Task, action: dict) -> str | None:
+        """Reject an add/increment tap that would exceed the requested quantity.
+
+        Production finding (2026-06-08 live Blinkit run): asked for "one pack
+        of Amul milk", the agent tapped ADD then bumped the stepper twice,
+        ending at qty 3. The prompt's "default to ONE" rule wasn't enough —
+        the model fumbled the stepper. This is the structural backstop.
+
+        Counts EXECUTED quantity-increasing taps so far (a fresh ADD reaches
+        qty 1; each +/increment adds 1) and rejects the next one once the
+        count has reached the requested quantity. Allows exactly `target`
+        increases, so a legitimate "add 2" flow (ADD then one +) is untouched.
+
+        Scoped to single-item tasks only (`_is_single_item_task`): on a
+        multi-item task the cross-product count wouldn't equal one item's
+        quantity, so the guard disarms rather than block the second item.
+        Commerce-gated by the caller, so non-shopping apps never see it.
+        """
+        if action.get("action") != "tap":
+            return None
+        note = str(action.get("note", ""))
+        if not _QTY_INCREASE_NOTE_RE.search(note):
+            return None
+        if not _is_single_item_task(task.description):
+            return None
+        target = _requested_quantity(task.description)
+        executed_increases = 0
+        for entry in task.history:
+            if not isinstance(entry, dict):
+                continue
+            prev = entry.get("action")
+            if not isinstance(prev, dict) or prev.get("action") != "tap":
+                continue
+            result = str(entry.get("result", ""))
+            if result.startswith("REJECTED") or result.startswith("ERROR"):
+                continue
+            if _QTY_INCREASE_NOTE_RE.search(str(prev.get("note", ""))):
+                executed_increases += 1
+        if executed_increases < target:
+            return None
+        return (
+            f"the task '{task.description}' asks for quantity {target}, and "
+            f"{executed_increases} add/increment action(s) have already "
+            f"executed — tapping ADD/+ again would over-add. After an item is "
+            f"in the cart at the requested quantity, do NOT keep tapping the "
+            f"card or the '+' stepper. Navigate to the cart (the [CART] bar or "
+            f"cart icon) to review and check out."
         )
 
     @staticmethod
@@ -1897,6 +2057,48 @@ def _looks_like_search_target(e: UiElement) -> bool:
     if "search" in e.desc.lower():
         return True
     return False
+
+
+def _requested_quantity(description: str) -> int:
+    """Parse the quantity the task explicitly asks for; default 1.
+
+    Recognises "2 packs" / "qty 3" / "add 2" / "two packets" / "3 of". Ignores
+    sizes ("500ml", "70g") because those numbers aren't followed by a count
+    unit. Clamped to [1, _MAX_REQUESTED_QTY] so a stray number can't set an
+    absurd target. Default 1 encodes the prompt's "if unspecified, add ONE".
+    """
+    d = description.lower()
+    best = 0
+    for rx in (_QTY_DIGIT_UNIT_RE, _QTY_IMPERATIVE_RE, _QTY_OF_RE, _QTY_KEYWORD_RE):
+        m = rx.search(d)
+        if m:
+            try:
+                best = max(best, int(m.group(1)))
+            except ValueError:
+                pass
+    mw = _QTY_WORD_UNIT_RE.search(d)
+    if mw:
+        best = max(best, _QTY_WORDS.get(mw.group(1), 1))
+    if best <= 0:
+        return 1
+    return min(best, _MAX_REQUESTED_QTY)
+
+
+def _is_single_item_task(description: str) -> bool:
+    """True when the task names a single item (no conjunction/list separator).
+
+    The excess-quantity guard counts add/increment actions across the whole
+    task; that equals one product's quantity only for a single-item task, so
+    the guard disarms on multi-item tasks ("add milk AND bread") to avoid
+    blocking the second item's ADD.
+
+    A trailing checkout-action clause is stripped first, so "add milk and
+    proceed to checkout" is still single-item (the "and" joins an action, not
+    a second product) and the guard stays armed — the fix for the live run
+    where milk over-added under exactly that phrasing.
+    """
+    core = _TRAILING_ACTION_CLAUSE_RE.sub("", description)
+    return _MULTI_ITEM_RE.search(core) is None
 
 
 def _looks_like_product_label(label: str) -> bool:

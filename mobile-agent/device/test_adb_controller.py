@@ -402,3 +402,18 @@ class TestGetForegroundPackage:
 
     async def test_returns_none_when_nothing_matches(self, monkeypatch) -> None:
         assert await self._pkg_for(monkeypatch, "no focus info here") is None
+
+
+class TestWakeScreen:
+    async def test_sends_wakeup_keyevent(self, monkeypatch) -> None:
+        adb = AdbController("emulator-5554")
+        calls: list[tuple[str, ...]] = []
+
+        async def fake_run(*args: str, timeout: float | None = None) -> bytes:
+            calls.append(args)
+            return b""
+
+        monkeypatch.setattr(adb, "_run", fake_run)
+        await adb.wake_screen()
+        # KEYCODE_WAKEUP = 224 (turns screen on; no-op if already on).
+        assert calls == [("shell", "input", "keyevent", "224")]
