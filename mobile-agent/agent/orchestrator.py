@@ -118,6 +118,23 @@ _LEGITIMATE_SENSITIVE_RE = re.compile(
     r"permission\s+(dialog|request)?)\b",
     re.IGNORECASE,
 )
+# Benign-NAVIGATION need_approval reasons — the model asking PERMISSION to do
+# something it should just do (press back, go home, tap the cart). Production
+# finding: with no [CART] element the model emitted need_approval "...should I
+# proceed with going back to the home screen?" and stalled the user. That's a
+# misuse of need_approval (rule 10 reserves it for payment/OTP/delete/
+# permission/cart-review). We reject these — but ONLY when the reason does NOT
+# also match _LEGITIMATE_SENSITIVE_RE, so a genuine sensitive handoff is never
+# blocked.
+_NAV_ESCAPE_RE = re.compile(
+    r"\b(go(ing)?\s+back|press\s+(the\s+)?back|navigate\s+back|"
+    r"back\s+to\s+(the\s+)?home|return\s+to\s+(the\s+)?home|home\s+screen|"
+    r"can('?t|not)\s+find\s+the\s+cart|cart\s+(is\s+)?not\s+visible|"
+    r"no\s+['\"]?view\s+cart['\"]?|no\s+\[?cart\]?\s+(element|button|bar|icon)|"
+    r"should\s+i\s+(proceed|go|navigate|tap|press|swipe|scroll)|"
+    r"confirm\s+if\s+i\s+should|shall\s+i|may\s+i\b)",
+    re.IGNORECASE,
+)
 # Cart-review reasons specifically — used to (a) detect when the user just
 # approved a cart-review HITL so we can latch payment_pre_approved, and (b)
 # distinguish "this is the cart screen handoff" from other sensitive flows.
@@ -290,6 +307,12 @@ MAX_CONSECUTIVE_SYNTHETIC_WAITS = 3
 # waiting on a black screen. Fail fast after this many so we don't spend a
 # whole session (and quota) waiting on a screen that will never change.
 MAX_CONSECUTIVE_WAITS = 6
+# How many times per task the orchestrator will press BACK itself to surface
+# the cart after an ADD + scroll fail to reveal a [CART] element. Capped at 1:
+# results -> back -> home (where the cart lives). More than one risks backing
+# out of the app entirely; past the cap the model is nudged to tap the now-
+# visible cart instead.
+MAX_CART_RECOVER_BACKS = 1
 # After this many loop-detected events in a single task we give up — the model
 # isn't going to escape on its own. Hard-fail with a clear reason.
 MAX_LOOPS_BEFORE_ABORT = 4
@@ -368,6 +391,7 @@ class Orchestrator:
         self._last_phash: str | None = None
         self._consecutive_synthetic_waits: int = 0
         self._consecutive_waits: int = 0
+        self._cart_recover_backs: int = 0
         self._unchanged_streak: int = 0
         self._loops_detected: int = 0
         self._last_loop_step: int = -1
@@ -406,6 +430,7 @@ class Orchestrator:
         self._last_phash = None
         self._consecutive_synthetic_waits = 0
         self._consecutive_waits = 0
+        self._cart_recover_backs = 0
         self._unchanged_streak = 0
         self._loops_detected = 0
         self._last_loop_step = -1
@@ -539,6 +564,22 @@ class Orchestrator:
                     # this to refuse blind taps.
                     self._task_tree_ever_seen = True
                     self._consecutive_stale_tree = 0
+                # Auto-recover the cart: after an ADD, if the model has already
+                # scrolled and there's STILL no [CART] element, press BACK
+                # ourselves to return to the app home (where the cart bar
+                # lives) — instead of relying on the model, which otherwise
+                # stalls or escapes via need_approval ("should I go back?").
+                # Bounded by MAX_CART_RECOVER_BACKS so we never back out of the
+                # app. Deterministic action, no provider call this step.
+                if (
+                    self._active_profile.enforce_shopping_guards
+                    and self._cart_recover_backs < MAX_CART_RECOVER_BACKS
+                    and self._should_auto_back_to_cart(task, ui_elements)
+                ):
+                    self._cart_recover_backs += 1
+                    await self._auto_back_for_cart(task, screenshot, ui_xml)
+                    self._last_phash = None
+                    continue
                 loop_hint = self._loop_hint(task)
                 if loop_hint:
                     self._audit.log_action(
@@ -902,6 +943,29 @@ class Orchestrator:
                 self._last_phash = None
                 continue
 
+            # Benign-navigation need_approval: the model asking permission to
+            # press back / go home / tap the cart, rather than a real sensitive
+            # handoff. Reject so it just navigates instead of stalling the user.
+            benign_reason = (
+                self._benign_approval_rejection(action)
+                if self._active_profile.enforce_shopping_guards else None
+            )
+            if benign_reason is not None:
+                hint = f"REJECTED need_approval: {benign_reason}"
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "REJECTED: need_approval for benign navigation",
+                )
+                await self._step_status(
+                    task,
+                    f"step {task.step_count}: need_approval for navigation rejected "
+                    "— just navigate",
+                )
+                self._finalize_step_result(task.step_count, action, hint)
+                self._last_phash = None
+                continue
+
             _log.info("step %d: hitl gate", task.step_count)
             await self._gate_with_hitl(task, action, screenshot, screenshot_b64, current_phash)
 
@@ -1047,11 +1111,14 @@ class Orchestrator:
 
         So once an ADD has landed and there's STILL no cart element in the
         tree — and we're not already on a cart/checkout screen — nudge the
-        model to reveal the bar instead of acting on the product again. The
-        nudge escalates: swipe up first; if a swipe was already tried since
-        the ADD and the bar still isn't here, press back to the home screen.
-        Returns "" when no nudge is warranted. Caller gates on the commerce
-        profile.
+        model to reveal the bar instead of acting on the product again. This
+        pairs with the orchestrator's auto-back (`_should_auto_back_to_cart`):
+        swipe up FIRST (cheap); once a scroll has been tried the orchestrator
+        presses back to home itself, and from there this hint tells the model
+        to TAP the now-visible cart bar/icon. We deliberately never tell the
+        model to press back — the orchestrator owns that, and a back-press
+        from the home screen would exit the app. Returns "" when no nudge is
+        warranted. Caller gates on the commerce profile.
         """
         if not _history_has_executed_add(task.history):
             return ""
@@ -1063,14 +1130,16 @@ class Orchestrator:
         if any(tok in haystack for tok in _CART_SCREEN_TOKENS):
             return ""
         if _swipe_after_last_add(task.history):
+            # Scrolled already; the orchestrator has/will press back to home.
+            # The cart bar/icon should be on screen now even if it isn't a
+            # detected [CART] node — tell the model to tap it visually.
             return (
-                "NOTE: the item is already in your cart, you've scrolled, and "
-                "there is STILL no 'View cart' / [CART] element in the UI list. "
-                "On this app the cart bar isn't surfaced on the results screen. "
-                "Press the device BACK button to return to the app home screen, "
-                "which has a labelled cart icon / 'View cart' bar — tap that to "
-                "open the cart. Do NOT tap ADD or the +/- stepper again; the "
-                "item is already added."
+                "NOTE: the item is already in your cart. A 'View cart' bar / cart "
+                "icon should now be visible on screen (a bar along the bottom, or "
+                "a cart icon at the top-right) even though it isn't tagged [CART] "
+                "in the list. TAP it at its on-screen position to open the cart. "
+                "Do NOT press back again (you would leave the app), and do NOT "
+                "tap ADD or the +/- stepper — the item is already added."
             )
         return (
             "NOTE: the item is already in your cart, but there is no 'View cart' "
@@ -1079,8 +1148,87 @@ class Orchestrator:
             "UP (start the swipe on a product card, e.g. drag from the lower "
             "third of the screen toward the top) to reveal the cart bar, then "
             "tap it. Do NOT tap ADD or the +/- stepper again; the item is "
-            "already added — if scrolling doesn't reveal a cart bar, press back "
-            "to the home screen and use its cart icon."
+            "already added."
+        )
+
+    @staticmethod
+    def _should_auto_back_to_cart(task: Task, elements: list[UiElement]) -> bool:
+        """True when the orchestrator should press BACK to surface the cart.
+
+        Fires when an item is in the cart, the model has ALREADY swiped since
+        the ADD (the cheap reveal was tried), there's still no [CART] element,
+        and we're not already on a cart/checkout screen. The caller also
+        enforces the commerce profile and the MAX_CART_RECOVER_BACKS cap, so
+        we only ever back out once (results -> home).
+        """
+        if not _history_has_executed_add(task.history):
+            return False
+        if not _swipe_after_last_add(task.history):
+            return False
+        if any(e.is_cart_bar for e in elements):
+            return False
+        haystack = " ".join((e.text + " " + e.desc).lower() for e in elements)
+        if any(tok in haystack for tok in _CART_SCREEN_TOKENS):
+            return False
+        return True
+
+    async def _auto_back_for_cart(
+        self, task: Task, screenshot: bytes, ui_xml: str | None
+    ) -> None:
+        """Press BACK to return toward the app home so the cart bar appears.
+
+        Best-effort — a flaky back-press must not kill the task. Records a
+        `recover` history entry (ignored by the tap-based loop/giveup
+        scanners) so the next model call sees what the orchestrator did.
+        """
+        action = {
+            "action": "recover",
+            "note": "auto: pressed back to surface the cart bar (none found after scroll)",
+        }
+        try:
+            await self._adb.key_event(KEYCODE_BACK)
+        except AdbError as e:
+            self._audit.log_action(
+                task.user_id, task.description, action, f"AUTO_RECOVER_FAILED: {e}"
+            )
+            return
+        result = "auto-recover: pressed back toward home to reveal the cart"
+        task.history.append({"action": action, "result": result})
+        self._audit.log_action(
+            task.user_id, task.description, action, "AUTO_RECOVER: back-to-home for cart"
+        )
+        await self._step_status(
+            task,
+            f"step {task.step_count}: no cart bar after scroll — pressed back to find it",
+        )
+        self._save_step_artifacts(task.step_count, screenshot, ui_xml, action, result)
+
+    @staticmethod
+    def _benign_approval_rejection(action: dict) -> str | None:
+        """Reject a need_approval that's really asking permission for a benign
+        navigation, not a genuine sensitive handoff.
+
+        Production finding: with no [CART] element the model emitted
+        need_approval "...should I proceed with going back to the home
+        screen?" and stalled the user. need_approval is reserved (rule 10) for
+        payment / OTP / delete / permission / cart-review. We reject a
+        navigation-ask — UNLESS the reason also names a genuinely sensitive
+        category (then it reaches the user untouched).
+        """
+        if action.get("action") != "need_approval":
+            return None
+        reason = str(action.get("reason", ""))
+        if not reason or _LEGITIMATE_SENSITIVE_RE.search(reason):
+            return None
+        if not _NAV_ESCAPE_RE.search(reason):
+            return None
+        return (
+            "need_approval is only for payment / OTP / delete / permission / "
+            "cart-review — NOT for navigation. You do not need permission to "
+            "press back, swipe, scroll, or tap the cart; just do it. If the item "
+            "is added and no [CART] element is listed, swipe up to reveal the "
+            "cart bar (the orchestrator will return you toward the home screen if "
+            "that fails), then tap the visible cart bar/icon"
         )
 
     @staticmethod

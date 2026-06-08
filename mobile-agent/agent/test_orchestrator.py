@@ -3180,13 +3180,18 @@ class TestCartRevealHint:
         el = self._el(text="Proceed to checkout")
         assert Orchestrator._cart_reveal_hint(t, [el]) == ""
 
-    def test_escalates_to_back_after_swipe(self) -> None:
+    def test_escalates_to_tap_visible_cart_after_swipe(self) -> None:
+        # After a swipe the orchestrator presses back itself, so the hint now
+        # tells the model to TAP the now-visible cart — and explicitly NOT to
+        # press back again (which would exit the app).
         t = Task(user_id=1, description="add milk")
         t.history = _add_hist() + [
             {"action": {"action": "swipe", "x1": 5, "y1": 9, "x2": 5, "y2": 1},
              "result": "swiped (5,9)->(5,1)"},
         ]
-        assert "BACK" in Orchestrator._cart_reveal_hint(t, [])
+        hint = Orchestrator._cart_reveal_hint(t, [])
+        assert "TAP" in hint
+        assert "Do NOT press back again" in hint
 
     async def test_injected_into_prompt_after_add(self, audit: AuditLogger) -> None:
         adb = _FakeAdb(foreground_package="com.grofers.customerapp")
@@ -3219,3 +3224,112 @@ class TestCartRevealHint:
         )
         await orch.run_task(Task(user_id=1, description="add thing"))
         assert "SWIPE UP" not in vision.calls[1]["task_description"]
+
+
+class TestAutoBackForCart:
+    """Auto-recover: after ADD + a swipe with still no [CART], the orchestrator
+    presses BACK itself (capped) instead of relying on the model."""
+
+    # A product card (content-desc carries the title) wrapping a real ADD
+    # button, and crucially NO cart node — so the ADD passes the intent /
+    # product-name guards and executes, but there's no [CART] to navigate to.
+    _XML = (
+        "<hierarchy rotation='0'>"
+        '<node content-desc="Pride of Cows Milk 500ml" class="android.view.ViewGroup" '
+        'bounds="[0,800][1080,1100]" clickable="true">'
+        '<node text="ADD" resource-id="com.x:id/add_to_cart" '
+        'class="android.widget.Button" bounds="[880,850][1040,1050]" clickable="true" />'
+        "</node>"
+        "</hierarchy>"
+    )
+
+    def _adb(self):
+        xml = self._XML
+
+        class _AdbWithTree(_FakeAdb):
+            async def dump_ui_xml(self) -> str | None:
+                return xml
+
+        return _AdbWithTree(foreground_package="com.grofers.customerapp")
+
+    def test_should_back_after_add_and_swipe_no_cart(self) -> None:
+        t = Task(user_id=1, description="add milk and proceed to checkout")
+        t.history = _add_hist() + [
+            {"action": {"action": "swipe", "x1": 5, "y1": 9, "x2": 5, "y2": 1},
+             "result": "swiped"},
+        ]
+        assert Orchestrator._should_auto_back_to_cart(t, []) is True
+
+    def test_should_not_back_before_swipe(self) -> None:
+        t = Task(user_id=1, description="add milk")
+        t.history = _add_hist()  # added but not yet scrolled
+        assert Orchestrator._should_auto_back_to_cart(t, []) is False
+
+    def test_should_not_back_when_cart_present(self) -> None:
+        t = Task(user_id=1, description="add milk")
+        t.history = _add_hist() + [
+            {"action": {"action": "swipe", "x1": 5, "y1": 9, "x2": 5, "y2": 1},
+             "result": "swiped"},
+        ]
+        cart = UiElement(
+            text="View cart", desc="", resource_id="", class_name="",
+            cx=0, cy=0, bounds=(0, 0, 10, 10), clickable=True, is_cart_bar=True,
+        )
+        assert Orchestrator._should_auto_back_to_cart(t, [cart]) is False
+
+    async def test_orchestrator_presses_back_once(self, audit: AuditLogger) -> None:
+        adb = self._adb()
+        # Script: ADD → swipe → (orchestrator auto-backs here) → done.
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 960, "y": 950,
+                  "note": "tap ADD on Pride of Cows Milk 500ml"}, _usage()),
+                ({"action": "swipe", "x1": 960, "y1": 950, "x2": 960, "y2": 400,
+                  "duration_ms": 400, "note": "swipe up to reveal cart"}, _usage()),
+                ({"action": "done", "summary": "ok"}, _usage()),
+            ]
+        )
+        orch = Orchestrator(
+            adb, HitlGate(), audit, vision, session_timeout_seconds=15,
+            profile_resolver=resolve_profile,
+        )
+        task = await orch.run_task(
+            Task(user_id=1, description="add milk and proceed to checkout")
+        )
+        # BACK keyevent (4) was pressed by the orchestrator, exactly once.
+        assert adb.key_events.count(4) == 1
+        assert any(
+            "AUTO_RECOVER" in str(h.get("result", "")) or
+            h.get("action", {}).get("action") == "recover"
+            for h in task.history
+        )
+
+
+class TestBenignApprovalRejection:
+    """need_approval used to ask permission for benign navigation is rejected;
+    genuine sensitive handoffs are never blocked."""
+
+    def test_rejects_going_back_permission_ask(self) -> None:
+        action = {"action": "need_approval",
+                  "reason": "there is no 'View cart' element. Should I proceed "
+                            "with going back to the home screen?"}
+        assert Orchestrator._benign_approval_rejection(action) is not None
+
+    def test_rejects_cant_find_cart(self) -> None:
+        action = {"action": "need_approval",
+                  "reason": "I cannot find the cart, may I navigate back?"}
+        assert Orchestrator._benign_approval_rejection(action) is not None
+
+    def test_allows_cart_review(self) -> None:
+        action = {"action": "need_approval",
+                  "reason": "Cart review: 1 item, ₹34. Approving also authorizes payment."}
+        assert Orchestrator._benign_approval_rejection(action) is None
+
+    def test_allows_payment(self) -> None:
+        action = {"action": "need_approval", "reason": "Place order / pay now?"}
+        assert Orchestrator._benign_approval_rejection(action) is None
+
+    def test_ignores_non_approval(self) -> None:
+        assert Orchestrator._benign_approval_rejection(
+            {"action": "tap", "x": 1, "y": 2, "note": "go back"}
+        ) is None
