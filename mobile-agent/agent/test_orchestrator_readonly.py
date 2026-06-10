@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.orchestrator import Orchestrator
+from agent.orchestrator import Orchestrator, _taps_since_last_type
 from agent.state_machine import Task, TaskState
 from agent.ui_tree import UiElement
 from security.audit_logger import AuditLogger
@@ -32,9 +32,12 @@ class TestReportTerminal:
         assert task.report == {"price": 99, "item_name": "Milk"}
 
     async def test_report_without_data_coerces_to_empty(self, tmp_path: Path) -> None:
+        # `report` is a valid terminal in any mode; missing/!dict data -> {}.
+        # Run NOT read-only so the probe-completeness guard (which nudges a
+        # price-less report) doesn't intercept this minimal terminal test.
         vision = _ScriptedVision([({"action": "report"}, _usage())])
         task = Task(user_id=1, description="probe")
-        await _orch(_FakeAdb(), vision, tmp_path).run_task(task, read_only=True)
+        await _orch(_FakeAdb(), vision, tmp_path).run_task(task)
         assert task.state is TaskState.DONE
         assert task.report == {}
 
@@ -103,3 +106,106 @@ class TestReadOnlyGuardUnit:
 
     def test_non_tap_ignored(self) -> None:
         assert Orchestrator._readonly_violation_rejection({"action": "swipe"}, []) is None
+
+
+class TestProbeCompletenessUnit:
+    def _task(self, history):
+        t = Task(user_id=1, description="probe")
+        t.history = history
+        return t
+
+    def test_done_is_nudged(self) -> None:
+        assert Orchestrator._readonly_probe_incomplete(
+            self._task([]), {"action": "done"}
+        )
+
+    def test_priceless_report_without_drill_is_nudged(self) -> None:
+        hist = [
+            {"action": {"action": "type", "text": "pizza"}, "result": "typed 5 char(s)"},
+        ]
+        hint = Orchestrator._readonly_probe_incomplete(
+            self._task(hist), {"action": "report", "data": {"price": None}}
+        )
+        assert hint is not None
+
+    def test_priceless_report_after_drill_is_accepted(self) -> None:
+        hist = [
+            {"action": {"action": "type", "text": "pizza"}, "result": "typed"},
+            {"action": {"action": "tap", "x": 1, "y": 2, "note": "open result"}, "result": "tapped (1,2)"},
+        ]
+        assert Orchestrator._readonly_probe_incomplete(
+            self._task(hist), {"action": "report", "data": {"price": None}}
+        ) is None
+
+    def test_report_with_price_is_accepted(self) -> None:
+        assert Orchestrator._readonly_probe_incomplete(
+            self._task([]), {"action": "report", "data": {"price": 199}}
+        ) is None
+
+    def test_unavailable_report_is_accepted(self) -> None:
+        assert Orchestrator._readonly_probe_incomplete(
+            self._task([]),
+            {"action": "report", "data": {"price": None, "available": False}},
+        ) is None
+
+
+class TestTapsSinceLastType:
+    def test_counts_taps_after_type(self) -> None:
+        hist = [
+            {"action": {"action": "type"}, "result": "typed"},
+            {"action": {"action": "tap"}, "result": "tapped"},
+            {"action": {"action": "tap"}, "result": "tapped"},
+        ]
+        assert _taps_since_last_type(hist) == 2
+
+    def test_zero_when_no_tap_after_type(self) -> None:
+        hist = [{"action": {"action": "type"}, "result": "typed"}]
+        assert _taps_since_last_type(hist) == 0
+
+    def test_zero_when_no_type(self) -> None:
+        assert _taps_since_last_type([{"action": {"action": "tap"}, "result": "tapped"}]) == 0
+
+    def test_rejected_tap_not_counted(self) -> None:
+        hist = [
+            {"action": {"action": "type"}, "result": "typed"},
+            {"action": {"action": "tap"}, "result": "REJECTED: nope"},
+        ]
+        assert _taps_since_last_type(hist) == 0
+
+
+class TestProbeCompletenessLoop:
+    async def test_done_then_drill_then_report(self, tmp_path: Path) -> None:
+        # Probe tries to bail with `done`; gets nudged; opens a result; reports
+        # a real price.
+        adb = _FakeAdb()
+        vision = _ScriptedVision(
+            [
+                ({"action": "tap", "x": 10, "y": 20, "note": "tap search bar"}, _usage()),
+                ({"action": "type", "text": "pizza", "note": "type pizza"}, _usage()),
+                ({"action": "done"}, _usage()),  # nudged
+                ({"action": "tap", "x": 30, "y": 40, "note": "open the first result"}, _usage()),
+                ({"action": "report", "data": {"price": 199, "item_name": "Margherita"}}, _usage()),
+            ]
+        )
+        task = Task(user_id=1, description="probe pizza")
+        await _orch(adb, vision, tmp_path).run_task(task, read_only=True)
+        assert task.state is TaskState.DONE
+        assert task.report == {"price": 199, "item_name": "Margherita"}
+        assert (30, 40) in adb.taps  # it opened a result
+
+    async def test_priceless_bail_is_bounded_not_infinite(self, tmp_path: Path) -> None:
+        # Model keeps reporting null without drilling — nudged MAX_PROBE_NUDGES
+        # times, then accepted so the probe can't loop forever.
+        adb = _FakeAdb()
+        vision = _ScriptedVision(
+            [
+                ({"action": "type", "text": "pizza", "note": "type pizza"}, _usage()),
+                ({"action": "report", "data": {"price": None}}, _usage()),
+                ({"action": "report", "data": {"price": None}}, _usage()),
+                ({"action": "report", "data": {"price": None}}, _usage()),
+            ]
+        )
+        task = Task(user_id=1, description="probe pizza")
+        await _orch(adb, vision, tmp_path).run_task(task, read_only=True)
+        assert task.state is TaskState.DONE
+        assert task.report == {"price": None}

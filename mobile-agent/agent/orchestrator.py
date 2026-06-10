@@ -38,6 +38,15 @@ from security.hitl_gate import HitlGate, ReadOnlyViolation
 
 
 MAX_LOOP_ITERATIONS = 30
+# A read-only price probe (cross-app comparison) should be SHORT — search, open
+# the result, read the price, report. Cap it well below the full budget so a
+# 3-app comparison can't run ~3x30 steps; a probe that can't get a price in this
+# many steps reports price=null and moves on.
+MAX_PROBE_ITERATIONS = 14
+# How many times a probe is nudged to finish properly (emit a `report` after
+# actually opening a result) before we accept whatever it gives. Bounded so a
+# stubborn model can't loop the probe forever.
+MAX_PROBE_NUDGES = 2
 # Only the most recent N history entries are sent to the model each step.
 # Loop/giveup detection still scans the FULL task.history orchestrator-side;
 # the model simply doesn't need the entire transcript re-tokenised every step.
@@ -452,6 +461,8 @@ class Orchestrator:
         # COMMERCE shopping rules. Set per-run by run_task(read_only=...);
         # defaults False so ordinary order runs are byte-identical.
         self._read_only: bool = False
+        # Count of "finish properly" nudges issued to a read-only probe.
+        self._probe_nudges: int = 0
         # Bounded wait for HITL approval (seconds), set per-run by run_task for
         # unattended scheduled tasks. None = wait indefinitely (interactive
         # default — byte-identical to before). On timeout, wait_for_approval
@@ -488,6 +499,7 @@ class Orchestrator:
         self._consecutive_stale_tree = 0
         self._read_only = read_only
         self._approval_timeout = approval_timeout
+        self._probe_nudges = 0
         # Attribution + replay metadata for the dashboard (persisted at insert).
         task.launch_package = launch_package
         task.artifact_dir = (
@@ -570,7 +582,8 @@ class Orchestrator:
     async def _loop(self, task: Task) -> None:
         screen_size = await self._safe_screen_size()
 
-        for _ in range(MAX_LOOP_ITERATIONS):
+        max_iters = MAX_PROBE_ITERATIONS if self._read_only else MAX_LOOP_ITERATIONS
+        for _ in range(max_iters):
             task.step_count += 1
             _log.info("step %d: begin", task.step_count)
 
@@ -852,6 +865,31 @@ class Orchestrator:
                 self._last_phash = None
                 continue
 
+            # Read-only probe completeness: a price probe must end with a
+            # `report` that reflects an actually-opened result — not a bare
+            # `done` (silent bail), and not a price=null report while still on
+            # the search/results screen (food cards show ETA, not price — the
+            # model must OPEN a result to read the price). Bounded by
+            # MAX_PROBE_NUDGES so it can never loop the probe.
+            if self._read_only and self._probe_nudges < MAX_PROBE_NUDGES:
+                probe_hint = self._readonly_probe_incomplete(task, action)
+                if probe_hint is not None:
+                    self._probe_nudges += 1
+                    hint = f"REJECTED: {probe_hint}"
+                    task.history.append({"action": action, "result": hint})
+                    self._audit.log_action(
+                        task.user_id, task.description, action,
+                        "READONLY_PROBE_INCOMPLETE",
+                    )
+                    await self._step_status(
+                        task,
+                        f"step {task.step_count}: open the result and read the "
+                        "price before reporting",
+                    )
+                    self._finalize_step_result(task.step_count, action, hint)
+                    self._last_phash = None
+                    continue
+
             # Product-name vs tap-coords check: the model claimed
             # "tap ADD on <product>" but the UI elements near the tap
             # coords don't mention <product> at all. Real failure case:
@@ -1112,7 +1150,7 @@ class Orchestrator:
             if action_type in _STATE_CHANGING:
                 await self._verify_outcome(task, action, current_phash)
 
-        raise OrchestratorError(f"exceeded {MAX_LOOP_ITERATIONS} loop iterations")
+        raise OrchestratorError(f"exceeded {max_iters} loop iterations")
 
     # ------------------------------------------------------------------
     # Dedup + skill lookup
@@ -1380,6 +1418,43 @@ class Orchestrator:
             '"currency":"INR","eta":"<string or null>","available":true,'
             '"item_name":"<what you found>","notes":"<short>"}}'
         )
+
+    @staticmethod
+    def _readonly_probe_incomplete(task: Task, action: dict) -> str | None:
+        """Return a nudge if a read-only probe is trying to finish without a
+        real price, else None.
+
+        Two cases:
+          1. `done` — a probe must finish with a `report`, never a bare done
+             (the Swiggy bail: searched, then `done`, zero data).
+          2. `report` with price=null while the model has NOT opened a result
+             since searching (no executed tap after the last `type`). Food
+             results show ETA, not price; the model must open a dish/restaurant
+             to read the price (the Zomato bail: reported null from results).
+
+        A price=null report AFTER opening a result is accepted (genuine "no
+        price"), as is available=false (unavailable).
+        """
+        atype = action.get("action")
+        if atype == "done":
+            return (
+                "this is a price check — do NOT finish with `done`. Read the "
+                "price and emit a report action. If you haven't opened a result "
+                "yet, tap the most relevant one first to see its price."
+            )
+        if atype == "report":
+            data = action.get("data")
+            data = data if isinstance(data, dict) else {}
+            if data.get("price") is None and data.get("available") is not False:
+                if _taps_since_last_type(task.history) == 0:
+                    return (
+                        "you reported no price but you're still on the search/"
+                        "results screen — cards here often show only a delivery "
+                        "time, not the price. TAP the most relevant result to "
+                        "open it, read the item's price, then report. Report "
+                        "price=null only if there's truly no price after opening."
+                    )
+        return None
 
     @staticmethod
     def _giveup_rejection(task: Task, action: dict) -> str | None:
@@ -2464,6 +2539,31 @@ def _summarize_report(report: dict) -> str:
     if name:
         bits.append(name)
     return " · ".join(bits) if bits else "no result"
+
+
+def _taps_since_last_type(history: list[dict]) -> int:
+    """Executed taps after the most recent executed `type`.
+
+    The read-only probe guard uses this to decide whether the model actually
+    opened a result (tapped something after searching) before claiming no
+    price. Rejected/errored steps don't count as executed.
+    """
+    def _executed(entry: dict) -> bool:
+        res = str(entry.get("result", ""))
+        return not (res.startswith("REJECTED") or res.startswith("ERROR"))
+
+    last_type = -1
+    for i, h in enumerate(history):
+        action = h.get("action", {}) or {}
+        if action.get("action") == "type" and _executed(h):
+            last_type = i
+    if last_type < 0:
+        return 0
+    return sum(
+        1
+        for h in history[last_type + 1:]
+        if (h.get("action", {}) or {}).get("action") == "tap" and _executed(h)
+    )
 
 
 def _actions_equivalent(a: dict, b: dict) -> bool:

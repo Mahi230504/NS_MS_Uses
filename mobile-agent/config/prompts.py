@@ -241,10 +241,13 @@ WHAT TO DO:
       header) and search for the item.
    2. Identify the best-matching product card. Brand matters: "Amul milk" → only
       an Amul card; don't substitute brands. The closest relevant result is fine.
-   3. Read its PRICE off the card or, if the card doesn't show it clearly, tap the
-      product NAME/IMAGE to open the detail page (that's a read, not an add) and
-      read the price there. Note the delivery time/ETA if the app shows one.
-   4. Finish with EXACTLY this terminal action (no add, no cart):
+   3. Read its PRICE. CRUCIAL: on many apps (especially food delivery) the
+      results / restaurant cards do NOT show a price — they show ratings or a
+      delivery time. In that case you MUST tap the product NAME/IMAGE/card to
+      OPEN it (that's a read, not an add) and read the item's actual price on the
+      opened page. Do not report "no price" while still on the results screen —
+      open a result first. Note the delivery time/ETA if shown.
+   4. Finish with EXACTLY this terminal action (no add, no cart, never "done"):
         {"action":"report","data":{"price":<number or null>,"currency":"INR",
          "eta":"<e.g. '10 mins' or null>","available":true,
          "item_name":"<the product you actually found>","notes":"<short, optional>"}}

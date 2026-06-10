@@ -40,15 +40,18 @@ _log = logging.getLogger("mobile_agent.comparison")
 # (mobility fare checks), so the report schema lives here too.
 _PROBE_TEMPLATE = (
     "READ-ONLY PRICE CHECK — do NOT buy, add to cart, book, confirm, or pay. "
-    "Find '{item}' in this app and read its current price and, if shown, the "
-    "delivery time / ETA. Search for it, pick the closest matching result, and "
-    "open it only if you need to in order to see the price. Do NOT tap ADD / "
-    "Buy / Checkout / Pay / Place Order / Book / Confirm / Request. When you "
-    'have the price, finish with: {"action":"report","data":{"price":<number '
-    'or null>,"currency":"INR","eta":"<string or null>","available":true,'
-    '"item_name":"<what you found>","notes":"<short or empty>"}}. '
-    "If '{item}' is genuinely unavailable here, report available=false with "
-    "price null."
+    "Goal: find the PRICE of '{item}' in this app. Steps: (1) search for "
+    "'{item}'; (2) the search results / restaurant cards often do NOT show the "
+    "price (they show ratings or a delivery time) — so TAP the most relevant "
+    "result to OPEN it; (3) read the item's actual price on the opened page. "
+    "Do NOT tap ADD / Buy / Checkout / Pay / Place Order / Book / Confirm / "
+    "Request — opening a product/dish to read its price is fine, committing is "
+    'not. Finish ONLY with: {"action":"report","data":{"price":<number or '
+    'null>,"currency":"INR","eta":"<string or null>","available":true,'
+    '"item_name":"<what you found>","notes":"<short or empty>"}} — never finish '
+    'with "done". Report price=null ONLY after you have opened a result and '
+    "there is genuinely no price; if '{item}' isn't available here, report "
+    "available=false."
 )
 
 _SALVAGE_SYSTEM = (
