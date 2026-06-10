@@ -153,6 +153,26 @@ class TestProbeCompletenessUnit:
         ) is None
 
 
+class TestOverlayDismiss:
+    async def test_dismisses_popup_then_proceeds(self, tmp_path: Path) -> None:
+        # A popup is shadowing the screen (sparse tree). The orchestrator should
+        # press BACK to dismiss it and then proceed — without wasting an LLM
+        # call on the popup-shadowed screen.
+        adb = _FakeAdb(popup_focused=True)
+        vision = _ScriptedVision([({"action": "done", "summary": "ok"}, _usage())])
+        task = Task(user_id=1, description="t")
+        await _orch(adb, vision, tmp_path).run_task(task)
+        assert 4 in adb.key_events  # pressed BACK (KEYCODE_BACK) to dismiss
+        assert task.state is TaskState.DONE
+        assert len(vision.calls) == 1  # popup step skipped the vision call
+
+    async def test_no_back_when_no_popup(self, tmp_path: Path) -> None:
+        adb = _FakeAdb(popup_focused=False)
+        vision = _ScriptedVision([({"action": "done", "summary": "ok"}, _usage())])
+        await _orch(adb, vision, tmp_path).run_task(Task(user_id=1, description="t"))
+        assert 4 not in adb.key_events
+
+
 class TestRepeatedRejectionCount:
     def _rej(self, x=5, y=5):
         return {"action": {"action": "tap", "x": x, "y": y}, "result": "REJECTED: nope"}

@@ -64,6 +64,12 @@ def _pick_fallback_ime(enabled: list[str]) -> str | None:
 #   mCurrentFocus=Window{abc123 u0 com.blinkit.markets/.MainActivity}
 # We pull the package out of the slash-separated component name.
 _CURRENT_FOCUS_RE = re.compile(r"mCurrentFocus=Window\{[^}]*\s+([\w.]+)/")
+# The whole mCurrentFocus window descriptor, for overlay detection. A focused
+# PopupWindow (launch promo, rating prompt) reads like
+#   mCurrentFocus=Window{6c57537 u0 PopupWindow:abc123}
+# and SHADOWS the uiautomator dump (only the popup's nodes appear). The
+# orchestrator dismisses such an overlay so the real screen is inspectable.
+_CURRENT_FOCUS_LINE_RE = re.compile(r"mCurrentFocus=Window\{[^}]*\}")
 # Fallbacks for when mCurrentFocus carries no package. Verified on a real
 # realme/ColorOS build (RMX3392): when ANY overlay holds input focus — the
 # notification shade, an IME, a system dialog, recents — mCurrentFocus reads
@@ -498,6 +504,24 @@ class AdbController:
             if m:
                 return m.group(1)
         return None
+
+    async def is_popup_focused(self) -> bool:
+        """True if a PopupWindow overlay currently holds input focus.
+
+        Such an overlay (a launch promo, rating prompt, etc.) shadows the
+        `uiautomator dump` — only the popup's nodes appear, hiding the real
+        screen behind it. The orchestrator uses this to dismiss the overlay
+        (press BACK) so the underlying screen becomes inspectable again.
+        Best-effort: any adb hiccup returns False.
+        """
+        try:
+            out = (await self._run("shell", "dumpsys", "window")).decode(
+                "utf-8", errors="replace"
+            )
+        except AdbError:
+            return False
+        m = _CURRENT_FOCUS_LINE_RE.search(out)
+        return bool(m and "PopupWindow" in m.group(0))
 
     async def _adbkeyboard_is_enabled(self) -> bool:
         """Cached: is ADBKeyboard listed as an enabled IME?"""

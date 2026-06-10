@@ -14,6 +14,38 @@ from device.adb_controller import (
 )
 
 
+class TestIsPopupFocused:
+    async def test_true_for_popupwindow(self, monkeypatch) -> None:
+        adb = AdbController("emulator-5554")
+
+        async def fake_run(*a, timeout=None):
+            return (
+                b"  mCurrentFocus=Window{6c5 u0 PopupWindow:abc123}\n"
+                b"  mFocusedApp=ActivityRecord{1 u0 com.application.zomato/.Home t1}"
+            )
+
+        monkeypatch.setattr(adb, "_run", fake_run)
+        assert await adb.is_popup_focused() is True
+
+    async def test_false_for_normal_activity(self, monkeypatch) -> None:
+        adb = AdbController("emulator-5554")
+
+        async def fake_run(*a, timeout=None):
+            return b"  mCurrentFocus=Window{6c5 u0 com.application.zomato/com.x.HomeActivityV2}"
+
+        monkeypatch.setattr(adb, "_run", fake_run)
+        assert await adb.is_popup_focused() is False
+
+    async def test_false_on_adb_error(self, monkeypatch) -> None:
+        adb = AdbController("emulator-5554")
+
+        async def boom(*a, timeout=None):
+            raise AdbError("dumpsys failed")
+
+        monkeypatch.setattr(adb, "_run", boom)
+        assert await adb.is_popup_focused() is False
+
+
 class TestPickFallbackIme:
     # The realme/ColorOS list that caused the stuck-keyboard bug: the voice IME
     # is listed first, so a naive "first non-ADBKeyboard" pick left the user

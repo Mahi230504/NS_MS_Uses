@@ -349,6 +349,14 @@ MAX_CONSECUTIVE_WAITS = 6
 # out of the app entirely; past the cap the model is nudged to tap the now-
 # visible cart instead.
 MAX_CART_RECOVER_BACKS = 1
+# How many times per task the orchestrator presses BACK to dismiss a popup
+# overlay that's shadowing the UI tree (launch promos, rating prompts). Bounded
+# so a misfire can't keep backing out of the app.
+MAX_OVERLAY_DISMISS_BACKS = 2
+# A genuine app screen exposes many interactable elements; a popup-shadowed
+# dump exposes only the popup's handful. At or below this count we suspect an
+# overlay and check for one (one extra dumpsys, only on sparse screens).
+POPUP_TREE_MAX_ELEMENTS = 6
 # After this many loop-detected events in a single task we give up — the model
 # isn't going to escape on its own. Hard-fail with a clear reason.
 MAX_LOOPS_BEFORE_ABORT = 4
@@ -440,6 +448,7 @@ class Orchestrator:
         self._consecutive_synthetic_waits: int = 0
         self._consecutive_waits: int = 0
         self._cart_recover_backs: int = 0
+        self._overlay_dismiss_backs: int = 0
         self._unchanged_streak: int = 0
         self._loops_detected: int = 0
         self._last_loop_step: int = -1
@@ -495,6 +504,7 @@ class Orchestrator:
         self._consecutive_synthetic_waits = 0
         self._consecutive_waits = 0
         self._cart_recover_backs = 0
+        self._overlay_dismiss_backs = 0
         self._unchanged_streak = 0
         self._loops_detected = 0
         self._last_loop_step = -1
@@ -652,6 +662,23 @@ class Orchestrator:
                     # this to refuse blind taps.
                     self._task_tree_ever_seen = True
                     self._consecutive_stale_tree = 0
+                # Overlay-dismiss: a focused PopupWindow (launch promo, rating
+                # prompt) shadows the dump — only its handful of nodes appear,
+                # hiding the real screen, so the model taps blind and every tap
+                # is coord-rejected. The model has no back action of its own, so
+                # press BACK ourselves to dismiss it and re-read the real tree.
+                # Only when the tree is suspiciously sparse (cheap: one extra
+                # dumpsys), bounded, and before the vision call (saves an LLM
+                # call on a useless screen). General — applies to any app/mode.
+                if (
+                    len(ui_elements) <= POPUP_TREE_MAX_ELEMENTS
+                    and self._overlay_dismiss_backs < MAX_OVERLAY_DISMISS_BACKS
+                    and await self._adb.is_popup_focused()
+                ):
+                    self._overlay_dismiss_backs += 1
+                    await self._dismiss_overlay(task, screenshot, ui_xml)
+                    self._last_phash = None
+                    continue
                 # Auto-recover the cart: after an ADD, if the model has already
                 # scrolled and there's STILL no [CART] element, press BACK
                 # ourselves to return to the app home (where the cart bar
@@ -1370,6 +1397,39 @@ class Orchestrator:
         await self._step_status(
             task,
             f"step {task.step_count}: no cart bar after scroll — pressed back to find it",
+        )
+        self._save_step_artifacts(task.step_count, screenshot, ui_xml, action, result)
+
+    async def _dismiss_overlay(
+        self, task: Task, screenshot: bytes, ui_xml: str | None
+    ) -> None:
+        """Press BACK to dismiss a popup overlay shadowing the screen.
+
+        Best-effort — a flaky back-press must not kill the task. Records a
+        `recover` history entry (ignored by the tap-based loop/giveup scanners)
+        so the next model call sees what the orchestrator did.
+        """
+        action = {
+            "action": "recover",
+            "note": "auto: pressed back to dismiss a popup overlay shadowing the screen",
+        }
+        try:
+            await self._adb.key_event(KEYCODE_BACK)
+        except AdbError as e:
+            self._audit.log_action(
+                task.user_id, task.description, action, f"OVERLAY_DISMISS_FAILED: {e}"
+            )
+            return
+        result = "auto-recover: pressed back to dismiss a popup overlay"
+        task.history.append({"action": action, "result": result})
+        self._audit.log_action(
+            task.user_id, task.description, action,
+            "OVERLAY_DISMISS: back to dismiss popup",
+        )
+        await self._step_status(
+            task,
+            f"step {task.step_count}: a popup was covering the screen — "
+            "pressed back to dismiss it",
         )
         self._save_step_artifacts(task.step_count, screenshot, ui_xml, action, result)
 

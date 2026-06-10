@@ -30,12 +30,16 @@ class _FakeAdb:
         screen_size: tuple[int, int] | None = (1080, 1920),
         screencaps: list[bytes] | None = None,
         foreground_package: str | None = None,
+        popup_focused: bool = False,
     ) -> None:
         self.taps: list[tuple[int, int]] = []
         self.screen_size = screen_size
         self.texts: list[str] = []
         self.key_events: list[int] = []
         self.woke: int = 0
+        # Overlay state for is_popup_focused(); pressing BACK clears it (a real
+        # back-press dismisses a popup), so tests can simulate dismissal.
+        self._popup_focused = popup_focused
         # If `screencaps` is provided, calls pop sequentially (last entry
         # repeats). Otherwise each call synthesizes a fresh unique PNG so
         # phash-based dedup / outcome verification doesn't engage. Tests that
@@ -69,6 +73,11 @@ class _FakeAdb:
 
     async def key_event(self, keycode: int) -> None:
         self.key_events.append(keycode)
+        if keycode == 4:  # KEYCODE_BACK dismisses a popup overlay
+            self._popup_focused = False
+
+    async def is_popup_focused(self) -> bool:
+        return self._popup_focused
 
     async def wake_screen(self) -> None:
         self.woke += 1
