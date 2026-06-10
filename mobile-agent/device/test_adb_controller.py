@@ -6,7 +6,47 @@ import base64
 
 import pytest
 
-from device.adb_controller import AdbController, AdbError, _escape_for_input_text
+from device.adb_controller import (
+    AdbController,
+    AdbError,
+    _escape_for_input_text,
+    _pick_fallback_ime,
+)
+
+
+class TestPickFallbackIme:
+    # The realme/ColorOS list that caused the stuck-keyboard bug: the voice IME
+    # is listed first, so a naive "first non-ADBKeyboard" pick left the user
+    # unable to type. We must pick the real keyboard (Gboard/LatinIME).
+    _REALME = [
+        "com.google.android.tts/com.google.android.apps.speech.tts.googletts.settings.asr.voiceime.VoiceInputMethodService",
+        "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME",
+        "com.android.adbkeyboard/.AdbIME",
+    ]
+
+    def test_prefers_real_keyboard_over_voice(self) -> None:
+        assert (
+            _pick_fallback_ime(self._REALME)
+            == "com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME"
+        )
+
+    def test_skips_adbkeyboard(self) -> None:
+        assert _pick_fallback_ime(self._REALME) != "com.android.adbkeyboard/.AdbIME"
+
+    def test_none_when_only_adbkeyboard(self) -> None:
+        assert _pick_fallback_ime(["com.android.adbkeyboard/.AdbIME"]) is None
+
+    def test_falls_back_to_any_when_all_non_typing(self) -> None:
+        # If the only alternative looks non-typing, still pick it over staying
+        # on ADBKeyboard (an imperfect guess beats no keyboard).
+        only_voice = [
+            "com.google.android.tts/...voiceime.VoiceInputMethodService",
+            "com.android.adbkeyboard/.AdbIME",
+        ]
+        assert _pick_fallback_ime(only_voice) == only_voice[0]
+
+    def test_empty_returns_none(self) -> None:
+        assert _pick_fallback_ime([]) is None
 
 
 class TestEscapeForInputText:

@@ -30,6 +30,36 @@ _WM_SIZE_RE = re.compile(r"(\d+)x(\d+)")
 # shell mangle if left alone. We backslash-escape these on the way through.
 _INPUT_TEXT_ESCAPE = ("\\", "'", '"', "&", ";", "<", ">", "(", ")", "|", "*", "?", "$", "`", "[", "]")
 _ADBKEYBOARD_IME = "com.android.adbkeyboard/.AdbIME"
+# IMEs that are NOT real on-screen keyboards — voice input, autofill proxies,
+# and ADBKeyboard itself. When restoring the user's keyboard we must skip these:
+# picking one (e.g. Google's TTS VoiceInputMethodService, which is often the
+# first entry in `ime list -s`) leaves the user with no way to type. Matched
+# case-insensitively as substrings of the IME id.
+_NON_TYPING_IME_MARKERS = (
+    "voiceime",
+    "voiceinputmethod",
+    "googletts",
+    "/.tts",
+    "autofill",
+    "adbkeyboard",
+)
+
+
+def _pick_fallback_ime(enabled: list[str]) -> str | None:
+    """Choose a real typing keyboard from the enabled-IME list.
+
+    Prefers an IME that isn't ADBKeyboard and isn't a voice/autofill service.
+    Falls back to the first non-ADBKeyboard entry only if every alternative
+    looks non-typing (better an imperfect guess than staying on ADBKeyboard).
+    Returns None when ADBKeyboard is the only enabled IME.
+    """
+    candidates = [ime for ime in enabled if ime and ime != _ADBKEYBOARD_IME]
+    typing = [
+        ime
+        for ime in candidates
+        if not any(m in ime.lower() for m in _NON_TYPING_IME_MARKERS)
+    ]
+    return (typing or candidates or [None])[0]
 # `dumpsys window` prints mCurrentFocus like:
 #   mCurrentFocus=Window{abc123 u0 com.blinkit.markets/.MainActivity}
 # We pull the package out of the slash-separated component name.
@@ -224,13 +254,14 @@ class AdbController:
             for line in enabled_raw.decode("utf-8", errors="replace").splitlines()
             if line.strip()
         ]
-        fallback = next(
-            (ime for ime in enabled if ime != _ADBKEYBOARD_IME),
-            None,
-        )
+        # Pick a REAL keyboard, skipping voice/autofill IMEs. Picking the first
+        # entry blindly (often Google's TTS voice IME) leaves the user unable to
+        # type — and on some OEMs `ime set` to a voice IME silently fails, so the
+        # device stays stuck on ADBKeyboard. See _pick_fallback_ime.
+        fallback = _pick_fallback_ime(enabled)
         if fallback is None:
-            # No alternative enabled. We could try `ime reset` here but
-            # that requires the right permission. Leave it; user can
+            # ADBKeyboard is the only enabled IME. We could try `ime reset`
+            # here but that needs the right permission. Leave it; user can
             # manually switch in Settings.
             return
         try:
