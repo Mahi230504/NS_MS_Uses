@@ -1,0 +1,1349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>ATLAS — Build an Agent That Uses Any App Like a Human</title>
+
+<!-- reveal.js core -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&amp;family=JetBrains+Mono:wght@400;500;700&amp;display=swap" rel="stylesheet">
+
+<style>
+:root{
+  --bg:#080b16; --bg2:#0e1430; --bg3:#0a0f22;
+  --ink:#e9edf8; --muted:#94a0c0; --faint:#5d688a;
+  --accent:#38e1d3;   /* Atlas teal */
+  --accent2:#6ea8ff;  /* blue */
+  --violet:#b291ff;
+  --amber:#ffb454;
+  --green:#54e08a;
+  --red:#ff6f7d;
+  --card:rgba(255,255,255,0.045);
+  --card2:rgba(255,255,255,0.07);
+  --line:rgba(255,255,255,0.13);
+  --glow:0 0 40px rgba(56,225,211,0.25);
+}
+
+/* ---------- base ---------- */
+.reveal{
+  font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  font-size:30px; color:var(--ink); font-weight:400;
+}
+.reveal-viewport{
+  background:
+    radial-gradient(1200px 700px at 80% -10%, rgba(56,225,211,0.10), transparent 60%),
+    radial-gradient(1100px 800px at -10% 110%, rgba(110,168,255,0.10), transparent 55%),
+    linear-gradient(160deg,#070a14 0%, #0b1124 55%, #080c18 100%);
+}
+.reveal .slides{ text-align:left; }
+.reveal .slides section{ height:100%; }
+.reveal h1,.reveal h2,.reveal h3,.reveal h4{
+  font-family:'Inter',sans-serif; font-weight:800; letter-spacing:-0.02em;
+  color:var(--ink); text-transform:none; line-height:1.07; margin:0 0 .35em;
+}
+.reveal h1{ font-size:2.35em; }
+.reveal h2{ font-size:1.62em; }
+.reveal h3{ font-size:1.15em; }
+.reveal p{ line-height:1.4; margin:.5em 0; }
+.reveal strong{ color:#fff; font-weight:700; }
+.reveal em{ color:var(--accent); font-style:normal; font-weight:600; }
+.reveal a{ color:var(--accent2); }
+.reveal ul,.reveal ol{ margin:.3em 0 .3em 1em; }
+.reveal li{ margin:.32em 0; line-height:1.34; }
+.reveal li::marker{ color:var(--accent); }
+
+/* gradient text */
+.grad{ background:linear-gradient(92deg,var(--accent),var(--accent2) 55%,var(--violet));
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+.grad-warm{ background:linear-gradient(92deg,var(--amber),var(--red));
+  -webkit-background-clip:text; background-clip:text; -webkit-text-fill-color:transparent; }
+
+/* ---------- code ---------- */
+.reveal pre{ width:100%; box-shadow:0 18px 50px rgba(0,0,0,.55); margin:.5em 0; font-size:.62em; }
+.reveal pre code{
+  border-radius:12px; padding:18px 20px; background:#0b1020 !important;
+  border:1px solid var(--line); font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;
+  line-height:1.42; max-height:560px;
+}
+.reveal code:not(pre code){
+  font-family:'JetBrains Mono',monospace; font-size:.85em; color:var(--accent);
+  background:rgba(56,225,211,.10); padding:.06em .38em; border-radius:6px;
+  border:1px solid rgba(56,225,211,.2);
+}
+
+/* ---------- file reference chips ---------- */
+.fileref{
+  display:inline-flex; align-items:center; gap:.4em; font-family:'JetBrains Mono',monospace;
+  font-size:.5em; color:var(--muted); background:rgba(110,168,255,.08);
+  border:1px solid rgba(110,168,255,.22); border-radius:999px; padding:.18em .7em;
+  margin:.15em .25em .15em 0; letter-spacing:0;
+}
+.fileref::before{ content:"📄"; font-size:.9em; }
+.fileref b{ color:var(--accent2); font-weight:600; }
+
+/* ---------- layout helpers ---------- */
+.kicker{ font-family:'JetBrains Mono',monospace; font-size:.5em; letter-spacing:.32em;
+  text-transform:uppercase; color:var(--accent); margin-bottom:1.1em; font-weight:600; }
+.center{ text-align:center; }
+.cols{ display:flex; gap:30px; align-items:flex-start; }
+.cols>*{ flex:1; min-width:0; }
+.lead{ font-size:1.12em; color:var(--muted); line-height:1.42; }
+.small{ font-size:.66em; color:var(--muted); }
+.dim{ color:var(--muted); }
+
+/* card */
+.card{ background:var(--card); border:1px solid var(--line); border-radius:16px;
+  padding:22px 24px; }
+.card h3{ margin-top:0; }
+.card.pad-sm{ padding:16px 18px; }
+
+/* big quote / throughline */
+.bigquote{ font-size:1.5em; font-weight:700; line-height:1.25; letter-spacing:-0.02em; }
+.bigquote .grad{ font-weight:800; }
+
+/* badges */
+.badge{ display:inline-block; font-family:'JetBrains Mono',monospace; font-size:.46em;
+  font-weight:600; letter-spacing:.06em; padding:.32em .7em; border-radius:8px; vertical-align:middle; }
+.badge.eng{ color:var(--violet); background:rgba(178,145,255,.12); border:1px solid rgba(178,145,255,.3); }
+.badge.beg{ color:var(--green); background:rgba(84,224,138,.12); border:1px solid rgba(84,224,138,.3); }
+.badge.demo{ color:var(--amber); background:rgba(255,180,84,.13); border:1px solid rgba(255,180,84,.32); }
+
+/* deep-dive hint */
+.deepdive{ position:absolute; bottom:18px; left:50%; transform:translateX(-50%);
+  font-family:'JetBrains Mono',monospace; font-size:.42em; color:var(--violet);
+  border:1px solid rgba(178,145,255,.3); background:rgba(178,145,255,.08);
+  padding:.3em .8em; border-radius:999px; animation:bob 1.8s ease-in-out infinite; }
+@keyframes bob{ 0%,100%{ transform:translate(-50%,0); } 50%{ transform:translate(-50%,5px); } }
+
+/* UI role tags */
+.tag{ font-family:'JetBrains Mono',monospace; font-size:.8em; font-weight:700;
+  padding:.08em .4em; border-radius:6px; white-space:nowrap; }
+.tag.action{ color:#0a0e1a; background:var(--green); }
+.tag.cart{ color:#0a0e1a; background:var(--accent); }
+.tag.loc{ color:#0a0e1a; background:var(--amber); }
+.tag.cat{ color:#0a0e1a; background:var(--violet); }
+
+/* pipeline of stages */
+.pipe{ display:flex; align-items:stretch; gap:0; flex-wrap:nowrap; }
+.pipe .stage{ flex:1; background:var(--card); border:1px solid var(--line);
+  border-radius:12px; padding:12px 10px; text-align:center; position:relative; font-size:.62em; }
+.pipe .stage b{ display:block; color:#fff; font-size:1.05em; }
+.pipe .stage .s{ color:var(--muted); font-size:.85em; }
+.pipe .arrow{ display:flex; align-items:center; color:var(--accent); font-size:1.1em; padding:0 6px; }
+
+/* the bare loop ring */
+.loopwrap{ display:flex; justify-content:center; gap:18px; align-items:center; flex-wrap:wrap; }
+.node{ background:var(--card2); border:1px solid var(--line); border-radius:14px;
+  padding:18px 22px; text-align:center; min-width:180px; box-shadow:var(--glow); }
+.node .ic{ font-size:1.6em; } .node b{ display:block; color:#fff; margin-top:.2em; }
+.node .d{ color:var(--muted); font-size:.62em; }
+.loop-arrow{ font-size:1.8em; color:var(--accent); }
+
+/* layer stack */
+.layer{ display:flex; gap:18px; align-items:center; background:var(--card);
+  border:1px solid var(--line); border-left:4px solid var(--accent); border-radius:12px;
+  padding:14px 20px; margin:10px 0; }
+.layer .n{ font-family:'JetBrains Mono',monospace; font-weight:800; font-size:1.4em;
+  color:var(--accent); min-width:1.4em; }
+.layer .t b{ color:#fff; font-size:1.05em; } .layer .t .d{ color:var(--muted); font-size:.72em; }
+.layer.l2{ border-left-color:var(--accent2); } .layer.l2 .n{ color:var(--accent2); }
+.layer.l3{ border-left-color:var(--violet); } .layer.l3 .n{ color:var(--violet); }
+.layer.l4{ border-left-color:var(--amber); } .layer.l4 .n{ color:var(--amber); }
+.layer.l5{ border-left-color:var(--green); } .layer.l5 .n{ color:var(--green); }
+
+/* guard chips grid */
+.guards{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+.guard{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; }
+.guard b{ color:#fff; font-size:.74em; display:block; }
+.guard .c{ color:var(--muted); font-size:.6em; line-height:1.3; }
+.guard .tagx{ font-family:'JetBrains Mono',monospace; font-size:.5em; color:var(--red); }
+.guard.univ{ border-left:3px solid var(--accent); }
+.guard.comm{ border-left:3px solid var(--amber); }
+
+/* comparison cards */
+.cards3{ display:flex; gap:18px; }
+.cards3 .c{ flex:1; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:20px; }
+.cards3 .c .x{ color:var(--red); font-weight:800; font-size:.8em; font-family:'JetBrains Mono',monospace; }
+.cards3 .c h3{ margin:.2em 0 .3em; }
+.cards3 .c p{ font-size:.66em; color:var(--muted); margin:.3em 0 0; }
+
+/* phone mock */
+.phone{ width:300px; border:9px solid #1a2138; border-radius:36px; background:#0c1226;
+  box-shadow:0 24px 70px rgba(0,0,0,.6); overflow:hidden; }
+.phone .scr{ padding:16px; min-height:430px; display:flex; flex-direction:column; gap:8px; }
+.phone .bar{ height:5px; width:60px; background:#2a3556; border-radius:99px; margin:6px auto 12px; }
+.bubble{ font-size:.5em; padding:8px 12px; border-radius:14px; max-width:85%; line-height:1.35; }
+.bubble.me{ align-self:flex-end; background:linear-gradient(120deg,var(--accent2),#4b7bd6); color:#fff; }
+.bubble.bot{ align-self:flex-start; background:#16203c; color:var(--ink); border:1px solid var(--line); }
+.bubble.sys{ align-self:center; font-family:'JetBrains Mono',monospace; font-size:.42em; color:var(--muted); }
+.approve{ align-self:center; width:90%; background:#101a36; border:1px solid var(--amber);
+  border-radius:14px; padding:10px; text-align:center; }
+.approve .btns{ display:flex; gap:8px; margin-top:8px; }
+.approve .btns div{ flex:1; padding:7px; border-radius:9px; font-size:.5em; font-weight:700; }
+.b-ok{ background:var(--green); color:#08220f; } .b-no{ background:var(--red); color:#2a0608; }
+
+/* timeline */
+.tl{ position:relative; margin-left:8px; border-left:2px solid var(--line); padding-left:22px; }
+.tl .it{ position:relative; margin:0 0 10px; }
+.tl .it::before{ content:""; position:absolute; left:-29px; top:6px; width:12px; height:12px;
+  border-radius:50%; background:var(--accent); box-shadow:0 0 0 4px rgba(56,225,211,.15); }
+.tl .it .h{ font-weight:700; color:#fff; font-size:.72em; }
+.tl .it .h code{ font-size:.8em; }
+.tl .it .d{ color:var(--muted); font-size:.6em; }
+.tl .it.safety::before{ background:var(--amber); box-shadow:0 0 0 4px rgba(255,180,84,.15); }
+.tl .it.feat::before{ background:var(--violet); box-shadow:0 0 0 4px rgba(178,145,255,.15); }
+
+/* curriculum table */
+.curtable{ width:100%; border-collapse:collapse; font-size:.66em; }
+.curtable td,.curtable th{ padding:12px 16px; border-bottom:1px solid var(--line); vertical-align:top; }
+.curtable th{ text-align:left; color:var(--accent); font-family:'JetBrains Mono',monospace; font-size:.85em; text-transform:uppercase; letter-spacing:.1em; }
+.curtable td.w{ color:#fff; font-weight:600; width:46%; }
+.curtable td.t{ color:var(--muted); }
+
+/* stat row */
+.stats{ display:flex; gap:16px; }
+.stat{ flex:1; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; text-align:center; }
+.stat .v{ font-size:1.8em; font-weight:900; } .stat .v.a{ color:var(--accent);} .stat .v.b{color:var(--accent2);} .stat .v.g{color:var(--green);} .stat .v.w{color:var(--amber);} .stat .v.v{color:var(--violet);}
+.stat .l{ font-size:.55em; color:var(--muted); letter-spacing:.04em; }
+
+/* callout */
+.callout{ border:1px solid rgba(255,180,84,.35); background:rgba(255,180,84,.08);
+  border-radius:12px; padding:14px 18px; font-size:.72em; }
+.callout.aha{ border-color:rgba(56,225,211,.4); background:rgba(56,225,211,.08); }
+.callout.eng{ border-color:rgba(178,145,255,.35); background:rgba(178,145,255,.08); }
+.callout b{ color:#fff; }
+
+/* mermaid sizing */
+.mermaid{ display:flex; justify-content:center; }
+/* Responsive SVG: scale proportionally to fit BOTH the slide width and the
+   available height, so a tall flowchart can't overflow the slide bottom. */
+.mermaid svg{ max-width:100% !important; max-height:500px !important; width:auto !important; height:auto !important; }
+
+/* footer + progress */
+.reveal .slide-number{ font-family:'JetBrains Mono',monospace; background:transparent; color:var(--faint); font-size:14px; right:18px; bottom:14px; }
+.throughline{ position:fixed; bottom:14px; left:20px; font-family:'JetBrains Mono',monospace;
+  font-size:11px; color:var(--faint); letter-spacing:.04em; z-index:30; pointer-events:none; }
+.reveal .progress{ color:var(--accent); height:4px; }
+.reveal .controls{ color:var(--accent); }
+
+/* section divider */
+.divider{ text-align:center; }
+.divider .num{ font-family:'JetBrains Mono',monospace; font-size:1.1em; color:var(--accent); letter-spacing:.3em; }
+.divider h1{ font-size:2.6em; margin-top:.2em; }
+
+/* blink cursor */
+.cursor{ display:inline-block; width:.6ch; background:var(--accent); color:transparent;
+  animation:blink 1.05s steps(1) infinite; margin-left:2px; }
+@keyframes blink{ 50%{ opacity:0; } }
+
+.hl-action{ color:var(--green); } .hl-cart{ color:var(--accent); } .hl-loc{ color:var(--amber); } .hl-cat{ color:var(--violet); }
+mark{ background:rgba(255,180,84,.25); color:#fff; padding:0 .2em; border-radius:4px; }
+mark.g{ background:rgba(84,224,138,.22);} mark.r{ background:rgba(255,111,125,.22);}
+</style>
+</head>
+<body>
+<div class="throughline">ATLAS · "The AI isn't the hard part. The engineering around it is."</div>
+<div class="reveal"><div class="slides">
+
+<!-- ============================================================= ACT 0 — COLD OPEN ============================================================= -->
+
+<!-- S1 — TITLE / COLD OPEN -->
+<section data-background-gradient="radial-gradient(900px 600px at 70% 20%, rgba(56,225,211,.16), transparent 60%), linear-gradient(160deg,#070a14,#0b1124)">
+  <div class="center" style="margin-top:.2em">
+    <div class="kicker">A live masterclass · 60 minutes</div>
+    <h1 style="font-size:3em"><span class="grad">ATLAS</span></h1>
+    <h2 style="font-weight:600;color:var(--muted);font-size:1.15em;margin-top:-.1em">
+      Build an agent that uses <span class="grad">any app</span> like a human
+    </h2>
+    <p style="font-size:1.05em;max-width:20ch;margin:.8em auto 0;line-height:1.3">
+      <span class="dim">"I'm going to talk to my phone — and it'll order groceries.</span><br>
+      <strong>I didn't write a single line of Blinkit code.</strong> <span class="dim">Watch.</span><span class="cursor">.</span>
+    </p>
+  </div>
+  <aside class="notes">
+    COLD OPEN. Do not introduce yourself. Phone mirrored full-screen (scrcpy). Say the one line, then trigger
+    the Blinkit order live (Demo A). Let them watch autonomous taps. Ask the room: "Predict — what does it tap next?"
+    The unexpected PAUSE at checkout plants the safety seed you pay off later.
+  </aside>
+</section>
+
+<!-- S2 — THE ONE SENTENCE -->
+<section>
+  <div class="center" style="margin-top:.6em">
+    <div class="kicker">The one idea everything hangs on</div>
+    <p class="bigquote">
+      The <span class="grad-warm">AI</span> isn't the hard part.<br>
+      The <span class="grad">engineering around the AI</span> is —<br>
+      and that's a <span class="grad">learnable craft.</span>
+    </p>
+    <p class="lead" style="max-width:24ch;margin:1em auto 0;font-size:.8em">
+      Every "wow" today proves the agent is <em>real</em>.<br>
+      Every teaching moment proves the engineering is what separates
+      a toy demo from something you'd let touch your credit card.
+    </p>
+  </div>
+  <aside class="notes">
+    10 seconds of credibility about yourself, then reframe what they saw: no API, no scraping, no accessibility hack.
+    "It looked at the screen and decided the next tap — the same way you would." Leave this sentence up as the anchor.
+  </aside>
+</section>
+
+<!-- S3 — THE PROMISE -->
+<section>
+  <div class="kicker">What you'll leave with</div>
+  <h2>In the next 50 minutes</h2>
+  <div class="cols" style="margin-top:.5em">
+    <div class="card">
+      <h3>🔭 You'll <span class="grad">understand</span></h3>
+      <p class="small">Exactly how a phone-driving agent works — the loop, the grounding, the guard stack, the safety model. No hand-waving; we map every layer to real code.</p>
+    </div>
+    <div class="card">
+      <h3>👁️ You'll <span class="grad">see</span> it</h3>
+      <p class="small">Three live demos on a real device — including <strong>an app you pick from the audience</strong>, with zero new code written for it.</p>
+    </div>
+    <div class="card">
+      <h3>🛠️ You'll <span class="grad">believe</span> you can build it</h3>
+      <p class="small">It's a loop: <em>see → think → act</em>. The hard 80% — making that loop not embarrass you — is the craft this course teaches.</p>
+    </div>
+  </div>
+  <p class="center lead" style="margin-top:.9em;font-size:.82em">Two tracks today: press <code>→</code> for the story · press <code>↓</code> for the engineering deep-dive.</p>
+  <aside class="notes">
+    State the promise out loud. Tell them about the two-track structure: horizontal = narrative, down arrow = code.
+    Alternate between "magic" (generalists) and "architecture" (SDEs) every few minutes so neither group drifts.
+  </aside>
+</section>
+
+<!-- ============================================================= ACT 1 — WHY THIS IS HARD / WHY NOW ============================================================= -->
+
+<!-- DIVIDER 01 -->
+<section data-background-gradient="linear-gradient(160deg,#0b1124,#070a14)">
+  <div class="divider" style="margin-top:1.2em">
+    <div class="num">0 1</div>
+    <h1>Why this is <span class="grad-warm">hard</span></h1>
+    <p class="lead">…and why it only became possible <em>now</em>.</p>
+  </div>
+  <aside class="notes">Quick poll: "How many of you have tried to automate something on your phone and given up?" Hands go up — you've named their pain.</aside>
+</section>
+
+<!-- S — THREE DEAD ENDS -->
+<section>
+  <div class="kicker">The three "obvious" ways to automate a phone — all dead ends</div>
+  <div class="cards3">
+    <div class="c">
+      <div class="x">✗ APPROACH 1</div>
+      <h3>Per-app APIs</h3>
+      <p>Don't exist for most consumer apps. Need partnerships, break on every release. <strong>Doesn't scale to "any app."</strong></p>
+    </div>
+    <div class="c">
+      <div class="x">✗ APPROACH 2</div>
+      <h3>RPA / coordinate scripts</h3>
+      <p>"Tap (540, 1200)." Brittle. One UI update and every hard-coded tap is wrong. <strong>Maintenance nightmare.</strong></p>
+    </div>
+    <div class="c">
+      <div class="x">✗ APPROACH 3</div>
+      <h3>Accessibility-service hacks</h3>
+      <p>Invasive, per-app, fights the OS, trips fraud detection. <strong>Fragile and adversarial.</strong></p>
+    </div>
+  </div>
+  <p class="center lead" style="margin-top:1em;font-size:.85em">Every one of these tries to <span class="grad-warm">reach inside</span> the app. That's the trap.</p>
+  <aside class="notes">Walk each, kill each. The common failure: they all try to integrate with the app's internals. Set up the pivot.</aside>
+</section>
+
+<!-- S — THE PIVOT -->
+<section data-background-gradient="radial-gradient(800px 500px at 50% 30%, rgba(56,225,211,.14), transparent 60%), linear-gradient(160deg,#070a14,#0b1124)">
+  <div class="center" style="margin-top:.5em">
+    <div class="kicker">The pivot</div>
+    <h1 style="font-size:2.1em">Stop integrating. <span class="grad">Perceive.</span></h1>
+    <p class="lead" style="max-width:26ch;margin:.6em auto 0">
+      Treat the phone the way a <strong>human</strong> does:<br>look at the screen → reason → tap. <em>One loop, every app.</em>
+    </p>
+  </div>
+  <div class="cols" style="margin-top:1em">
+    <div class="callout aha"><b>This is "computer use."</b> No integration surface at all — the screen <em>is</em> the API. The same agent drives a grocery app, a maps app, a chat app, because it never assumes anything about the app's internals.</div>
+    <div class="callout"><b>Why now?</b> This was science fiction 3 years ago. It only became viable when <strong>vision-language models</strong> got good enough to read a UI and pick the next action. The model is the new ingredient — the rest is engineering.</div>
+  </div>
+  <aside class="notes">
+    This reframing is worth dwelling on. "Stop integrating, perceive" is the conceptual unlock. The "why now" is the VLM —
+    that's the part you couldn't have built in 2021. Everything after this slide is the engineering that makes perception reliable.
+  </aside>
+</section>
+
+<!-- ============================================================= ACT 2 — MENTAL MODEL + ARCHITECTURE ============================================================= -->
+
+<!-- DIVIDER 02 -->
+<section data-background-gradient="linear-gradient(160deg,#0b1124,#070a14)">
+  <div class="divider" style="margin-top:1.2em">
+    <div class="num">0 2</div>
+    <h1>The <span class="grad">mental model</span></h1>
+    <p class="lead">We'll build the whole agent on screen — one layer at a time.</p>
+  </div>
+  <aside class="notes">This is the core teaching block (~13 min). Don't rush. This is where SDEs decide the course is legit.</aside>
+</section>
+
+<!-- LAYER 1 — THE BARE LOOP -->
+<section>
+  <div class="kicker">Layer 1 · the "aha"</div>
+  <h2>The entire agent is a loop</h2>
+  <div class="loopwrap" style="margin:.6em 0 .3em">
+    <div class="node fragment fade-in-then-semi-out"><div class="ic">📸</div><b>SEE</b><div class="d">screenshot the screen</div></div>
+    <div class="loop-arrow fragment">→</div>
+    <div class="node fragment fade-in-then-semi-out"><div class="ic">🧠</div><b>THINK</b><div class="d">vision model: "next tap?"</div></div>
+    <div class="loop-arrow fragment">→</div>
+    <div class="node fragment fade-in-then-semi-out"><div class="ic">👆</div><b>ACT</b><div class="d">tap / type / swipe</div></div>
+    <div class="loop-arrow fragment">↺</div>
+  </div>
+  <div class="fragment">
+    <pre><code class="language-text" data-trim>screenshot → vision model: "what's the next tap?" → tap → repeat   (max 30 steps)</code></pre>
+  </div>
+  <p class="fragment lead center" style="font-size:.92em;margin-top:.3em">
+    That's it. That's the whole agent.<br><span class="grad">Everything else is making this loop not embarrass you.</span>
+  </p>
+  <span class="fileref"><b>agent/orchestrator.py</b> · _loop() · MAX_LOOP_ITERATIONS = 30</span>
+  <aside class="notes">
+    Reveal the nodes one at a time, then the one-liner, then the punchline. The punchline is the thesis of the whole talk.
+    A beginner can hold this in their head. Now we earn the rest.
+  </aside>
+</section>
+
+<!-- THE 5 LAYERS OVERVIEW -->
+<section>
+  <div class="kicker">…so what's the other 95% of the code?</div>
+  <h2>Five layers turn a toy into a product</h2>
+  <div class="layer fragment"><div class="n">1</div><div class="t"><b>The loop</b><div class="d">see → think → act → repeat</div></div></div>
+  <div class="layer l2 fragment"><div class="n">2</div><div class="t"><b>Perception — <em>grounding</em></b><div class="d">give the model the UI tree, not just pixels &nbsp;·&nbsp; the 40% → 95% jump</div></div></div>
+  <div class="layer l3 fragment"><div class="n">3</div><div class="t"><b>Decision — a <em>pluggable</em> brain</b><div class="d">the model is a commodity behind a Protocol</div></div></div>
+  <div class="layer l4 fragment"><div class="n">4</div><div class="t"><b>Action &amp; verification</b><div class="d">execute over ADB, then check the screen actually changed</div></div></div>
+  <div class="layer l5 fragment"><div class="n">5</div><div class="t"><b>The guard stack</b><div class="d">reject bad actions <em>before</em> they touch the device — the credibility payload</div></div></div>
+  <aside class="notes">Accrete the layers. Tell them: layers 2-5 are the engineering. The model is layer 3 — one slot. Promise we'll hit each.</aside>
+</section>
+
+<!-- ▼▼ VSTACK: Layer 2 (Perception) ▼▼ -->
+<section>
+
+<!-- LAYER 2 — GROUNDING -->
+<section>
+  <span class="badge beg">LAYER 2 · PERCEPTION</span>
+  <h2>Grounding: a screenshot is not enough <span class="badge eng">FOR ENGINEERS ↓</span></h2>
+  <p class="lead" style="font-size:.8em;margin-top:-.2em">Ask a VLM for pixel coordinates and it <strong>hallucinates</strong> — it'll happily tap (540, 1200) into dead space. On a results page with <em>six identical "ADD" buttons</em>, pixels alone can't tell them apart.</p>
+  <div class="cols" style="margin-top:.3em">
+    <div class="card pad-sm">
+      <p class="small" style="margin-top:0"><span class="hl-cat">▾</span> &nbsp;raw <code>uiautomator</code> XML — hundreds of nodes</p>
+      <pre><code class="language-xml" data-trim>&lt;node class="android.widget.Button"
+  resource-id="...:id/add_button"
+  content-desc="Add"
+  bounds="[920,720][1040,800]"
+  clickable="true" .../&gt;</code></pre>
+    </div>
+    <div class="card pad-sm">
+      <p class="small" style="margin-top:0"><span class="hl-action">▸</span> &nbsp;compacted to a <strong>model-readable element list</strong> with <em>real center coords</em></p>
+      <pre><code class="language-text" data-trim data-noescape>- <span class="hl-loc">[LOCATION]</span> "Delivering to Home · 8 mins" at (540, 180)
+- "Search for atta, butter…" at (540, 330) class=EditText
+- <span class="hl-action">[ACTION]</span> "ADD" at (980, 760)  for "Maggi 2-Min Masala 70g"
+- <span class="hl-action">[ACTION]</span> "ADD" at (980, 1320) for "Yippee Magic Masala 60g"
+- <span class="hl-cat">[CATEGORY?]</span> "Maggi N Maggi House" at (540, 600)</code></pre>
+    </div>
+  </div>
+  <p class="center" style="font-size:.74em;margin-top:.5em"><span class="grad">Six identical "ADD" buttons become six distinguishable choices.</span> Each carries the product card's title.</p>
+  <span class="fileref"><b>agent/ui_tree.py</b> · parse() / render_elements()</span>
+  <span class="fileref"><b>device/adb_controller.py</b> · dump_ui_xml()</span>
+  <div class="deepdive">↓ how the tree is built &amp; how ADD gets its product name</div>
+  <aside class="notes">
+    SDE catnip. Grounding is the single biggest reliability win — the difference between ~40% and ~95% task success.
+    The role tags ([ACTION]/[CART]/[LOCATION]/[CATEGORY?]) and the product label per ADD button are what make taps land on the RIGHT thing.
+  </aside>
+</section>
+
+<!-- LAYER 2 — DEEP DIVE A: parse pipeline -->
+<section>
+  <span class="badge eng">DEEP DIVE · ui_tree.py</span>
+  <h3>From 300 nodes to ≤60 useful elements</h3>
+  <div class="cols">
+    <div style="flex:1.15">
+      <pre><code class="language-python" data-trim data-noescape>def parse(xml, profile=COMMERCE) -> list[UiElement]:
+    root = ET.fromstring(xml)
+    parent_map = {c: p for p in root.iter() for c in p}
+    for node in root.iter("node"):
+        bounds = _parse_bounds(node.attrib.get("bounds"))
+        # keep only clickable / labelled / focused, non-zero-area
+        if not (clickable or text or desc or focused):
+            continue
+        cx, cy = (x1+x2)//2, (y1+y2)//2     # CENTER = tap target
+        is_action = _is_action_like(text, desc, rid, profile)
+        if is_action:                       # walk parents → product title
+            container_label = _find_container_label(node, parent_map, profile)
+        ...
+    return _suppress_wrapping_clickables(elements)  # drop the card,
+                                                    # keep the inner ADD</code></pre>
+    </div>
+    <div style="flex:.85">
+      <div class="card pad-sm small">
+        <p style="margin-top:0"><strong>Five decisions that make grounding work:</strong></p>
+        <ul style="font-size:.92em">
+          <li><strong>Center coords</strong> from <code>bounds</code> — the model taps these, never raw pixels.</li>
+          <li><strong>Keep only</strong> clickable / labelled / focused nodes; drop layout wrappers &amp; zero-area.</li>
+          <li><strong>Suppress wrapping clickables</strong> — a card wrapping an ADD button tempts a tap on the card (opens detail). Force the inner target.</li>
+          <li><strong>60-element budget</strong>, with every <span class="tag action">[ACTION]</span> &amp; <span class="tag cart">[CART]</span> pinned first so they're never truncated.</li>
+          <li><strong>Profile-driven</strong> tags — commerce apps get the shopping vocabulary; everything else pays nothing.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <aside class="notes">The wrapping-clickable suppression is a subtle, real bug they'd hit: tapping a product card opens the detail page instead of adding. Leaf-preference fixes it.</aside>
+</section>
+
+<!-- LAYER 2 — DEEP DIVE B: container label -->
+<section>
+  <span class="badge eng">DEEP DIVE · the product-label trick</span>
+  <h3>Why each "ADD" knows what it buys</h3>
+  <p class="lead" style="font-size:.74em">In Blinkit's tree the product title lives on a parent <code>ViewGroup</code>'s <code>content-desc</code>, not on the ADD button. So we walk <em>up</em> the XML from each ADD until we find a real label.</p>
+  <pre><code class="language-python" data-trim data-noescape>def _find_container_label(action_node, parent_map, profile) -> str:
+    cur = parent_map.get(action_node)
+    while cur is not None:
+        for candidate in (content_desc(cur), text(cur)):
+            if candidate and candidate.lower() not in profile.action_desc_exact \
+               and len(candidate) >= profile.min_container_label_len \
+               and fits_inside_a_card(cur):        # not the whole screen root
+                return strip_re.sub("", candidate) # "…is available for ₹130" → ""
+        cur = parent_map.get(cur)
+    return ""</code></pre>
+  <div class="callout aha" style="margin-top:.4em"><b>Real failure this prevents:</b> the model claimed "tap ADD on eggs" but the coords actually bought a <mark class="r">Fire TV Stick</mark>. With the label attached, a guard catches the mismatch <em>before</em> the tap. (We'll see that guard in Layer 5.)</div>
+  <span class="fileref"><b>agent/ui_tree.py</b> · _find_container_label()</span>
+  <aside class="notes">This is the bridge to the guard stack. The label isn't just for the prompt — it's ground truth a guard checks the model's claim against.</aside>
+</section>
+</section>
+<!-- ▲ end VSTACK Layer 2 -->
+
+<!-- ▼▼ VSTACK: Layer 3 (Decision) ▼▼ -->
+<section>
+
+<!-- LAYER 3 — PLUGGABLE BRAIN -->
+<section>
+  <span class="badge beg">LAYER 3 · DECISION</span>
+  <h2>The model is a <span class="grad">commodity</span> you slot in <span class="badge eng">FOR ENGINEERS ↓</span></h2>
+  <p class="lead" style="font-size:.8em;margin-top:-.1em">The vision model sits behind a one-method <code>Protocol</code>. Swap Gemini → Vertex → any OpenRouter model with <strong>one env var</strong>. No framework, no LangGraph — a hand-written async state machine.</p>
+  <div class="cols">
+    <div style="flex:1.1">
+      <pre><code class="language-python" data-trim data-noescape>@runtime_checkable
+class VisionProvider(Protocol):
+    async def get_next_action(
+        self, screenshot_bytes, task_description,
+        step_history, screen_size=None,
+        skill_hint=None, ui_tree=None,
+    ) -> ProviderResponse: ...        # → {action dict} + token usage
+
+    async def classify_yes_no(
+        self, screenshot_bytes, question) -> bool: ...</code></pre>
+      <span class="fileref"><b>agent/providers/base.py</b></span>
+    </div>
+    <div style="flex:.9">
+      <div class="card pad-sm small">
+        <p style="margin-top:0"><strong>One factory, three brains:</strong></p>
+        <pre style="margin:.2em 0"><code class="language-bash" data-trim>VISION_PROVIDER=gemini      # AI Studio, free tier
+VISION_PROVIDER=vertex      # GCP billing, ADC auth
+VISION_PROVIDER=openrouter  # any model, 1 key</code></pre>
+        <p style="font-size:.95em"><code>google/gemini-2.5-flash</code> · <code>gpt-4o-mini</code> · <code>claude-3.5-sonnet</code> — all behind the same interface.</p>
+      </div>
+    </div>
+  </div>
+  <p class="center lead" style="margin-top:.4em;font-size:.95em"><span class="grad">The model is the ingredient. The harness is the product.</span></p>
+  <div class="deepdive">↓ the prompt, the throttle, the JSON salvage</div>
+  <aside class="notes">
+    Generalists hear: "you're not locked to one AI vendor." SDEs hear: "clean seam, testable, swappable."
+    The key line: models are improving and getting cheaper every month — you want them behind a seam so you ride that curve for free.
+  </aside>
+</section>
+
+<!-- LAYER 3 — DEEP DIVE -->
+<section>
+  <span class="badge eng">DEEP DIVE · providers/</span>
+  <h3>What "send a screenshot to a model" really involves</h3>
+  <div class="cols">
+    <div class="card pad-sm small" style="flex:1">
+      <h3 style="font-size:.8em;color:var(--accent)">📦 The prompt payload</h3>
+      <p>Each step the provider assembles: <strong>system prompt</strong> (action schema + rules) + <strong>screenshot</strong> (binary or base64 data-URL) + <strong>UI-tree block</strong> + per-app <strong>skill hint</strong> + the <strong>last 12</strong> history entries. Output forced to JSON.</p>
+      <span class="fileref"><b>providers/openrouter.py</b> · get_next_action()</span>
+    </div>
+    <div class="card pad-sm small" style="flex:1">
+      <h3 style="font-size:.8em;color:var(--amber)">⏱ Free-tier throttle</h3>
+      <p>A rolling-window RPM/RPD limiter <em>sleeps</em> to honor requests-per-minute and raises <code>QuotaExceeded</code> (not retryable) at the daily ceiling — so a quota wall is a clear message, not a silent hang.</p>
+      <span class="fileref"><b>providers/throttle.py</b></span>
+    </div>
+  </div>
+  <div class="card pad-sm small" style="margin-top:14px">
+    <h3 style="font-size:.8em;color:var(--green)">🧯 JSON salvage — models lie about their output format</h3>
+    <p style="margin-bottom:.3em">Reasoning models burn the output budget "thinking" and truncate the JSON mid-object. The parser degrades gracefully instead of failing the whole task:</p>
+    <pre><code class="language-python" data-trim>def _parse_action(text):
+    try: return json.loads(text)                  # 1. clean JSON
+    except: pass
+    if (obj := extract_json_object(text)): return json.loads(obj)   # 2. dig it out of prose/fences
+    if (s := salvage_truncated_json(text)): return json.loads(s)    # 3. close a cut-off object
+    raise ProviderError(...)</code></pre>
+    <span class="fileref"><b>providers/_parse.py</b> · extract_json_object / salvage_truncated_json</span>
+  </div>
+  <aside class="notes">"Models are unreliable narrators of their own output." Robust parsing is unglamorous and essential — exactly the kind of thing toy demos skip and production can't.</aside>
+</section>
+</section>
+<!-- ▲ end VSTACK Layer 3 -->
+
+<!-- ▼▼ VSTACK: Layer 4 (Action) ▼▼ -->
+<section>
+
+<!-- LAYER 4 — ACTION & VERIFICATION -->
+<section>
+  <span class="badge beg">LAYER 4 · ACTION</span>
+  <h2>Act over ADB — then <span class="grad">check it worked</span> <span class="badge eng">FOR ENGINEERS ↓</span></h2>
+  <div class="cols">
+    <div style="flex:1">
+      <p class="small">An action dict becomes a real gesture on the device:</p>
+      <pre><code class="language-python" data-trim data-noescape>tap   → adb shell input tap X Y
+type  → ADBKeyboard broadcast (or input text) → ENTER
+swipe → adb shell input swipe X1 Y1 X2 Y2 MS
+done / need_approval → handled by orchestrator</code></pre>
+      <span class="fileref"><b>agent/action_executor.py</b></span>
+    </div>
+    <div style="flex:1">
+      <div class="callout aha"><b>The agent notices when it's stuck.</b><br>After every tap/type/swipe it re-screenshots and compares a <strong>perceptual hash</strong>. If the screen didn't change:</div>
+      <div class="pipe" style="margin-top:12px;font-size:.9em">
+        <div class="stage"><b>streak 1</b><span class="s">note it</span></div>
+        <div class="arrow">→</div>
+        <div class="stage"><b>streak 2</b><span class="s">press BACK to recover</span></div>
+        <div class="arrow">→</div>
+        <div class="stage" style="border-color:var(--red)"><b>streak 3</b><span class="s">abort the task</span></div>
+      </div>
+    </div>
+  </div>
+  <p class="center small" style="margin-top:.5em">A retry wrapper gives every gesture up to <strong>4 attempts</strong> (0.5 / 1.0 / 2.0 s backoff) before failing — flaky USB shouldn't kill a task.</p>
+  <span class="fileref"><b>agent/orchestrator.py</b> · _verify_outcome() · _execute_with_retry()</span>
+  <span class="fileref"><b>agent/phash.py</b></span>
+  <div class="deepdive">↓ the ADB layer &amp; the UI-dump that fights animated screens</div>
+  <aside class="notes">Verification is what separates "fire and forget" from "closed loop." The agent perceives the result of its own action and self-corrects. That's the difference between a script and an agent.</aside>
+</section>
+
+<!-- LAYER 4 — DEEP DIVE -->
+<section>
+  <span class="badge eng">DEEP DIVE · device/adb_controller.py</span>
+  <h3>Driving a real, hostile device</h3>
+  <div class="cols">
+    <div class="card pad-sm small" style="flex:1">
+      <h3 style="font-size:.78em;color:var(--accent)">🌳 The 3-pass UI dump</h3>
+      <p><code>uiautomator dump</code> needs the screen "idle" — but carousels &amp; skeleton loaders <em>never</em> idle. So:</p>
+      <ol style="font-size:.92em">
+        <li>normal dump (full fidelity, incl. <code>EditText</code>)</li>
+        <li>retry after 250 ms (let it settle)</li>
+        <li><code>--compressed</code> fallback (works on animated screens)</li>
+      </ol>
+      <p>Writes to <code>/sdcard</code> then <code>cat</code>s it back — streaming to <code>/dev/tty</code> <em>hangs</em> on ColorOS. 8 s cap per pass.</p>
+    </div>
+    <div class="card pad-sm small" style="flex:1">
+      <h3 style="font-size:.78em;color:var(--amber)">🧩 OEM reality checks</h3>
+      <ul style="font-size:.92em">
+        <li><strong>ADBKeyboard IME</strong> swapped in for a task — <code>input text</code> drops chars in a focus race; restored on exit.</li>
+        <li><strong>wake_screen()</strong> first — a sleeping display returns all-black PNGs the model can only "wait" on.</li>
+        <li><strong>foreground package</strong> read via 3 fallbacks — ColorOS hides it behind the notification shade.</li>
+        <li>Every <code>adb</code> call is timeout-bounded so a stuck USB link can't freeze the whole loop.</li>
+      </ul>
+    </div>
+  </div>
+  <p class="center small" style="margin-top:.4em"><span class="dim">Every one of these lines exists because a real run failed without it.</span> ← that's the whole talk in one sentence.</p>
+  <aside class="notes">This slide is pure "the engineering is the hard part" evidence. Each workaround maps to a real device that misbehaved. Production is a thousand of these.</aside>
+</section>
+</section>
+<!-- ▲ end VSTACK Layer 4 -->
+
+<!-- LAYER 5 — THE GUARD STACK (intro) -->
+<section data-background-gradient="radial-gradient(800px 500px at 50% 25%, rgba(84,224,138,.12), transparent 60%), linear-gradient(160deg,#070a14,#0b1124)">
+  <span class="badge beg">LAYER 5 · THE GUARD STACK</span>
+  <h2 class="center" style="margin-top:.1em">The model proposes. <span class="grad">The harness disposes.</span></h2>
+  <p class="center lead" style="font-size:.82em;max-width:34ch;margin:.2em auto .7em">The model is wrong <strong>all the time</strong>. Every proposed action runs a gauntlet <em>before</em> it can touch the device:</p>
+  <div class="pipe">
+    <div class="stage" style="border-color:var(--accent2)"><b>🧠 model</b><span class="s">proposes an action</span></div>
+    <div class="arrow">→</div>
+    <div class="stage" style="border-color:var(--red)"><b>① validate</b><span class="s">allow/block · hard fail</span></div>
+    <div class="arrow">→</div>
+    <div class="stage" style="border-color:var(--amber)"><b>② 11 guards</b><span class="s">structural · soft reject</span></div>
+    <div class="arrow">→</div>
+    <div class="stage" style="border-color:var(--green)"><b>③ HITL gate</b><span class="s">pause if sensitive</span></div>
+    <div class="arrow">→</div>
+    <div class="stage"><b>📱 execute</b><span class="s">only now</span></div>
+  </div>
+  <div class="callout" style="margin-top:14px;font-size:.7em"><b>Hard vs soft.</b> <span class="tag" style="background:var(--red);color:#2a0608">validate</span> is a hard fail — a blocked action ends the task. The <span class="tag" style="background:var(--amber);color:#2a1a06">11 guards</span> are <em>soft</em>: a rejected action appends a corrective hint to history and the model retries next step. It never reaches the phone. <span class="dim">It self-corrects with feedback instead of failing.</span></div>
+  <aside class="notes">
+    THE most persuasive moment for serious buyers. "The model proposes; the harness disposes" — say it slowly. This block is where SDEs decide the course is legit. Don't rush.
+  </aside>
+</section>
+
+<!-- ▼▼ VSTACK: Layer 5 (Guards) ▼▼ -->
+<section>
+
+<!-- LAYER 5 — THE 11 GUARDS -->
+<section>
+  <div class="kicker">11 structural guards · <span style="color:var(--accent)">━ always-on</span> &nbsp; <span style="color:var(--amber)">━ commerce-only</span></div>
+  <div class="guards">
+    <div class="guard univ"><b>Stale-tree</b><div class="c">tap while the UI dump is empty → "wait, don't tap blind" (2× then vision-only)</div></div>
+    <div class="guard univ"><b>Coordinate grounding</b><div class="c">tap/swipe lands on no element (±20px) → hallucinated coords</div></div>
+    <div class="guard univ"><b>Type-without-focus</b><div class="c">a <code>type</code> with no focused EditText → chars go to /dev/null</div></div>
+    <div class="guard comm"><b>Intent mismatch</b><div class="c">"tap search bar" note lands on the <span class="tag loc">[LOCATION]</span> header</div></div>
+    <div class="guard comm"><b>Product-name mismatch</b><div class="c">"ADD eggs" but the label under the coords says Fire TV Stick</div></div>
+    <div class="guard comm"><b>Category tap</b><div class="c">tapping a <span class="tag cat">[CATEGORY?]</span> tile on an add-to-cart task</div></div>
+    <div class="guard comm"><b>Repeated ADD</b><div class="c">a 2nd "fresh ADD" at the same ±10px (those pixels are now a stepper)</div></div>
+    <div class="guard comm"><b>Excess quantity</b><div class="c">requested qty already in cart → another ADD/+ would over-order</div></div>
+    <div class="guard comm"><b>Premature cart-review</b><div class="c">"Cart review" approval while still on the search-results page</div></div>
+    <div class="guard comm"><b>Giveup</b><div class="c">"no products found" before any real swipe, or right after an ADD</div></div>
+    <div class="guard comm"><b>Benign-nav approval</b><div class="c">asking permission to "press back / tap cart" — just do it</div></div>
+    <div class="guard" style="border-left:3px dashed var(--violet);background:rgba(178,145,255,.06)"><b>…and it keeps growing</b><div class="c">each guard was added the day a real run failed without it</div></div>
+  </div>
+  <p class="center small" style="margin-top:.5em">Every rejection is <strong>audit-logged</strong> with a tag (<code>COORD_REJECTED</code>, <code>PRODUCT_NAME_MISMATCH_REJECTED</code>, …) — so a failed run is fully explainable.</p>
+  <span class="fileref"><b>agent/orchestrator.py</b> · _loop() lines ~659–967</span>
+  <div class="deepdive">↓ read a real guard &amp; the phash self-correction trio</div>
+  <aside class="notes">
+    Don't read all 11 — point at 3-4 and tell the story (Fire TV Stick, the location-header misclick, over-ordering 3 milks). The dashed "keeps growing" tile sets up the git-history journey slide.
+    The README froze at "nine"; the code is now eleven — that growth IS the lesson.
+  </aside>
+</section>
+
+<!-- LAYER 5 — DEEP DIVE A: a real guard -->
+<section>
+  <span class="badge eng">DEEP DIVE · one guard, in full</span>
+  <h3>Product-name mismatch — "you said eggs; that buys a Fire TV Stick"</h3>
+  <pre><code class="language-python" data-trim data-noescape>def _add_product_name_mismatch(action, elements) -> str | None:
+    note = action.get("note", "")                       # "tap ADD on eggs"
+    claimed = _extract_product_from_add_note(note)       # "eggs"
+    words = significant_words(claimed)                   # drop stop-words
+    x, y = action["x"], action["y"]
+
+    target = find_action_at(x, y, elements)              # the [ACTION] under the coords
+    if target and target.container_label:                # ground truth from the XML
+        if any(w in target.container_label.lower() for w in words):
+            return None                                  # ✓ claim matches the card → allow
+        return (f"note claims ADD on '{claimed}', but the button at "
+                f"({x},{y}) actually buys '{target.container_label}'. "
+                f"Find the [ACTION] line whose for \"...\" matches.")   # ✗ REJECT + hint</code></pre>
+  <div class="cols" style="margin-top:.3em">
+    <div class="callout aha" style="flex:1"><b>The pattern every guard follows:</b> read the model's stated intent (<code>note</code>) → check it against structural ground truth (the UI tree) → on conflict, return a <em>specific, actionable</em> hint. The model reads the hint next step and re-targets.</div>
+    <div class="callout eng" style="flex:1"><b>Conservative on purpose:</b> it skips when the product can't be parsed, when there's no label, when the tree is empty. <strong>A guard that mis-fires is worse than no guard</strong> — false rejections stall real tasks.</div>
+  </div>
+  <span class="fileref"><b>agent/orchestrator.py</b> · _add_product_name_mismatch()</span>
+  <aside class="notes">Walk the code top to bottom slowly — it's readable. The "conservative on purpose" point is mature engineering judgment, exactly what the course sells.</aside>
+</section>
+
+<!-- LAYER 5 — DEEP DIVE B: the phash trio + session guards -->
+<section>
+  <span class="badge eng">DEEP DIVE · self-correction &amp; cost control</span>
+  <h3>Three uses of one perceptual hash</h3>
+  <div class="cols">
+    <div class="card pad-sm small" style="flex:1">
+      <h3 style="font-size:.74em;color:var(--accent)">♻️ Dedup</h3>
+      <p>Screen identical to what the model last saw? <strong>Skip the model call</strong>, synthesize a <code>wait</code>. Saves tokens &amp; latency (capped at 3 in a row).</p>
+    </div>
+    <div class="card pad-sm small" style="flex:1">
+      <h3 style="font-size:.74em;color:var(--amber)">🔁 Loop detection</h3>
+      <p>Over <em>executed</em> history, detect <strong>A-A</strong>, <strong>A-B-A-B</strong>, or any action seen ≥3×. Warn the model; hard-abort at 4 loops.</p>
+    </div>
+    <div class="card pad-sm small" style="flex:1">
+      <h3 style="font-size:.74em;color:var(--green)">✅ Verify</h3>
+      <p>After a gesture, re-hash. Unchanged → back-button at streak 2, fail at streak 3.</p>
+    </div>
+  </div>
+  <h3 style="margin-top:.7em;font-size:.95em">Session-level backstops — a runaway agent can't run forever <span class="dim">or burn your quota</span></h3>
+  <div class="stats" style="margin-top:.2em">
+    <div class="stat"><div class="v a">30</div><div class="l">max loop iterations</div></div>
+    <div class="stat"><div class="v w">4</div><div class="l">loops → hard abort</div></div>
+    <div class="stat"><div class="v b">6</div><div class="l">consecutive waits → abort</div></div>
+    <div class="stat"><div class="v g">600s</div><div class="l">session timeout (asyncio)</div></div>
+    <div class="stat"><div class="v v">12</div><div class="l">history entries sent / step</div></div>
+  </div>
+  <span class="fileref"><b>orchestrator.py</b> · _maybe_synthesize_wait · _loop_hint · _verify_outcome</span>
+  <aside class="notes">
+    The cost story matters to anyone who's run an agent: an unbounded loop on a frozen screen once burned 264k tokens. These caps are the difference between a $0.05 task and a $40 surprise.
+  </aside>
+</section>
+</section>
+<!-- ▲ end VSTACK Layer 5 -->
+
+<!-- THE COMPLETE LOOP -->
+<section>
+  <div class="kicker">Layers 1–5, assembled · one step end-to-end</div>
+  <h2 style="font-size:1.3em">The complete agent loop</h2>
+  <div class="mermaid">
+flowchart LR
+    A(["screencap<br/>+ phash"]) --> B{"screen<br/>unchanged?"}
+    B -->|yes| W["synthetic wait<br/>(skip model)"]
+    B -->|no| C["UI tree + skill<br/>+ app profile"]
+    C --> D["vision model<br/>proposes action"]
+    D -->|done| Z(["DONE"])
+    D --> E{"(1) validate<br/>allow or block"}
+    E -->|blocked| X(["FAIL"])
+    E -->|ok| F{"(2) 11 guards"}
+    F -->|"reject + hint"| D
+    F -->|pass| G{"(3) HITL<br/>sensitive?"}
+    G -->|yes| H["await Telegram<br/>approve or deny"]
+    H -->|deny| X
+    H -->|approve| I["execute over ADB"]
+    G -->|no| I
+    I --> J["audit + persist"]
+    J --> K{"screen changed?"}
+    K -->|"no, 3x"| X
+    K -->|yes| A
+</div>
+  <p class="center small" style="margin-top:.3em">Audit is written <strong>before</strong> execute and <strong>after</strong> the result — never just after.</p>
+  <aside class="notes">This is the payoff of the layer build. Trace one happy path, then trace a rejection looping back to the model, then trace the HITL pause. Three traces, whole architecture internalized.</aside>
+</section>
+
+<!-- ARCHITECTURE AT A GLANCE -->
+<section>
+  <div class="kicker">Zoom out · the whole system on the host</div>
+  <h2 style="font-size:1.3em">Architecture at a glance</h2>
+  <div class="mermaid">
+flowchart TB
+    TG["Telegram<br/>text, voice, approve, deny"]
+    PH["Phone shortcut<br/>press and speak"]
+    subgraph HOST["HOST (laptop)"]
+      direction TB
+      H["Handlers"]
+      WH["Webhook trigger"]
+      RT["Router + Apps<br/>NL to app, task, param"]
+      ORC["ORCHESTRATOR<br/>the agent loop"]
+      VIS["Vision provider<br/>+ throttle"]
+      UIT["UI tree + skills<br/>+ prompts"]
+      SEC["HITL, validator,<br/>audit, users"]
+      DB[("sqlite<br/>tasks + steps")]
+      ADB["AdbController"]
+    end
+    DEV["device or emulator"]
+    CLOUD["Gemini, OpenRouter"]
+    TG --> H
+    PH -->|"USB: adb reverse"| WH
+    H --> RT
+    WH --> RT
+    RT --> ORC
+    ORC --> VIS
+    VIS --> CLOUD
+    ORC --> UIT
+    ORC --> SEC
+    ORC --> DB
+    ORC --> ADB
+    ADB -->|"tap, type, swipe"| DEV
+</div>
+  <span class="fileref"><b>main.py</b> wires every singleton · README §3</span>
+  <aside class="notes">Two front doors (Telegram + phone shortcut) converge on the Router, which converges on the orchestrator, which fans out to the provider, perception, security, persistence, and the device. One process, one event loop.</aside>
+</section>
+
+<!-- ============================================================= ACT 3 — THE WOW BLOCKS ============================================================= -->
+
+<!-- DIVIDER 03 -->
+<section data-background-gradient="linear-gradient(160deg,#0b1124,#070a14)">
+  <div class="divider" style="margin-top:1.2em">
+    <div class="num">0 3</div>
+    <h1>The two <span class="grad">"wow"</span> moments</h1>
+    <p class="lead">Generalization · and the pause before paying.</p>
+  </div>
+</section>
+
+<!-- DEMO 2 CUE -->
+<section data-background-gradient="radial-gradient(700px 500px at 50% 30%, rgba(110,168,255,.14), transparent 60%), linear-gradient(160deg,#070a14,#0b1124)">
+  <div class="center" style="margin-top:.4em">
+    <span class="badge demo">▶ LIVE DEMO 2 · audience picks the app</span>
+    <h2 style="margin-top:.4em;font-size:1.5em">"Same loop. <span class="grad">Zero new code.</span>"</h2>
+    <p class="lead" style="max-width:30ch;margin:.4em auto">Pick one — and tell me what it should do:</p>
+    <div class="cards3" style="max-width:90%;margin:.4em auto">
+      <div class="c center"><div style="font-size:1.6em">🍽️</div><b>Swiggy</b><p>"search biryani"</p></div>
+      <div class="c center"><div style="font-size:1.6em">🗺️</div><b>Maps</b><p>"drop a pin at the airport"</p></div>
+      <div class="c center"><div style="font-size:1.6em">💬</div><b>WhatsApp</b><p>"draft a message to Mom"</p></div>
+    </div>
+    <p class="small center" style="margin-top:.5em">Their ownership of the prompt makes the success impossible to dismiss as staged.</p>
+  </div>
+  <aside class="notes">
+    Let the audience pick BOTH the app and the task (from a vetted shortlist). Narrate before it acts so they score it live.
+    Backup recording cued. If it stalls &gt;15s, narrate over the recording — never debug live.
+  </aside>
+</section>
+
+<!-- ▼▼ VSTACK: Generalization ▼▼ -->
+<section>
+
+<!-- GENERALIZATION CONCEPT -->
+<section>
+  <span class="badge beg">WOW #2</span>
+  <h2>Generality is a <span class="grad">property of the architecture</span> <span class="badge eng">FOR ENGINEERS ↓</span></h2>
+  <p class="lead" style="font-size:.8em;margin-top:-.1em">There are <strong>no per-app flows</strong>. The same loop drives every app because it only ever reasons over <em>this screen, right now</em>. Per-app knowledge is optional and lives in two thin, declarative places:</p>
+  <div class="cols">
+    <div class="card">
+      <h3 style="color:var(--accent)">📁 <code>skills/&lt;pkg&gt;.md</code> — the <em>prompt</em> half</h3>
+      <p class="small">Plain-markdown hints for an app: gotchas, traps, HITL-worthy screens. Add a file, no code change. <strong>22 apps shipped.</strong> Even with <em>no</em> skill file, the agent still works.</p>
+      <pre style="margin-top:.3em"><code class="language-text" data-trim># Blinkit — the #1 misclick trap
+The home "search bar" is NOT a real input —
+tapping it NAVIGATES to a search screen.
+Tap the EditText there before typing.</code></pre>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--amber)">⚙️ <code>AppProfile</code> — the <em>structural</em> half</h3>
+      <p class="small">The vocabulary the UI-tree renderer uses to tag elements, and the toggles that <strong>arm the shopping guards</strong>. Two profiles today:</p>
+      <ul class="small" style="margin-top:.2em">
+        <li><code>GENERIC</code> — inert. No tags, all shopping guards off. <strong>Pays nothing.</strong> (maps, chat, media, rides…)</li>
+        <li><code>COMMERCE</code> — the search→add→cart→checkout family (Blinkit, Zepto, Swiggy, Amazon, Flipkart…). Arms 8 guards + the <span class="tag action">[ACTION]</span><span class="tag cart">[CART]</span><span class="tag loc">[LOCATION]</span><span class="tag cat">[CATEGORY?]</span> tags.</li>
+      </ul>
+    </div>
+  </div>
+  <p class="center small" style="margin-top:.4em"><span class="grad">You don't code generality per app. You code the loop once, and declare what's special.</span></p>
+  <span class="fileref"><b>agent/profiles.py</b></span><span class="fileref"><b>agent/skills.py</b></span><span class="fileref"><b>bot/apps.py</b> · 23 apps · 7 categories</span>
+  <div class="deepdive">↓ how a profile arms the guards (and why GENERIC is free)</div>
+  <aside class="notes">
+    The reframe is the whole segment: generality isn't a feature, it's a consequence of perceive-don't-integrate. The profile/skill split shows that even the per-app stuff is declarative, not procedural.
+  </aside>
+</section>
+
+<!-- GENERALIZATION DEEP DIVE -->
+<section>
+  <span class="badge eng">DEEP DIVE · profiles.py</span>
+  <h3>One resolver decides how much "shopping brain" to switch on</h3>
+  <div class="cols">
+    <div style="flex:1.1">
+      <pre><code class="language-python" data-trim data-noescape>@dataclass(frozen=True)
+class AppProfile:
+    name: str
+    enforce_shopping_guards: bool = False   # arms the 8 commerce guards
+    action_text_tokens: frozenset = ...     # what counts as [ACTION]
+    cart_id_tokens:     tuple = ...          # what counts as [CART]
+    location_tokens:    tuple = ...          # the [LOCATION] header
+    # ...vocabulary for the renderer's tags
+
+GENERIC  = AppProfile(name="generic")               # everything empty → inert
+COMMERCE = AppProfile(name="commerce",
+    enforce_shopping_guards=True, action_text_tokens={"add","+","checkout",...}, ...)
+
+def resolve_profile(package) -> AppProfile:
+    return _BY_PACKAGE.get(package, GENERIC)         # unknown app → GENERIC</code></pre>
+    </div>
+    <div style="flex:.9">
+      <div class="callout aha small"><b>How the loop uses it (orchestrator):</b>
+        <pre style="margin:.3em 0"><code class="language-python" data-trim>intent_problem = (
+  self._intent_mismatch(action, elements)
+  if profile.enforce_shopping_guards
+  else None)        # ← GENERIC skips it entirely</code></pre>
+        Every commerce guard is gated on this one flag. On a chat app the flag is <code>False</code>, so the shopping guards <strong>never run</strong> — both faster <em>and</em> safer (they'd mis-fire on a non-commerce screen).</div>
+      <p class="small" style="margin-top:.4em"><strong>Why this refactor mattered:</strong> the shopping heuristics used to run on <em>every</em> app — even WhatsApp — where they produced no signal and could only mis-fire. Promoting them to a profile made the agent truly general.</p>
+    </div>
+  </div>
+  <span class="fileref"><b>agent/profiles.py</b> · resolve_profile() · wired in <b>main.py</b></span>
+  <aside class="notes">This is the generalization refactor from the project's own history. The "gate on one boolean" pattern is how you keep a general core while supporting specialized families cleanly.</aside>
+</section>
+</section>
+<!-- ▲ end VSTACK Generalization -->
+
+<!-- DEMO 3 CUE -->
+<section data-background-gradient="radial-gradient(700px 500px at 50% 30%, rgba(255,180,84,.14), transparent 60%), linear-gradient(160deg,#070a14,#0b1124)">
+  <div class="center" style="margin-top:.6em">
+    <span class="badge demo">▶ LIVE DEMO 3 · deny the payment</span>
+    <h2 style="margin-top:.4em;font-size:1.5em">Re-run the order — and this time, <span class="grad-warm">tap Deny.</span></h2>
+    <p class="lead" style="max-width:30ch;margin:.5em auto">Watch the task stop <strong>cold</strong>. Logged. Nothing charged.</p>
+    <p class="bigquote" style="font-size:1.05em;margin-top:.7em">"An agent you can't stop is a <span class="grad-warm">liability</span>, not a product.<br><span class="grad">The pause is the feature.</span>"</p>
+  </div>
+  <aside class="notes">
+    Pay off the checkout pause from the cold open. Counterintuitively, STOPPING the agent impresses serious buyers more than completing the task. This quietly answers "what happens when it screws up?" — that's trust, and trust converts skeptics.
+  </aside>
+</section>
+
+<!-- HITL TRUST MOMENT -->
+<section>
+  <span class="badge beg">WOW #3 · THE TRUST MOMENT</span>
+  <h2>It hits a payment screen → <span class="grad">it stops and asks you</span></h2>
+  <div class="cols" style="align-items:center;margin-top:.2em">
+    <div class="center" style="flex:.8">
+      <div class="phone" style="margin:0 auto">
+        <div class="scr">
+          <div class="bar"></div>
+          <div class="bubble me">order milk on blinkit</div>
+          <div class="bubble sys">launched Blinkit · searching…</div>
+          <div class="bubble bot">✅ added Amul Taaza 500ml to cart</div>
+          <div class="approve">
+            <div style="font-size:.5em;color:var(--amber);font-weight:700">⏸ APPROVAL NEEDED</div>
+            <div style="font-size:.46em;color:var(--ink);margin-top:4px">Cart review: 1× Amul Taaza ₹27.<br>Approving here also authorizes payment.</div>
+            <div class="btns"><div class="b-ok">✓ Approve</div><div class="b-no">✕ Deny</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div style="flex:1.2">
+      <p class="lead" style="font-size:.82em">The loop <strong>blocks</strong> on an <code>asyncio.Event</code> and waits for your tap in Telegram. The HITL gate fires on:</p>
+      <ul style="font-size:.78em">
+        <li>💳 <strong>Payment</strong> · checkout · UPI · card · billing</li>
+        <li>🔐 <strong>OTP</strong> / verification codes / 2FA</li>
+        <li>🗑️ <strong>Delete</strong> / uninstall / clear-data / factory reset</li>
+        <li>🛡️ <strong>System permission</strong> dialogs</li>
+        <li>…and <strong>anything</strong> the model itself flags <code>need_approval</code></li>
+      </ul>
+      <div class="callout" style="margin-top:.3em;font-size:.66em"><b>One approval, whole checkout.</b> Approve the cart review and a <code>payment_pre_approved</code> latch lets the later "Place order / Pay" step through — but <strong>OTP always re-prompts.</strong> One tap, full audit trail.</div>
+    </div>
+  </div>
+  <span class="fileref"><b>security/hitl_gate.py</b></span><span class="fileref"><b>orchestrator.py</b> · _gate_with_hitl()</span>
+  <aside class="notes">Tap Deny live; the task fails with "user denied approval", logged. Then approve a fresh one to complete the order — bookends the story you opened with.</aside>
+</section>
+
+<!-- ▼▼ VSTACK: Safety ▼▼ -->
+<section>
+
+<!-- THE SAFETY MODEL -->
+<section>
+  <div class="kicker">Defensive by construction · seven independent layers</div>
+  <h2 style="font-size:1.25em">The safety model</h2>
+  <div class="guards" style="grid-template-columns:repeat(2,1fr);gap:12px">
+    <div class="guard" style="border-left:3px solid var(--green)"><b>1 · Emulator-only by default</b><div class="c">refuses to run if a physical device is attached unless <code>ALLOW_PHYSICAL_DEVICE=1</code> — and warns loudly</div></div>
+    <div class="guard" style="border-left:3px solid var(--accent)"><b>2 · Authorization</b><div class="c">only users in <code>users.json</code>; onboarding via 5-min single-use <code>/pair</code> codes; per-user policy: read-only / confirm-sensitive / always-approve</div></div>
+    <div class="guard" style="border-left:3px solid var(--red)"><b>3 · Action validator</b><div class="c">allow-set + blocklist (no calls, SMS, factory-reset, uninstall, <code>rm</code>) — hard fail before execution</div></div>
+    <div class="guard" style="border-left:3px solid var(--amber)"><b>4 · HITL gate</b><div class="c">payment / OTP / delete / permission + any model <code>need_approval</code> — blocks until you tap</div></div>
+    <div class="guard" style="border-left:3px solid var(--violet)"><b>5 · Audit before action</b><div class="c"><code>EXECUTING</code> logged <em>before</em> the act, <code>RESULT</code> after — keys/tokens redacted, daily rotation</div></div>
+    <div class="guard" style="border-left:3px solid var(--accent2)"><b>6 · Webhook security</b><div class="c">timing-safe shared secret; bound to <code>127.0.0.1</code>, reached only over the USB <code>adb reverse</code> tunnel; empty secret = disabled</div></div>
+  </div>
+  <p class="center small" style="margin-top:.5em"><span class="grad">7 · Secrets never touch disk or logs</span> — all config from <code>.env</code>; keys regex-redacted from the audit trail.</p>
+  <span class="fileref"><b>security/</b> · <b>device/emulator.py</b> · <b>bot/users.py</b> · <b>config/settings.py</b></span>
+  <div class="deepdive">↓ the HITL gate in code · validator &amp; audit</div>
+  <aside class="notes">
+    Walk this fast — it's the objection-answering slide. Each layer is independent; defense in depth. This is what "you'd let it touch your credit card" actually requires.
+  </aside>
+</section>
+
+<!-- SAFETY DEEP DIVE A: HitlGate -->
+<section>
+  <span class="badge eng">DEEP DIVE · hitl_gate.py</span>
+  <h3>The gate is just detection + a blocking wait</h3>
+  <pre><code class="language-python" data-trim data-noescape>async def requires_approval(action, screenshot_b64, policy) -> bool:
+    if policy == "read_only" and action_type in STATE_CHANGING:
+        raise ReadOnlyViolation(...)        # hard refusal, not a prompt
+    if policy == "always_approve":  return False
+    if action_type == "need_approval":  return True   # model asked → always pause
+    # scan the model's plain-English `note` for sensitive intent:
+    haystack = note + reason + summary + text
+    return any(kw in haystack for kw in SENSITIVE_KEYWORDS)  # payment/otp/delete/permission
+
+async def wait_for_approval(user_id, timeout=None) -> bool:
+    event = asyncio.Event(); self._pending[user_id] = event
+    await asyncio.wait_for(event.wait(), timeout)     # ← orchestrator blocks here
+    return self._results.get(user_id, False)          # grant()/deny() set the event</code></pre>
+  <div class="cols" style="margin-top:.2em">
+    <div class="callout aha small" style="flex:1"><b>Two doors to "yes."</b> A keyword scan of the model's narration <em>OR</em> (optional, <code>ENABLE_VISION_HITL=1</code>) a vision yes/no classifier — cached by phash so a static screen doesn't burn a call. The two results are OR'd: either one pauses.</div>
+    <div class="callout eng small" style="flex:1"><b>Why a keyword scan of the <code>note</code>?</b> The model writes "tapping Place Order" in plain English. Catching dangerous <em>intent stated in words</em> is a cheap, robust second net beyond the action type alone.</div>
+  </div>
+  <aside class="notes">The asyncio.Event bridge between the orchestrator coroutine and the Telegram callback is the elegant core — no threads, no polling. grant()/deny() in the handler set the event the loop is awaiting.</aside>
+</section>
+
+<!-- SAFETY DEEP DIVE B: validator + audit -->
+<section>
+  <span class="badge eng">DEEP DIVE · validator + audit</span>
+  <h3>Normalize, allow/block, and log everything — twice</h3>
+  <div class="cols">
+    <div style="flex:1">
+      <p class="small" style="margin-top:0"><strong>action_validator.py</strong> — normalize model quirks, then gate:</p>
+      <pre><code class="language-python" data-trim data-noescape># models disagree on verbs &amp; coord shapes — normalize first
+ALIASES = {"click":"tap","press":"tap","input":"type","scroll":"swipe"}
+# coerce coordinate:[x,y] / bbox / {"x":..} → scalar x,y
+ALLOWED = {tap,type,swipe,done,need_approval,wait}
+BLOCKED = (call, sms, factory_reset, uninstall, "adb shell rm")</code></pre>
+      <span class="fileref"><b>security/action_validator.py</b></span>
+    </div>
+    <div style="flex:1">
+      <p class="small" style="margin-top:0"><strong>audit_logger.py</strong> — one JSON line per action, before &amp; after:</p>
+      <pre><code class="language-json" data-trim>{"timestamp":"…Z","user_id":42,
+ "task":"order milk on blinkit",
+ "action":{"action":"tap","x":980,"y":760,
+           "note":"tap ADD on Amul Taaza"},
+ "result":"EXECUTING"}</code></pre>
+      <p class="small">Secrets regex-redacted · content truncated to 50 chars · midnight-UTC rotation, 30-day retention.</p>
+    </div>
+  </div>
+  <div class="callout small" style="margin-top:.2em"><b>Normalizing is safety too.</b> Qwen-style models emit <code>"click"</code> and <code>"coordinate":[x,y]</code>; GPT emits <code>"input"</code>. The validator canonicalizes them so the executor only ever sees clean <code>tap/type/swipe</code> with scalar coords — and a blocked term in <em>any</em> structural field is a hard fail.</div>
+  <span class="fileref"><b>security/audit_logger.py</b> · <b>orchestrator.py</b> audits EXECUTING then RESULT</span>
+  <aside class="notes">"Audit before, not after" is a deliberate rule from CLAUDE.md — if the process dies mid-action you still have a record that you tried it. That's forensics-grade discipline.</aside>
+</section>
+</section>
+<!-- ▲ end VSTACK Safety -->
+
+<!-- ============================================================= ACT 4 — FRONTIER + CLOSE ============================================================= -->
+
+<!-- DIVIDER 04 -->
+<section data-background-gradient="linear-gradient(160deg,#0b1124,#070a14)">
+  <div class="divider" style="margin-top:1.2em">
+    <div class="num">0 4</div>
+    <h1>Where native <span class="grad-warm">can't go</span></h1>
+    <p class="lead">You can't beat the native app on raw speed. You win where it <em>can't follow.</em></p>
+  </div>
+  <aside class="notes">This is the positioning. Be honest about shipped vs roadmap — this audience respects honesty and punishes overselling.</aside>
+</section>
+
+<!-- ▼▼ VSTACK: Voice ▼▼ -->
+<section>
+
+<!-- VOICE — SHIPPED -->
+<section>
+  <span class="badge beg">SHIPPED &amp; DEMOABLE</span>
+  <h2>Hands-free voice — <span class="grad">your thumbs can't do this</span> <span class="badge eng">FOR ENGINEERS ↓</span></h2>
+  <p class="lead" style="font-size:.78em;margin-top:-.1em">Press a phone shortcut, speak, the agent reads the intent back, you confirm — it runs. No screen, no typing. The thing you want <em>while cooking or driving.</em></p>
+  <div class="mermaid">
+sequenceDiagram
+    participant P as Phone shortcut
+    participant W as Webhook
+    participant R as Router
+    participant T as Telegram
+    P->>W: POST text = "okay atlas, add milk on blinkit"
+    Note over W: strip wake-word, hmac auth
+    W->>R: route to app, task, param
+    W-->>P: speaks "Got it, add milk on Blinkit. Confirm?"
+    P->>W: POST confirm = yes
+    W->>T: run task. HITL gates payment + OTP
+</div>
+  <div class="callout aha" style="margin-top:.3em;font-size:.66em"><b>Nothing is exposed on the network.</b> For a USB phone, <code>adb reverse tcp:8765</code> tunnels the device's localhost to the host over the cable. The trigger only <em>proposes &amp; confirms</em> — Telegram stays the approval + result surface, so voice never bypasses a HITL gate.</div>
+  <span class="fileref"><b>bot/webhook.py</b> · <b>bot/handlers.py</b> · _strip_wake_word()</span>
+  <div class="deepdive">↓ the two-phase webhook &amp; the router</div>
+  <aside class="notes">
+    Tier: medium reliability (mic/STT/OEM quirks). Demo only if same-day tested; recording mandatory. The confirm-first flow is the safe default; autorun collapses it for trusted shortcuts.
+  </aside>
+</section>
+
+<!-- VOICE DEEP DIVE -->
+<section>
+  <span class="badge eng">DEEP DIVE · webhook.py + router.py</span>
+  <h3>Two phases, one tiny stateless endpoint</h3>
+  <div class="cols">
+    <div style="flex:1.05">
+      <pre><code class="language-python" data-trim data-noescape># confirm-first: understand → speak back → run
+if has_confirm:                       # phase 2
+    approve = confirm in _AFFIRMATIVE
+    msg = handle_external_confirm(owner, approve)
+elif autorun:                         # single-shot for trusted clients
+    msg = handle_external_run(owner, text)
+else:                                 # phase 1: propose
+    msg = handle_external_trigger(owner, text)
+return {"ok": True, "message": msg}   # spoken back by the phone</code></pre>
+      <p class="small">A single owner user; the request body <em>cannot</em> choose a different user. 90-second TTL on the pending intent.</p>
+    </div>
+    <div style="flex:.95">
+      <div class="card pad-sm small">
+        <h3 style="font-size:.74em;color:var(--accent)">🧭 The Router — LLM intent over a fixed catalogue</h3>
+        <p>Free text → one structured <code>(app, task, param)</code> against a <strong>23-app registry</strong>. A text-only model call:</p>
+        <pre style="margin:.2em 0"><code class="language-json" data-trim>{"app_id":"blinkit","task_id":"order","param":"milk"}</code></pre>
+        <p>Hallucinated ids fail validation and fall back to the freeform agent. Aliases ("cab"→uber) resolved by the LLM — no hard-coded map.</p>
+      </div>
+    </div>
+  </div>
+  <span class="fileref"><b>bot/router.py</b> · <b>bot/apps.py</b> · routing active only when the provider supports <code>complete_text</code> (OpenRouter)</span>
+  <aside class="notes">The router is the daily-driver path: one message, no menu taps. It's a thin LLM classifier with a strict validation backstop — the same "model proposes, code disposes" pattern as the guards.</aside>
+</section>
+</section>
+<!-- ▲ end VSTACK Voice -->
+
+<!-- ROADMAP — HONEST -->
+<section>
+  <span class="badge demo" style="color:var(--violet);background:rgba(178,145,255,.12);border-color:rgba(178,145,255,.3)">ROADMAP · framed as vision, not faked</span>
+  <h2>The frontier — what you build <span class="grad">toward</span></h2>
+  <div class="cards3" style="margin-top:.3em">
+    <div class="c"><div style="font-size:1.5em">⏰</div><h3>Scheduled &amp; proactive</h3><p>"Reorder my usual every Sunday." Cron-driven runs with no human in the seat — the native app can't initiate.</p></div>
+    <div class="c"><div style="font-size:1.5em">🔗</div><h3>Cross-app orchestration</h3><p>"Check the cheapest cab, then book it, then text my ETA." One instruction spanning apps that have no integration with each other.</p></div>
+    <div class="c"><div style="font-size:1.5em">⌚</div><h3>Multi-surface</h3><p>Watch, car, earbuds — any surface that can capture intent and speak a result. The agent isn't tied to a screen.</p></div>
+  </div>
+  <div class="callout" style="margin-top:.7em;font-size:.7em">⚠️ <b>Integrity note:</b> single-task voice/text + HITL is <span style="color:var(--green)">solid and live-safe</span>. True multi-app-in-one-instruction and scheduling are <span style="color:var(--violet)">roadmap</span> — presented as <em>where this goes</em>, not as working demos. <strong>This audience respects the honesty.</strong></div>
+  <aside class="notes">Say plainly which is shipped and which is roadmap. The credibility you bank here is worth more than a faked demo. "In the course, you build toward this."</aside>
+</section>
+
+<!-- THE ENGINEERING JOURNEY -->
+<section>
+  <div class="kicker">Proof, from the project's own git history · 20 commits</div>
+  <h2 style="font-size:1.2em">The loop took a week. The <span class="grad">last mile</span> took the rest.</h2>
+  <div class="cols" style="margin-top:.2em">
+    <div class="tl" style="flex:1">
+      <div class="it"><div class="h">Ship the bare loop &amp; providers <code>973deda</code></div><div class="d">screenshot → model → tap. Works ~40% of the time.</div></div>
+      <div class="it feat"><div class="h">Integrate the UI tree <code>3736a51</code></div><div class="d">grounding — the single biggest jump. 40% → 95%.</div></div>
+      <div class="it safety"><div class="h">ADBKeyboard IME + typing heuristics <code>55687f0</code></div><div class="d">typing silently failed on OEM ROMs. Fixed.</div></div>
+      <div class="it feat"><div class="h">Intent router <code>242cee7</code></div><div class="d">one message → structured task. No menu taps.</div></div>
+      <div class="it safety"><div class="h">Enforce focus + loop detection <code>fbfcbac</code></div><div class="d">type-without-focus &amp; A-B-A-B cycles caught.</div></div>
+    </div>
+    <div class="tl" style="flex:1">
+      <div class="it safety"><div class="h">Stale-tree override <code>55126b4</code></div><div class="d">animated screens never idle → dead loops. Fixed.</div></div>
+      <div class="it safety"><div class="h">sdcard UI dump, not stdout <code>3377ea6</code></div><div class="d">ColorOS hung streaming to /dev/tty. Fixed.</div></div>
+      <div class="it feat"><div class="h">Per-app grounding profiles <code>5324d3c</code></div><div class="d">commerce brain off WhatsApp → truly general.</div></div>
+      <div class="it safety"><div class="h">Quantity guard + wait limit <code>1afdd89</code></div><div class="d">stopped ordering 3 milks instead of 1.</div></div>
+      <div class="it safety"><div class="h">Cart-reveal hints + auto-back <code>decd709</code></div><div class="d">the missing "View cart" bar, solved structurally.</div></div>
+    </div>
+  </div>
+  <p class="center" style="margin-top:.4em;font-size:.82em"><span class="grad">Almost every commit after grounding is a production failure caught and turned into a guard.</span> That's the craft.</p>
+  <aside class="notes">
+    This is the emotional proof of the thesis. The AI (the model) didn't change across these commits — the engineering around it did, relentlessly. Each guard has a war story. Tell one or two.
+  </aside>
+</section>
+
+<!-- ============================================================= ACT 5 — THE PITCH, EARNED ============================================================= -->
+
+<!-- CURRICULUM MAPS TO WOW -->
+<section>
+  <div class="kicker">Here's what you'll build · mapped to the exact moments you just saw</div>
+  <h2 style="font-size:1.2em">Every "wow" is a module</h2>
+  <table class="curtable">
+    <tr><th>What wowed you</th><th>What the course teaches</th></tr>
+    <tr><td class="w">🛒 It ordered with no API</td><td class="t">The perceive → reason → act loop &amp; computer use</td></tr>
+    <tr><td class="w">🎯 It tapped the <em>right</em> button</td><td class="t">Grounding: UI trees, element roles, coordinate truth, container labels</td></tr>
+    <tr><td class="w">🛡️ It didn't do anything dumb</td><td class="t">The guard stack, self-correction, dedup &amp; loop detection</td></tr>
+    <tr><td class="w">⏸ It paused before paying</td><td class="t">HITL design, the safety model, audit &amp; authorization</td></tr>
+    <tr><td class="w">🌍 It ran on <em>any</em> app</td><td class="t">Provider abstraction &amp; generalized, profile-driven harness design</td></tr>
+  </table>
+  <p class="center lead" style="margin-top:.5em;font-size:.82em">You walk out with <strong>your own agent driving a real device</strong> — and the <span class="grad">engineering judgment</span> to make it safe.</p>
+  <aside class="notes">Don't pivot to a generic sales slide. Map the curriculum onto what they witnessed. The durable, transferable skill is the JUDGMENT — not the prompt.</aside>
+</section>
+
+<!-- CTA + CLOSE -->
+<section data-background-gradient="radial-gradient(900px 600px at 50% 25%, rgba(56,225,211,.18), transparent 60%), linear-gradient(160deg,#070a14,#0b1124)">
+  <div class="center" style="margin-top:.3em">
+    <div class="kicker">Your move</div>
+    <h1 style="font-size:2.1em">Build the agent. <span class="grad">Own the craft.</span></h1>
+    <div class="card" style="display:inline-block;margin:.5em auto;border-color:rgba(56,225,211,.4)">
+      <p style="margin:0;font-size:.9em"><strong>🎓 Enroll:</strong> <span class="grad">&lt;your-link-here&gt;</span> &nbsp;·&nbsp; <strong>cohort starts &lt;date&gt;</strong> &nbsp;·&nbsp; <span class="dim">&lt;offer / deadline&gt;</span></p>
+    </div>
+    <p class="bigquote" style="font-size:1.15em;margin-top:.7em">
+      The <span class="grad-warm">AI</span> isn't the hard part.<br>
+      The <span class="grad">engineering around it</span> is —<br>
+      and now you've <span class="grad">seen the whole craft.</span>
+    </p>
+  </div>
+  <aside class="notes">
+    Say the CTA out loud; don't just show it. Then the closing line — restate the throughline. Open Q&amp;A. Planted seed if the room is shy:
+    "A common question: how often does the model get it wrong?" → "Constantly — that's why the guards exist." (re-sells the engineering).
+  </aside>
+</section>
+
+<!-- ============================================================= APPENDIX ============================================================= -->
+
+<!-- APPENDIX: CODE MAP -->
+<section>
+  <div class="kicker">Appendix · read the code — every reference in one place</div>
+  <h2 style="font-size:1.15em">The codebase, by area <span class="small dim">(~15k lines Python, fully async, no agent framework)</span></h2>
+  <div class="cols" style="font-size:.82em">
+    <div style="flex:1">
+      <div class="card pad-sm" style="margin-bottom:10px">
+        <b style="color:var(--accent)">🧠 Agent core</b>
+        <div class="small"><code>agent/orchestrator.py</code> — the loop + 11 guards (2.4k ln)<br>
+        <code>agent/ui_tree.py</code> — uiautomator XML → elements<br>
+        <code>agent/state_machine.py</code> · <code>phash.py</code> · <code>action_executor.py</code><br>
+        <code>agent/profiles.py</code> · <code>skills.py</code> · <code>persistence.py</code></div>
+      </div>
+      <div class="card pad-sm">
+        <b style="color:var(--accent2)">🔌 Providers (pluggable brain)</b>
+        <div class="small"><code>providers/base.py</code> — the <code>VisionProvider</code> Protocol<br>
+        <code>gemini.py</code> · <code>vertex.py</code> · <code>openrouter.py</code><br>
+        <code>throttle.py</code> · <code>_parse.py</code> (JSON salvage)</div>
+      </div>
+    </div>
+    <div style="flex:1">
+      <div class="card pad-sm" style="margin-bottom:10px">
+        <b style="color:var(--amber)">🛡️ Security</b>
+        <div class="small"><code>security/hitl_gate.py</code> — approval gate<br>
+        <code>action_validator.py</code> — allow/block + normalize<br>
+        <code>audit_logger.py</code> — redacted JSON trail</div>
+      </div>
+      <div class="card pad-sm" style="margin-bottom:10px">
+        <b style="color:var(--violet)">💬 Interface</b>
+        <div class="small"><code>bot/handlers.py</code> · <code>telegram_bot.py</code><br>
+        <code>webhook.py</code> (voice) · <code>router.py</code> · <code>apps.py</code><br>
+        <code>users.py</code> · <code>pairing.py</code> · <code>session.py</code></div>
+      </div>
+      <div class="card pad-sm">
+        <b style="color:var(--green)">📱 Device + config</b>
+        <div class="small"><code>device/adb_controller.py</code> (Android) · <code>ios_controller.py</code><br>
+        <code>device/emulator.py</code> — emulator-only guard<br>
+        <code>config/settings.py</code> · <code>prompts.py</code> · <code>skills/*.md</code></div>
+      </div>
+    </div>
+  </div>
+  <p class="center small" style="margin-top:.3em">Start here: <code>README.md</code> §4 (end-to-end flow) → <code>CLAUDE.md</code> (the rules) → <code>orchestrator.py:514</code> (<code>_loop</code>).</p>
+</section>
+
+<!-- APPENDIX: NUMBERS -->
+<section>
+  <div class="kicker">Appendix · the numbers that matter</div>
+  <h2 style="font-size:1.15em">Constants &amp; defaults <span class="small dim">(the dials that keep it safe &amp; cheap)</span></h2>
+  <div class="stats" style="flex-wrap:wrap;gap:12px">
+    <div class="stat" style="flex:1 1 18%"><div class="v a">30</div><div class="l">MAX_LOOP_ITERATIONS</div></div>
+    <div class="stat" style="flex:1 1 18%"><div class="v w">4</div><div class="l">MAX_LOOPS_BEFORE_ABORT</div></div>
+    <div class="stat" style="flex:1 1 18%"><div class="v b">60</div><div class="l">max UI elements / prompt</div></div>
+    <div class="stat" style="flex:1 1 18%"><div class="v g">12</div><div class="l">history entries / step</div></div>
+    <div class="stat" style="flex:1 1 18%"><div class="v v">11</div><div class="l">structural guards</div></div>
+    <div class="stat" style="flex:1 1 18%"><div class="v a">600s</div><div class="l">session timeout (deployed)</div></div>
+    <div class="stat" style="flex:1 1 18%"><div class="v w">±20px</div><div class="l">coord forgiveness margin</div></div>
+    <div class="stat" style="flex:1 1 18%"><div class="v b">8s</div><div class="l">UI-dump timeout / pass</div></div>
+    <div class="stat" style="flex:1 1 18%"><div class="v g">3</div><div class="l">vision-model retries</div></div>
+    <div class="stat" style="flex:1 1 18%"><div class="v v">23</div><div class="l">apps · 7 categories</div></div>
+  </div>
+  <div class="cols" style="margin-top:.6em;font-size:.72em">
+    <div class="callout small" style="flex:1"><b>Defaults that ship:</b> <code>VISION_PROVIDER=openrouter</code> · <code>google/gemini-2.5-flash</code> · emulator-only unless <code>ALLOW_PHYSICAL_DEVICE=1</code> · 64-bit perceptual hash.</div>
+    <div class="callout small eng" style="flex:1"><b>Retry/backoff:</b> ADB actions retry at 0.5 / 1.0 / 2.0 s (4 attempts). HITL has no timeout by default — the agent waits for you, indefinitely.</div>
+  </div>
+</section>
+
+<!-- FINAL -->
+<section data-background-gradient="radial-gradient(700px 500px at 50% 40%, rgba(110,168,255,.14), transparent 60%), linear-gradient(160deg,#070a14,#0b1124)">
+  <div class="center" style="margin-top:1em">
+    <h1 style="font-size:2.4em"><span class="grad">Thank you.</span></h1>
+    <p class="lead" style="margin-top:.3em">Questions?</p>
+    <p class="small" style="margin-top:1.2em;font-family:'JetBrains Mono',monospace;color:var(--faint)">
+      deck controls&nbsp; <code>→ ←</code> story&nbsp;·&nbsp;<code>↓</code> deep-dive&nbsp;·&nbsp;<code>S</code> speaker notes&nbsp;·&nbsp;<code>F</code> fullscreen&nbsp;·&nbsp;<code>O</code> overview&nbsp;·&nbsp;<code>ESC</code> grid
+    </p>
+    <p class="small dim" style="margin-top:.6em">ATLAS — a generalized mobile computer-use agent · built on the masterclass blueprint</p>
+  </div>
+  <aside class="notes">
+    Closing line restates the throughline one final time. To export a PDF: open with <code>?print-pdf</code> appended to the URL, then Print → Save as PDF (landscape, background graphics on).
+  </aside>
+</section>
+
+</div></div>
+
+<!-- reveal.js + plugins (UMD globals) -->
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/zoom/zoom.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad:false, theme:'dark', securityLevel:'loose',
+    flowchart:{ curve:'basis', htmlLabels:false, useMaxWidth:true },
+    sequence:{ useMaxWidth:true, mirrorActors:false },
+    themeVariables:{
+      fontFamily:'JetBrains Mono, monospace', fontSize:'15px',
+      primaryColor:'#101a36', primaryTextColor:'#e9edf8', primaryBorderColor:'#38e1d3',
+      lineColor:'#6ea8ff', secondaryColor:'#16203c', tertiaryColor:'#0b1020',
+      noteBkgColor:'#1a2750', noteTextColor:'#e9edf8', noteBorderColor:'#ffb454'
+    }
+  });
+  // Render each Mermaid diagram lazily, only once its slide is actually
+  // visible. Rendering inside a display:none reveal slide makes getBBox()
+  // return NaN, collapsing the diagram to zero size — so we run mermaid on
+  // just the current slide's diagrams (the one slide with real layout).
+  var PRINT_PDF = /print-pdf/.test(window.location.search);
+  function renderVisibleMermaid(){
+    // Normal mode: render only the current (visible) slide's diagrams — a
+    // diagram rendered inside a display:none slide collapses to zero size.
+    // print-pdf mode: every slide is laid out at once, so render them all.
+    var scope;
+    if(PRINT_PDF){ scope = document; }
+    else{
+      scope = (window.Reveal && Reveal.getCurrentSlide) ? Reveal.getCurrentSlide() : null;
+      if(!scope) return;
+    }
+    var els = scope.querySelectorAll('.mermaid:not([data-processed])');
+    if(!els.length) return;
+    try{ mermaid.run({ nodes: Array.prototype.slice.call(els) }); }
+    catch(e){ console.warn('mermaid', e); }
+    setTimeout(function(){ try{ Reveal.layout(); }catch(e){} }, 80);
+  }
+  Reveal.initialize({
+    hash:true, slideNumber:'c/t', controls:true, controlsTutorial:true,
+    progress:true, center:false, transition:'slide', backgroundTransition:'fade',
+    width:1280, height:720, margin:0.045, minScale:0.2, maxScale:1.6,
+    pdfSeparateFragments:false,
+    plugins:[ RevealNotes, RevealHighlight, RevealZoom ]
+  }).then(function(){ renderVisibleMermaid(); });
+  Reveal.on('ready', renderVisibleMermaid);
+  Reveal.on('slidechanged', renderVisibleMermaid);
+</script>
+</body>
+</html>
