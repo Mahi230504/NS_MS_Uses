@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 
@@ -10,8 +11,8 @@ from telegram.ext import Application, ContextTypes
 
 from agent.comparison import ComparisonEngine, ComparisonResult, ProbeTarget
 from agent.orchestrator import Orchestrator
-from agent.persistence import TaskRepository
-from agent.state_machine import Task
+from agent.persistence import SavedTaskRepository, SavedTaskRow, TaskRepository
+from agent.state_machine import Task, TaskState
 from bot.apps import (
     APPS,
     App,
@@ -20,7 +21,13 @@ from bot.apps import (
     get_task,
     render_prompt,
 )
-from bot.intent import CompareIntent, IntentClassifier, SingleIntent
+from bot.intent import (
+    CompareIntent,
+    IntentClassifier,
+    RunSavedIntent,
+    SaveIntent,
+    SingleIntent,
+)
 from bot.pairing import PairCodeIssuer
 from bot.router import Route, Router
 from bot.session import Session, SessionState, SessionStore
@@ -109,6 +116,20 @@ class _PendingComparison:
     created_at: float
 
 
+@dataclass
+class _LastRun:
+    """The most recent launch for a user — what "save this" / the post-run
+    save-offer captures. Structured fields enable template-aware replay;
+    `description` is the always-present fallback.
+    """
+
+    description: str
+    launch_package: str | None = None
+    app_id: str | None = None
+    task_id: str | None = None
+    param: str | None = None
+
+
 class Handlers:
     """Bundles all Telegram callbacks. One instance per running bot."""
 
@@ -124,6 +145,7 @@ class Handlers:
         router: Router | None = None,
         classifier: IntentClassifier | None = None,
         comparison: ComparisonEngine | None = None,
+        saved: SavedTaskRepository | None = None,
     ) -> None:
         self._app = application
         self._orch = orchestrator
@@ -137,12 +159,16 @@ class Handlers:
         # present it supersedes the bare router on the message + voice paths.
         self._classifier = classifier
         self._comparison = comparison
+        # Saved quick tasks (#4). None disables save/run-saved.
+        self._saved = saved
         self._sessions = SessionStore()
         self._running: dict[int, asyncio.Task] = {}
         # External-trigger proposals awaiting a spoken yes/no, keyed by user.
         self._pending: dict[int, _PendingIntent] = {}
         # Finished comparisons whose order buttons are still live, keyed by user.
         self._pending_comparison: dict[int, _PendingComparison] = {}
+        # The user's most recent launch, for "save this as a quick task".
+        self._last_run: dict[int, _LastRun] = {}
 
     # ------------------------------------------------------------------
     # Auth helpers
@@ -215,6 +241,13 @@ class Handlers:
             await self._launch_templated_task(update, user.id, text)
             return
 
+        if sess.state == SessionState.AWAITING_SAVE_NAME:
+            # User is naming a "save as quick task".
+            sess.state = SessionState.IDLE
+            msg = await self._save_last_run_core(user.id, text)
+            await update.message.reply_text(msg)
+            return
+
         if self._has_running_task(user.id):
             await update.message.reply_text(
                 "A task is already running. Use /abort first or wait for it to finish."
@@ -229,6 +262,20 @@ class Handlers:
             intent = await self._classifier.classify(text)
             if isinstance(intent, CompareIntent):
                 await self._launch_comparison(update.message, user.id, intent)
+                return
+            if isinstance(intent, SaveIntent):
+                await update.message.reply_text(
+                    await self._save_last_run_core(user.id, intent.name)
+                )
+                return
+            if isinstance(intent, RunSavedIntent):
+                row = await self._resolve_saved(user.id, intent.name)
+                if row is None:
+                    await update.message.reply_text(
+                        f'No saved task matches "{intent.name}". See /saved.'
+                    )
+                    return
+                await self._run_saved(update.message, user.id, row)
                 return
             if isinstance(intent, SingleIntent):
                 await self._launch_route(update, user.id, intent.route)
@@ -273,6 +320,8 @@ class Handlers:
             await self._on_task_pick(query, user_id, data[5:])
         elif data.startswith("cmp:"):
             await self._on_comparison_pick(query, user_id, data[4:])
+        elif data == "save:last":
+            await self._on_save_offer_click(query, user_id)
         elif data == "back:apps":
             await self._on_back_to_apps(query, user_id)
         elif data == "freeform":
@@ -386,8 +435,12 @@ class Handlers:
         await message.reply_text(
             f"Starting in {app.emoji} {app.name}: {description}"
         )
-        self._running[user_id] = asyncio.create_task(
-            self._orch.run_task(task, launch_package=app.package)
+        self._spawn_task(
+            user_id, task, launch_package=app.package,
+            last_run=_LastRun(
+                description=description, launch_package=app.package,
+                app_id=app.id, task_id=task_tpl.id, param=param,
+            ),
         )
 
     async def _launch_freeform_task(
@@ -402,7 +455,10 @@ class Handlers:
         sess.task_id = None
         await update.message.reply_text(f"Starting task: {text}")
         # No launch_package — the agent decides where to start.
-        self._running[user_id] = asyncio.create_task(self._orch.run_task(task))
+        self._spawn_task(
+            user_id, task, launch_package=None,
+            last_run=_LastRun(description=text),
+        )
 
     async def _launch_route(
         self, update: Update, user_id: int, route: Route
@@ -434,8 +490,164 @@ class Handlers:
         await update.message.reply_text(
             f"{route.app.emoji} {route.app.name}: {description}"
         )
-        self._running[user_id] = asyncio.create_task(
-            self._orch.run_task(task, launch_package=route.app.package)
+        self._spawn_task(
+            user_id, task, launch_package=route.app.package,
+            last_run=_LastRun(
+                description=description, launch_package=route.app.package,
+                app_id=route.app.id, task_id=route.task.id, param=route.param,
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Saved quick tasks (feature #4)
+
+    def _spawn_task(
+        self,
+        user_id: int,
+        task: Task,
+        *,
+        launch_package: str | None = None,
+        last_run: "_LastRun | None" = None,
+        offer_save: bool = True,
+    ) -> asyncio.Task:
+        """Launch a single-app task, remember it, and (on success) offer to save.
+
+        Centralizes the create_task + _running bookkeeping so every single-app
+        launch captures `_last_run` (for "save this") and, unless suppressed,
+        attaches a done-callback that offers a one-tap save when the run
+        finishes successfully.
+        """
+        fut = asyncio.create_task(
+            self._orch.run_task(task, launch_package=launch_package)
+        )
+        self._running[user_id] = fut
+        if last_run is not None:
+            self._last_run[user_id] = last_run
+        if offer_save and self._saved is not None and last_run is not None:
+            fut.add_done_callback(
+                lambda f, uid=user_id: self._on_run_done(f, uid)
+            )
+        return fut
+
+    def _on_run_done(self, fut: asyncio.Task, user_id: int) -> None:
+        """Done-callback: offer to save a task that completed successfully.
+
+        Sync (asyncio callback contract); schedules the async offer on the loop.
+        Swallows cancellation/errors — the orchestrator already reported them.
+        """
+        if fut.cancelled():
+            return
+        try:
+            task = fut.result()
+        except Exception:
+            return
+        if task is None or getattr(task, "state", None) is not TaskState.DONE:
+            return
+        if user_id not in self._last_run:
+            return
+        asyncio.create_task(self._offer_save(user_id))
+
+    async def _offer_save(self, user_id: int) -> None:
+        try:
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(
+                    "💾 Save as quick task", callback_data="save:last"
+                )]]
+            )
+            await self._app.bot.send_message(
+                chat_id=user_id,
+                text="Want to save this as a quick task you can re-run anytime?",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+
+    async def _on_save_offer_click(self, query, user_id: int) -> None:
+        if self._saved is None or user_id not in self._last_run:
+            await query.edit_message_text("Nothing recent to save.")
+            return
+        self._sessions.get(user_id).state = SessionState.AWAITING_SAVE_NAME
+        await query.edit_message_text(
+            "What should I call this quick task? Send me a short name."
+        )
+
+    async def _save_last_run_core(self, user_id: int, name: str) -> str:
+        """Save the user's last run under `name`; returns a user-facing line."""
+        if self._saved is None:
+            return "Saving quick tasks isn't enabled."
+        last = self._last_run.get(user_id)
+        if last is None:
+            return "I don't have a recent task to save — run something first."
+        label = name.strip()
+        slug = _slugify(label)
+        if not slug:
+            return "That name won't work — use some letters or numbers."
+        await self._saved.upsert(
+            user_id=user_id, slug=slug, label=label,
+            raw_description=last.description, app_id=last.app_id,
+            task_id=last.task_id, param=last.param,
+            launch_package=last.launch_package,
+        )
+        return f'Saved as "{label}". Re-run it with /run {slug} or "run my {label}".'
+
+    async def _resolve_saved(
+        self, user_id: int, query: str
+    ) -> SavedTaskRow | None:
+        """Resolve a saved task by name: slug -> exact label -> unique
+        substring -> fuzzy. Returns None if nothing matches confidently."""
+        if self._saved is None:
+            return None
+        rows = await self._saved.list_for(user_id)
+        if not rows:
+            return None
+        q = query.strip().lower()
+        qslug = _slugify(query)
+        for r in rows:
+            if r.slug == qslug:
+                return r
+        for r in rows:
+            if r.label.lower() == q:
+                return r
+        subs = [r for r in rows if q and q in r.label.lower()]
+        if len(subs) == 1:
+            return subs[0]
+        import difflib
+
+        labels = {r.label.lower(): r for r in rows}
+        match = difflib.get_close_matches(q, list(labels), n=1, cutoff=0.6)
+        return labels[match[0]] if match else None
+
+    async def _run_saved(self, message, user_id: int, row: SavedTaskRow) -> None:
+        if self._has_running_task(user_id):
+            await message.reply_text("A task is already running. Use /abort first.")
+            return
+        app = get_app(row.app_id) if row.app_id else None
+        task_tpl = get_task(app, row.task_id) if (app and row.task_id) else None
+        if app is not None and task_tpl is not None:
+            # Structured replay — re-render so template fixes propagate.
+            description = render_prompt(task_tpl.template, row.param)
+            launch_package = app.package
+        else:
+            description = row.raw_description
+            launch_package = row.launch_package
+        if self._saved is not None:
+            try:
+                await self._saved.mark_run(user_id, row.slug)
+            except Exception:
+                pass
+        task = Task(user_id=user_id, description=description)
+        sess = self._sessions.get(user_id)
+        sess.state = SessionState.RUNNING
+        sess.app_id = row.app_id
+        sess.task_id = row.task_id
+        await message.reply_text(f'▶️ Running "{row.label}": {description}')
+        self._spawn_task(
+            user_id, task, launch_package=launch_package,
+            last_run=_LastRun(
+                description=description, launch_package=launch_package,
+                app_id=row.app_id, task_id=row.task_id, param=row.param,
+            ),
+            offer_save=False,  # already saved
         )
 
     # ------------------------------------------------------------------
@@ -654,6 +866,29 @@ class Handlers:
                     f"Got it — compare {intent.item} on {names}. "
                     "I'll show the result on Telegram. Confirm?"
                 )
+            if isinstance(intent, SaveIntent):
+                # Saving touches no device state — do it immediately, no confirm.
+                return await self._save_last_run_core(user_id, intent.name)
+            if isinstance(intent, RunSavedIntent):
+                row = await self._resolve_saved(user_id, intent.name)
+                if row is None:
+                    return f"I couldn't find a saved task called {intent.name}."
+                app = get_app(row.app_id) if row.app_id else None
+                task_tpl = (
+                    get_task(app, row.task_id) if (app and row.task_id) else None
+                )
+                if app is not None and task_tpl is not None:
+                    description = render_prompt(task_tpl.template, row.param)
+                    launch_package = app.package
+                else:
+                    description = row.raw_description
+                    launch_package = row.launch_package
+                self._pending[user_id] = _PendingIntent(
+                    description=description,
+                    launch_package=launch_package,
+                    created_at=time.monotonic(),
+                )
+                return f"Got it — run {row.label}. Confirm?"
             if isinstance(intent, SingleIntent):
                 route = intent.route
         elif self._router is not None:
@@ -744,13 +979,94 @@ class Handlers:
         await self._app.bot.send_message(
             chat_id=user_id, text=f"Starting: {pending.description}"
         )
-        self._running[user_id] = asyncio.create_task(
-            self._orch.run_task(task, launch_package=pending.launch_package)
+        self._spawn_task(
+            user_id, task, launch_package=pending.launch_package,
+            last_run=_LastRun(
+                description=pending.description,
+                launch_package=pending.launch_package,
+            ),
         )
         return "On it — I'll confirm on Telegram."
 
     # ------------------------------------------------------------------
     # Other commands (unchanged from before)
+
+    # ------------------------------------------------------------------
+    # Saved-task commands (feature #4)
+
+    async def save_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if update.message is None or user is None:
+            return
+        if not self._is_paired(user.id):
+            return
+        name = " ".join(context.args or []).strip()
+        if not name:
+            await update.message.reply_text(
+                "Usage: /save <name> — saves the task you just ran."
+            )
+            return
+        await update.message.reply_text(
+            await self._save_last_run_core(user.id, name)
+        )
+
+    async def list_saved(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if update.message is None or user is None:
+            return
+        if not self._is_paired(user.id):
+            return
+        if self._saved is None:
+            await update.message.reply_text("Saved tasks aren't enabled.")
+            return
+        rows = await self._saved.list_for(user.id)
+        if not rows:
+            await update.message.reply_text(
+                "No saved tasks yet. Run something, then tap “Save as quick task”."
+            )
+            return
+        lines = ["Your saved tasks:"]
+        for r in rows:
+            head = r.raw_description[:50].replace("\n", " ")
+            if len(r.raw_description) > 50:
+                head += "…"
+            lines.append(f"• {r.label}  —  /run {r.slug}\n    {head}")
+        await update.message.reply_text("\n".join(lines))
+
+    async def run_saved(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if update.message is None or user is None:
+            return
+        if not self._is_paired(user.id):
+            return
+        name = " ".join(context.args or []).strip()
+        if not name:
+            await update.message.reply_text("Usage: /run <name>  (see /saved)")
+            return
+        row = await self._resolve_saved(user.id, name)
+        if row is None:
+            await update.message.reply_text(
+                f'No saved task matches "{name}". See /saved.'
+            )
+            return
+        await self._run_saved(update.message, user.id, row)
+
+    async def forget_saved(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if update.message is None or user is None:
+            return
+        if not self._is_paired(user.id):
+            return
+        name = " ".join(context.args or []).strip()
+        if not name or self._saved is None:
+            await update.message.reply_text("Usage: /forget <name>")
+            return
+        row = await self._resolve_saved(user.id, name)
+        if row is None:
+            await update.message.reply_text(f'No saved task matches "{name}".')
+            return
+        await self._saved.delete(user.id, row.slug)
+        await update.message.reply_text(f'Forgot "{row.label}".')
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -955,6 +1271,12 @@ _RANKING_LABELS = {
     "best": "⭐ Comparing best",
 }
 _RANKING_HEADERS = {"cheapest": "Cheapest", "fastest": "Fastest", "best": "Best"}
+
+
+def _slugify(name: str) -> str:
+    """Lowercase, hyphenated slug for a saved-task name (e.g. 'Sunday order'
+    -> 'sunday-order'). Empty when the name has no alphanumerics."""
+    return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
 
 
 def _ranking_label(ranking_key: str) -> str:

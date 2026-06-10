@@ -7,6 +7,8 @@ from bot.intent import (
     CompareIntent,
     IntentClassifier,
     RankingKey,
+    RunSavedIntent,
+    SaveIntent,
     SingleIntent,
     UnknownIntent,
 )
@@ -149,6 +151,22 @@ class TestUnknownAndEdges:
     async def test_garbage_reply_degrades(self) -> None:
         c = _classifier("the model rambled without any json")
         assert isinstance(await c.classify("hello"), UnknownIntent)
+
+
+class TestSaveAndRunSaved:
+    async def test_save_intent(self) -> None:
+        c = _classifier('{"intent":"save","name":"sunday order"}')
+        r = await c.classify("save this as my sunday order")
+        assert isinstance(r, SaveIntent) and r.name == "sunday order"
+
+    async def test_run_saved_intent(self) -> None:
+        c = _classifier('{"intent":"run_saved","name":"sunday order"}')
+        r = await c.classify("run my sunday order")
+        assert isinstance(r, RunSavedIntent) and r.name == "sunday order"
+
+    async def test_save_without_name_degrades(self) -> None:
+        c = _classifier('{"intent":"save","name":null}')
+        assert not isinstance(await c.classify("save this"), SaveIntent)
 
 
 class TestRankingKey:

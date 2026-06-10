@@ -62,6 +62,24 @@ CREATE TABLE IF NOT EXISTS comparisons (
 
 CREATE INDEX IF NOT EXISTS idx_comparisons_user_created
     ON comparisons (user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS saved_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    slug TEXT NOT NULL,
+    label TEXT NOT NULL,
+    app_id TEXT,
+    task_id TEXT,
+    param TEXT,
+    raw_description TEXT NOT NULL,
+    launch_package TEXT,
+    created_at TEXT NOT NULL,
+    last_run_at TEXT,
+    run_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_user_slug
+    ON saved_tasks (user_id, slug);
 """
 
 # Terminal states — used to flag what counts as a "still-running" orphan at
@@ -124,6 +142,22 @@ class ComparisonRow:
         except (json.JSONDecodeError, TypeError):
             return []
         return data if isinstance(data, list) else []
+
+
+@dataclass(frozen=True)
+class SavedTaskRow:
+    id: int
+    user_id: int
+    slug: str
+    label: str
+    app_id: str | None
+    task_id: str | None
+    param: str | None
+    raw_description: str
+    launch_package: str | None
+    created_at: str
+    last_run_at: str | None
+    run_count: int
 
 
 class TaskRepository:
@@ -314,3 +348,95 @@ class TaskRepository:
             )
             await db.commit()
             return cursor.rowcount or 0
+
+
+class SavedTaskRepository:
+    """Async DAO for user-saved quick tasks (feature #4).
+
+    Shares the same SQLite file as TaskRepository; the `saved_tasks` table is
+    created by TaskRepository.initialize() via the shared _SCHEMA, so this
+    class only does CRUD. Uniqueness is per (user_id, slug).
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._path = db_path
+
+    async def upsert(
+        self,
+        *,
+        user_id: int,
+        slug: str,
+        label: str,
+        raw_description: str,
+        app_id: str | None = None,
+        task_id: str | None = None,
+        param: str | None = None,
+        launch_package: str | None = None,
+    ) -> None:
+        """Create or replace the saved task at (user_id, slug)."""
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                INSERT INTO saved_tasks
+                    (user_id, slug, label, app_id, task_id, param,
+                     raw_description, launch_package, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, slug) DO UPDATE SET
+                    label = excluded.label,
+                    app_id = excluded.app_id,
+                    task_id = excluded.task_id,
+                    param = excluded.param,
+                    raw_description = excluded.raw_description,
+                    launch_package = excluded.launch_package
+                """,
+                (
+                    user_id, slug, label, app_id, task_id, param,
+                    raw_description, launch_package, _utcnow(),
+                ),
+            )
+            await db.commit()
+
+    async def get(self, user_id: int, slug: str) -> SavedTaskRow | None:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM saved_tasks WHERE user_id = ? AND slug = ?",
+                (user_id, slug),
+            )
+            row = await cursor.fetchone()
+            return SavedTaskRow(**dict(row)) if row else None
+
+    async def list_for(self, user_id: int) -> list[SavedTaskRow]:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM saved_tasks
+                WHERE user_id = ?
+                ORDER BY last_run_at DESC, created_at DESC
+                """,
+                (user_id,),
+            )
+            rows = await cursor.fetchall()
+            return [SavedTaskRow(**dict(r)) for r in rows]
+
+    async def delete(self, user_id: int, slug: str) -> bool:
+        async with aiosqlite.connect(self._path) as db:
+            cursor = await db.execute(
+                "DELETE FROM saved_tasks WHERE user_id = ? AND slug = ?",
+                (user_id, slug),
+            )
+            await db.commit()
+            return (cursor.rowcount or 0) > 0
+
+    async def mark_run(self, user_id: int, slug: str) -> None:
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                UPDATE saved_tasks
+                SET last_run_at = ?, run_count = run_count + 1
+                WHERE user_id = ? AND slug = ?
+                """,
+                (_utcnow(), user_id, slug),
+            )
+            await db.commit()

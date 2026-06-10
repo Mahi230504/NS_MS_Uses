@@ -14,6 +14,7 @@ class SessionState(str, Enum):
     CHOOSING_APP = "choosing_app"
     CHOOSING_TASK = "choosing_task"
     AWAITING_PARAM = "awaiting_param"
+    AWAITING_SAVE_NAME = "awaiting_save_name"  # naming a "save as quick task"
     RUNNING = "running"
 
 

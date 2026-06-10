@@ -36,8 +36,10 @@ DEFAULT_MAX_CANDIDATES = 3
 class IntentKind(str, Enum):
     SINGLE = "single"      # one (app, task, param) — the existing router path
     COMPARE = "compare"    # feature #6 — probe N apps, rank, pick
+    SAVE = "save"          # feature #4 — save the last run as a quick task
+    RUN_SAVED = "run_saved"  # feature #4 — run a saved quick task by name
     UNKNOWN = "unknown"    # nothing matched — fall through to the freeform agent
-    # Reserved for upcoming features (#4/#5): SAVE, RUN_SAVED, SCHEDULE.
+    # Reserved for upcoming feature #5: SCHEDULE.
 
 
 class RankingKey(str, Enum):
@@ -73,11 +75,29 @@ class CompareIntent:
 
 
 @dataclass(frozen=True)
+class SaveIntent:
+    """Save the user's most recent run as a named quick task."""
+
+    name: str
+    kind: IntentKind = field(default=IntentKind.SAVE, init=False)
+
+
+@dataclass(frozen=True)
+class RunSavedIntent:
+    """Run a previously saved quick task by (fuzzy) name."""
+
+    name: str
+    kind: IntentKind = field(default=IntentKind.RUN_SAVED, init=False)
+
+
+@dataclass(frozen=True)
 class UnknownIntent:
     kind: IntentKind = field(default=IntentKind.UNKNOWN, init=False)
 
 
-Intent = Union[SingleIntent, CompareIntent, UnknownIntent]
+Intent = Union[
+    SingleIntent, CompareIntent, SaveIntent, RunSavedIntent, UnknownIntent
+]
 
 
 class _TextCompleter(Protocol):
@@ -95,16 +115,22 @@ Classify the user's message into exactly one intent and extract its fields.
 
 Output JSON ONLY, in this exact shape (no code fences, no prose):
 {
-  "intent": "single" | "compare" | "unknown",
+  "intent": "single" | "compare" | "save" | "run_saved" | "unknown",
   "category": "<groceries|food|mobility|shopping|media|tools|payments> or null",
   "app_ids": ["<id>", ...],
   "task_id": "<id> or null",
   "param": "<string> or null",
   "item": "<string> or null",
-  "ranking_key": "cheapest" | "fastest" | "best" | null
+  "ranking_key": "cheapest" | "fastest" | "best" | null,
+  "name": "<string> or null"
 }
 
 Rules:
+- "save" when the user wants to bookmark the thing they JUST did as a reusable
+  quick task — e.g. "save this as my sunday order", "remember this as morning
+  coffee". Put the chosen label in `name`.
+- "run_saved" when the user wants to run a previously saved quick task by name —
+  e.g. "run my sunday order", "do my morning coffee". Put the name in `name`.
 - "compare" when the user wants to choose between apps by price/time/quality —
   e.g. "cheapest pizza on swiggy or zomato", "compare cab fare on uber and ola",
   "which is cheaper for milk, blinkit or zepto". For compare: fill `category`,
@@ -187,6 +213,18 @@ class IntentClassifier:
             if compare is not None:
                 return compare
             # Not enough comparable apps — treat as a single-app request.
+            return await self._single_or_unknown(text)
+
+        if intent == "save":
+            name = _clean_str(data.get("name"))
+            if name:
+                return SaveIntent(name=name)
+            return await self._single_or_unknown(text)
+
+        if intent == "run_saved":
+            name = _clean_str(data.get("name"))
+            if name:
+                return RunSavedIntent(name=name)
             return await self._single_or_unknown(text)
 
         if intent == "single":

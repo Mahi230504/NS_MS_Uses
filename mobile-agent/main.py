@@ -7,7 +7,7 @@ from pathlib import Path
 
 from agent.comparison import ComparisonEngine
 from agent.orchestrator import Orchestrator
-from agent.persistence import TaskRepository
+from agent.persistence import SavedTaskRepository, TaskRepository
 from agent.profiles import resolve_profile
 from agent.providers import make_provider
 from agent.skills import SkillRegistry
@@ -131,6 +131,7 @@ def main() -> None:
     skills = SkillRegistry(Path(__file__).resolve().parent / "skills")
 
     repo = TaskRepository(settings.db_path)
+    saved_repo = SavedTaskRepository(settings.db_path)
     asyncio.run(repo.initialize())
     recovered = asyncio.run(repo.recover_orphans())
     if recovered:
@@ -186,6 +187,7 @@ def main() -> None:
         router=router_instance,
         classifier=classifier_instance,
         comparison=comparison_engine,
+        saved=saved_repo,
     )
 
     orchestrator.on_approval_request = handlers.on_approval_request
