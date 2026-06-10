@@ -5,13 +5,21 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, ContextTypes
 
 from agent.comparison import ComparisonEngine, ComparisonResult, ProbeTarget
 from agent.orchestrator import Orchestrator
-from agent.persistence import SavedTaskRepository, SavedTaskRow, TaskRepository
+from agent.persistence import (
+    SavedTaskRepository,
+    SavedTaskRow,
+    ScheduleRepository,
+    ScheduleRow,
+    TaskRepository,
+)
 from agent.state_machine import Task, TaskState
 from bot.apps import (
     APPS,
@@ -26,10 +34,12 @@ from bot.intent import (
     IntentClassifier,
     RunSavedIntent,
     SaveIntent,
+    ScheduleIntent,
     SingleIntent,
 )
 from bot.pairing import PairCodeIssuer
 from bot.router import Route, Router
+from bot.scheduler import build_schedule_spec, describe_schedule
 from bot.session import Session, SessionState, SessionStore
 from bot.users import UserPolicy, UserRecord, UserStore
 from security.hitl_gate import HitlGate
@@ -53,6 +63,10 @@ _COMPARISON_TTL_SECONDS = 600
 # order. Used to pick which task to run when the user selects an app from a
 # comparison (groceries/food -> order, shopping -> search, mobility -> book).
 _ORDER_TASK_PRIORITY = ("order", "book", "search", "play", "nav", "recharge")
+
+# How long an unattended scheduled run waits at a cart/payment HITL gate before
+# giving up (stop-at-cart default: nothing is paid if no one approves in time).
+_SCHEDULED_APPROVAL_TIMEOUT_SECONDS = 600.0
 
 # Wake-word prefixes the trigger client (AutoVoice "Atlas") prepends to every
 # spoken task. We strip them here so the router prompt sees just the command
@@ -146,6 +160,8 @@ class Handlers:
         classifier: IntentClassifier | None = None,
         comparison: ComparisonEngine | None = None,
         saved: SavedTaskRepository | None = None,
+        schedules: ScheduleRepository | None = None,
+        timezone_name: str = "Asia/Kolkata",
     ) -> None:
         self._app = application
         self._orch = orchestrator
@@ -161,6 +177,9 @@ class Handlers:
         self._comparison = comparison
         # Saved quick tasks (#4). None disables save/run-saved.
         self._saved = saved
+        # Recurring/scheduled tasks (#5). None disables scheduling.
+        self._schedules = schedules
+        self._tz = timezone_name
         self._sessions = SessionStore()
         self._running: dict[int, asyncio.Task] = {}
         # External-trigger proposals awaiting a spoken yes/no, keyed by user.
@@ -262,6 +281,11 @@ class Handlers:
             intent = await self._classifier.classify(text)
             if isinstance(intent, CompareIntent):
                 await self._launch_comparison(update.message, user.id, intent)
+                return
+            if isinstance(intent, ScheduleIntent):
+                await update.message.reply_text(
+                    await self._create_schedule_core(user.id, intent)
+                )
                 return
             if isinstance(intent, SaveIntent):
                 await update.message.reply_text(
@@ -509,16 +533,22 @@ class Handlers:
         launch_package: str | None = None,
         last_run: "_LastRun | None" = None,
         offer_save: bool = True,
+        approval_timeout: float | None = None,
     ) -> asyncio.Task:
         """Launch a single-app task, remember it, and (on success) offer to save.
 
         Centralizes the create_task + _running bookkeeping so every single-app
         launch captures `_last_run` (for "save this") and, unless suppressed,
         attaches a done-callback that offers a one-tap save when the run
-        finishes successfully.
+        finishes successfully. `approval_timeout` bounds the HITL wait for
+        unattended scheduled runs (None = wait indefinitely, the interactive
+        default).
         """
         fut = asyncio.create_task(
-            self._orch.run_task(task, launch_package=launch_package)
+            self._orch.run_task(
+                task, launch_package=launch_package,
+                approval_timeout=approval_timeout,
+            )
         )
         self._running[user_id] = fut
         if last_run is not None:
@@ -648,6 +678,105 @@ class Handlers:
                 app_id=row.app_id, task_id=row.task_id, param=row.param,
             ),
             offer_save=False,  # already saved
+        )
+
+    # ------------------------------------------------------------------
+    # Scheduled / recurring tasks (feature #5)
+
+    async def _notify(self, user_id: int, text: str) -> None:
+        """Best-effort Telegram message (used by background flows)."""
+        try:
+            await self._app.bot.send_message(chat_id=user_id, text=text)
+        except Exception:
+            pass
+
+    async def launch_scheduled(self, row: ScheduleRow) -> bool:
+        """Run a due scheduled task — the Scheduler's launcher callback.
+
+        Inherits the one-task-per-user guard: if a task is already running the
+        fire is SKIPPED and noted, never queued (single device; a stale order
+        could be wrong). Honors the schedule's pay_automatically flag and a
+        bounded HITL window so an unattended run can't hang or pay without
+        authorization.
+        """
+        user_id = row.user_id
+        if not self._is_paired(user_id):
+            return False
+        if self._has_running_task(user_id):
+            await self._notify(
+                user_id,
+                f'⏰ Skipped scheduled "{row.name}" — another task is running.',
+            )
+            return False
+        app = get_app(row.app_id) if row.app_id else None
+        task_tpl = get_task(app, row.task_id) if (app and row.task_id) else None
+        if app is not None and task_tpl is not None:
+            description = render_prompt(task_tpl.template, row.param)
+            launch_package = app.package
+        else:
+            description = row.raw_description
+            launch_package = row.launch_package
+        task = Task(user_id=user_id, description=description)
+        if row.pay_automatically:
+            task.auto_approve_payment = True
+        sess = self._sessions.get(user_id)
+        sess.state = SessionState.RUNNING
+        sess.app_id = row.app_id
+        sess.task_id = row.task_id
+        mode = "auto-pay" if row.pay_automatically else "stops at cart"
+        await self._notify(
+            user_id, f'⏰ Running scheduled "{row.name}" ({mode}): {description}'
+        )
+        self._spawn_task(
+            user_id, task, launch_package=launch_package,
+            last_run=_LastRun(
+                description=description, launch_package=launch_package,
+                app_id=row.app_id, task_id=row.task_id, param=row.param,
+            ),
+            offer_save=False,
+            approval_timeout=_SCHEDULED_APPROVAL_TIMEOUT_SECONDS,
+        )
+        return True
+
+    async def _create_schedule_core(
+        self, user_id: int, intent: ScheduleIntent
+    ) -> str:
+        """Validate + persist a schedule from a ScheduleIntent; return a line."""
+        if self._schedules is None:
+            return "Scheduling isn't enabled."
+        spec = build_schedule_spec(
+            freq=intent.freq, time_str=intent.time_str, tz=self._tz,
+            now=datetime.now(timezone.utc),
+            weekday_name=intent.weekday_name, day_of_month=intent.day_of_month,
+        )
+        if spec is None:
+            return (
+                "I couldn't understand that schedule. Try e.g. "
+                '"order milk on blinkit every day at 9am".'
+            )
+        route = intent.route
+        description = render_prompt(route.task.template, route.param)
+        name = intent.name or f"{route.app.name}: {route.task.label}"
+        sid = await self._schedules.insert(
+            user_id=user_id, name=name, freq=intent.freq,
+            at_minute=spec["at_minute"], tz=self._tz,
+            raw_description=description, next_run_at=spec["next_run_at"],
+            weekday=spec["weekday"], day_of_month=spec["day_of_month"],
+            app_id=route.app.id, task_id=route.task.id, param=route.param,
+            launch_package=route.app.package,
+            pay_automatically=intent.pay_automatically,
+        )
+        phrase = describe_schedule(
+            intent.freq, spec["at_minute"], spec["weekday"], spec["day_of_month"]
+        )
+        pay = (
+            " It will pay automatically."
+            if intent.pay_automatically
+            else " It will stop at the cart for your approval."
+        )
+        return (
+            f'📅 Scheduled "{name}" {phrase} (#{sid}). '
+            f"Next run: {_fmt_local(spec['next_run_at'], self._tz)}.{pay}"
         )
 
     # ------------------------------------------------------------------
@@ -866,6 +995,9 @@ class Handlers:
                     f"Got it — compare {intent.item} on {names}. "
                     "I'll show the result on Telegram. Confirm?"
                 )
+            if isinstance(intent, ScheduleIntent):
+                # Creating a schedule touches no device state — do it now.
+                return await self._create_schedule_core(user_id, intent)
             if isinstance(intent, SaveIntent):
                 # Saving touches no device state — do it immediately, no confirm.
                 return await self._save_last_run_core(user_id, intent.name)
@@ -1067,6 +1199,83 @@ class Handlers:
             return
         await self._saved.delete(user.id, row.slug)
         await update.message.reply_text(f'Forgot "{row.label}".')
+
+    # ------------------------------------------------------------------
+    # Schedule commands (feature #5)
+
+    async def schedule_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if update.message is None or user is None:
+            return
+        if not self._is_paired(user.id):
+            return
+        if self._classifier is None or self._schedules is None:
+            await update.message.reply_text("Scheduling isn't enabled.")
+            return
+        text = " ".join(context.args or []).strip()
+        if not text:
+            await update.message.reply_text(
+                "Usage: /schedule <task> <when>\n"
+                "E.g. /schedule order milk on blinkit every day at 9am"
+            )
+            return
+        intent = await self._classifier.classify(text)
+        if not isinstance(intent, ScheduleIntent):
+            await update.message.reply_text(
+                "I couldn't parse a schedule from that. Include a task and a "
+                'time, e.g. "order milk on blinkit every day at 9am".'
+            )
+            return
+        await update.message.reply_text(
+            await self._create_schedule_core(user.id, intent)
+        )
+
+    async def list_schedules(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if update.message is None or user is None:
+            return
+        if not self._is_paired(user.id):
+            return
+        if self._schedules is None:
+            await update.message.reply_text("Scheduling isn't enabled.")
+            return
+        rows = await self._schedules.list_for(user.id)
+        if not rows:
+            await update.message.reply_text(
+                "No schedules yet. Create one with /schedule or just say "
+                '"order milk on blinkit every day at 9am".'
+            )
+            return
+        lines = ["Your schedules:"]
+        for r in rows:
+            phrase = describe_schedule(r.freq, r.at_minute, r.weekday, r.day_of_month)
+            off = "" if r.enabled else " (off)"
+            pay = " · auto-pay" if r.pay_automatically else ""
+            lines.append(
+                f"#{r.id} {r.name} — {phrase}{pay}{off}\n"
+                f"    next: {_fmt_local(r.next_run_at, self._tz)}  ·  /unschedule {r.id}"
+            )
+        await update.message.reply_text("\n".join(lines))
+
+    async def unschedule(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if update.message is None or user is None:
+            return
+        if not self._is_paired(user.id) or self._schedules is None:
+            return
+        args = context.args or []
+        if not args:
+            await update.message.reply_text("Usage: /unschedule <id> (see /schedules)")
+            return
+        try:
+            sid = int(args[0])
+        except ValueError:
+            await update.message.reply_text("The id must be a number — see /schedules.")
+            return
+        removed = await self._schedules.delete(user.id, sid)
+        await update.message.reply_text(
+            f"Removed schedule #{sid}." if removed else f"No schedule #{sid}."
+        )
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -1277,6 +1486,18 @@ def _slugify(name: str) -> str:
     """Lowercase, hyphenated slug for a saved-task name (e.g. 'Sunday order'
     -> 'sunday-order'). Empty when the name has no alphanumerics."""
     return re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+
+
+def _fmt_local(iso_utc: str, tz: str) -> str:
+    """Render a UTC ISO timestamp in the user's local tz for confirmations."""
+    try:
+        return (
+            datetime.fromisoformat(iso_utc)
+            .astimezone(ZoneInfo(tz))
+            .strftime("%a %d %b, %H:%M")
+        )
+    except Exception:
+        return iso_utc
 
 
 def _ranking_label(ranking_key: str) -> str:

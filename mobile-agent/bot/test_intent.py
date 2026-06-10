@@ -9,6 +9,7 @@ from bot.intent import (
     RankingKey,
     RunSavedIntent,
     SaveIntent,
+    ScheduleIntent,
     SingleIntent,
     UnknownIntent,
 )
@@ -167,6 +168,37 @@ class TestSaveAndRunSaved:
     async def test_save_without_name_degrades(self) -> None:
         c = _classifier('{"intent":"save","name":null}')
         assert not isinstance(await c.classify("save this"), SaveIntent)
+
+
+class TestScheduleIntent:
+    async def test_schedule_daily(self) -> None:
+        c = _classifier(
+            '{"intent":"schedule","app_ids":["blinkit"],"task_id":"order",'
+            '"param":"milk","schedule_freq":"daily","schedule_time":"09:00",'
+            '"pay_automatically":false}'
+        )
+        r = await c.classify("order milk on blinkit every day at 9am")
+        assert isinstance(r, ScheduleIntent)
+        assert r.freq == "daily" and r.time_str == "09:00"
+        assert r.route.app.id == "blinkit" and r.route.param == "milk"
+        assert r.pay_automatically is False
+
+    async def test_schedule_weekly_with_pay(self) -> None:
+        c = _classifier(
+            '{"intent":"schedule","app_ids":["zepto"],"task_id":"order",'
+            '"param":"groceries","schedule_freq":"weekly","schedule_time":"09:00",'
+            '"schedule_weekday":"sunday","pay_automatically":true}'
+        )
+        r = await c.classify("every sunday 9am reorder groceries on zepto and pay")
+        assert isinstance(r, ScheduleIntent)
+        assert r.weekday_name == "sunday" and r.pay_automatically is True
+
+    async def test_schedule_unresolvable_task_degrades(self) -> None:
+        c = _classifier(
+            '{"intent":"schedule","app_ids":[],"schedule_freq":"daily",'
+            '"schedule_time":"09:00"}'
+        )
+        assert not isinstance(await c.classify("schedule something"), ScheduleIntent)
 
 
 class TestRankingKey:

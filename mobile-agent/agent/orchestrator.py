@@ -167,6 +167,15 @@ _PAYMENT_FLOW_RE = re.compile(
     r"\b(payment|pay\s+now|place\s+order|proceed\s+to\s+(payment|checkout))\b",
     re.IGNORECASE,
 )
+# Sensitive categories that must NEVER auto-grant, even for an unattended
+# scheduled run that opted into auto-pay. These still require a human (and will
+# time out safely under the bounded approval window). Used by _gate_with_hitl's
+# auto_approve_payment branch.
+_NON_AUTOPAY_RE = re.compile(
+    r"\b(otp|verification\s+code|verify\s+(otp|pin|code)|2fa|two-factor|"
+    r"no\s+payment\s+method|permission|delete|uninstall|factory\s+reset)\b",
+    re.IGNORECASE,
+)
 # Text/desc tokens that indicate the current screen IS the cart-review
 # screen — used to validate that "Cart review" need_approval reasons are
 # emitted at the right moment, not while still on search-results. Any one
@@ -437,6 +446,11 @@ class Orchestrator:
         # COMMERCE shopping rules. Set per-run by run_task(read_only=...);
         # defaults False so ordinary order runs are byte-identical.
         self._read_only: bool = False
+        # Bounded wait for HITL approval (seconds), set per-run by run_task for
+        # unattended scheduled tasks. None = wait indefinitely (interactive
+        # default — byte-identical to before). On timeout, wait_for_approval
+        # returns False and the task fails safely (nothing paid unattended).
+        self._approval_timeout: float | None = None
 
     def get_task(self, user_id: int) -> Task | None:
         return self._tasks.get(user_id)
@@ -447,6 +461,7 @@ class Orchestrator:
         *,
         launch_package: str | None = None,
         read_only: bool = False,
+        approval_timeout: float | None = None,
     ) -> Task:
         self._tasks[task.user_id] = task
         self._last_step_status_at = 0.0
@@ -466,6 +481,7 @@ class Orchestrator:
         self._task_tree_ever_seen = False
         self._consecutive_stale_tree = 0
         self._read_only = read_only
+        self._approval_timeout = approval_timeout
         task.state = TaskState.RUNNING
         await self._persist_insert(task)
         await self._status(task, f"starting: {task.description}")
@@ -2010,6 +2026,28 @@ class Orchestrator:
             )
             return
 
+        # Unattended scheduled auto-pay (#5): the schedule opted into paying
+        # automatically, so auto-grant the cart-review AND payment gates to let
+        # the order complete with nobody watching Telegram. NEVER auto-grants
+        # OTP / permission / delete / "no payment method" — those still require
+        # a human and will hit the bounded wait below and time out safely.
+        if (
+            task.auto_approve_payment
+            and action.get("action") == "need_approval"
+            and (
+                _CART_REVIEW_RE.search(reason_text)
+                or _PAYMENT_FLOW_RE.search(payment_haystack)
+            )
+            and not _NON_AUTOPAY_RE.search(payment_haystack)
+        ):
+            if _CART_REVIEW_RE.search(reason_text):
+                task.payment_pre_approved = True
+            self._audit.log_action(
+                task.user_id, task.description, action,
+                "AUTO_APPROVED: scheduled auto-pay (cart/payment)",
+            )
+            return
+
         # If the model emits need_approval shortly after a loop hint was
         # injected, it's *usually* using approval as a give-up escape hatch
         # rather than a genuine sensitive-action gate. EXCEPTION: a
@@ -2046,12 +2084,19 @@ class Orchestrator:
             task.user_id, task.description, action, "AWAITING_APPROVAL"
         )
         await self._request_approval(task, action)
-        approved = await self._hitl.wait_for_approval(task.user_id)
+        approved = await self._hitl.wait_for_approval(
+            task.user_id, timeout=self._approval_timeout
+        )
         if not approved:
             self._audit.log_action(
                 task.user_id, task.description, action, "DENIED"
             )
-            raise OrchestratorError("user denied approval")
+            raise OrchestratorError(
+                "approval not granted (denied or timed out); nothing was "
+                "paid — cart left for review"
+                if self._approval_timeout is not None
+                else "user denied approval"
+            )
         # If the user just approved a Cart-review need_approval, latch the
         # combined-approval flag so the downstream Pay Now / Place Order
         # gate auto-grants. The prompt instructs the model to phrase the

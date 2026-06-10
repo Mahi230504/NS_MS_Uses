@@ -38,8 +38,8 @@ class IntentKind(str, Enum):
     COMPARE = "compare"    # feature #6 — probe N apps, rank, pick
     SAVE = "save"          # feature #4 — save the last run as a quick task
     RUN_SAVED = "run_saved"  # feature #4 — run a saved quick task by name
+    SCHEDULE = "schedule"  # feature #5 — schedule a recurring/one-shot task
     UNKNOWN = "unknown"    # nothing matched — fall through to the freeform agent
-    # Reserved for upcoming feature #5: SCHEDULE.
 
 
 class RankingKey(str, Enum):
@@ -91,12 +91,27 @@ class RunSavedIntent:
 
 
 @dataclass(frozen=True)
+class ScheduleIntent:
+    """Schedule a (resolved single-app) task to run on a recurrence."""
+
+    route: Route                  # the task to run when it fires
+    freq: str                     # once | daily | weekly | monthly
+    time_str: str                 # "HH:MM" local
+    weekday_name: str | None = None
+    day_of_month: int | None = None
+    pay_automatically: bool = False
+    name: str | None = None
+    kind: IntentKind = field(default=IntentKind.SCHEDULE, init=False)
+
+
+@dataclass(frozen=True)
 class UnknownIntent:
     kind: IntentKind = field(default=IntentKind.UNKNOWN, init=False)
 
 
 Intent = Union[
-    SingleIntent, CompareIntent, SaveIntent, RunSavedIntent, UnknownIntent
+    SingleIntent, CompareIntent, SaveIntent, RunSavedIntent,
+    ScheduleIntent, UnknownIntent,
 ]
 
 
@@ -122,10 +137,23 @@ Output JSON ONLY, in this exact shape (no code fences, no prose):
   "param": "<string> or null",
   "item": "<string> or null",
   "ranking_key": "cheapest" | "fastest" | "best" | null,
-  "name": "<string> or null"
+  "name": "<string> or null",
+  "schedule_freq": "once" | "daily" | "weekly" | "monthly" | null,
+  "schedule_time": "<HH:MM 24h local> or null",
+  "schedule_weekday": "monday".."sunday" | null,
+  "schedule_day_of_month": <1-31> | null,
+  "pay_automatically": true | false | null
 }
 
 Rules:
+- "schedule" when the user wants a task to run automatically later or on a
+  repeating schedule — e.g. "order milk on blinkit every day at 9am", "every
+  sunday 9am reorder groceries on zepto", "recharge my number on the 1st each
+  month". Fill the task fields (`app_ids`=[one], `task_id`, `param`) AND the
+  schedule_* fields: schedule_freq, schedule_time (24h HH:MM), and
+  schedule_weekday (weekly) / schedule_day_of_month (monthly). Set
+  pay_automatically=true ONLY if the user explicitly said to pay/charge
+  automatically; otherwise false.
 - "save" when the user wants to bookmark the thing they JUST did as a reusable
   quick task — e.g. "save this as my sunday order", "remember this as morning
   coffee". Put the chosen label in `name`.
@@ -227,6 +255,12 @@ class IntentClassifier:
                 return RunSavedIntent(name=name)
             return await self._single_or_unknown(text)
 
+        if intent == "schedule":
+            sched = self._build_schedule(data)
+            if sched is not None:
+                return sched
+            return await self._single_or_unknown(text)
+
         if intent == "single":
             single = self._build_single(data)
             if single is not None:
@@ -282,6 +316,29 @@ class IntentClassifier:
                 if app not in ordered:
                     ordered.append(app)
         return tuple(ordered[: self._max_candidates])
+
+    def _build_schedule(self, data: dict) -> ScheduleIntent | None:
+        single = self._build_single(data)
+        if single is None:
+            return None  # can't schedule a task we can't resolve
+        freq = _clean_str(data.get("schedule_freq"))
+        time_str = _clean_str(data.get("schedule_time"))
+        if not freq or not time_str:
+            return None
+        dom_raw = data.get("schedule_day_of_month")
+        try:
+            dom = int(dom_raw) if dom_raw is not None else None
+        except (TypeError, ValueError):
+            dom = None
+        return ScheduleIntent(
+            route=single.route,
+            freq=freq.lower(),
+            time_str=time_str,
+            weekday_name=_clean_str(data.get("schedule_weekday")),
+            day_of_month=dom,
+            pay_automatically=bool(data.get("pay_automatically")),
+            name=_clean_str(data.get("name")),
+        )
 
     def _build_single(self, data: dict) -> SingleIntent | None:
         app_ids = data.get("app_ids")

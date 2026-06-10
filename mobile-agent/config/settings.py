@@ -53,6 +53,9 @@ class Settings:
     # latency. Only used when the provider supports text completion (router/
     # classifier path).
     comparison_max_candidates: int
+    # IANA timezone the user's schedules (#5) are expressed in. Local wall-clock
+    # ("every day at 9am") is interpreted in this tz and stored as absolute UTC.
+    timezone: str
 
 
 def _resolve_config_dir() -> Path:
@@ -186,6 +189,14 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
         raise RuntimeError(f"COMPARISON_MAX_CANDIDATES must be an integer: {e}")
     comparison_max_candidates = max(2, comparison_max_candidates)
 
+    tz_name = os.environ.get("TIMEZONE", "Asia/Kolkata").strip() or "Asia/Kolkata"
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(tz_name)  # validate early — bad tz fails fast, not at fire-time
+    except Exception as e:
+        raise RuntimeError(f"TIMEZONE {tz_name!r} is not a valid IANA zone: {e}")
+
     # Opt-in override of the emulator-only safety rule. Set to "1" / "true" /
     # "yes" to run on a physical device. Leave empty (default) to refuse.
     allow_physical = os.environ.get("ALLOW_PHYSICAL_DEVICE", "").strip().lower() in (
@@ -224,4 +235,5 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
         webhook_host=webhook_host,
         webhook_port=webhook_port,
         comparison_max_candidates=comparison_max_candidates,
+        timezone=tz_name,
     )

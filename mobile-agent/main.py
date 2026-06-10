@@ -7,7 +7,11 @@ from pathlib import Path
 
 from agent.comparison import ComparisonEngine
 from agent.orchestrator import Orchestrator
-from agent.persistence import SavedTaskRepository, TaskRepository
+from agent.persistence import (
+    SavedTaskRepository,
+    ScheduleRepository,
+    TaskRepository,
+)
 from agent.profiles import resolve_profile
 from agent.providers import make_provider
 from agent.skills import SkillRegistry
@@ -15,6 +19,7 @@ from bot.handlers import Handlers
 from bot.intent import IntentClassifier
 from bot.pairing import PairCodeIssuer
 from bot.router import Router
+from bot.scheduler import Scheduler
 from bot.telegram_bot import build_application, register_handlers
 from bot.users import UserPolicy, UserStore
 from config.settings import load_settings
@@ -132,6 +137,7 @@ def main() -> None:
 
     repo = TaskRepository(settings.db_path)
     saved_repo = SavedTaskRepository(settings.db_path)
+    schedule_repo = ScheduleRepository(settings.db_path)
     asyncio.run(repo.initialize())
     recovered = asyncio.run(repo.recover_orphans())
     if recovered:
@@ -188,6 +194,8 @@ def main() -> None:
         classifier=classifier_instance,
         comparison=comparison_engine,
         saved=saved_repo,
+        schedules=schedule_repo,
+        timezone_name=settings.timezone,
     )
 
     orchestrator.on_approval_request = handlers.on_approval_request
@@ -195,7 +203,10 @@ def main() -> None:
 
     register_handlers(app, handlers)
 
-    _wire_webhook(app, handlers, settings, adb)
+    # Recurring-task scheduler: a minute-resolution async loop started on the
+    # bot's own event loop (post_init). Restart-safe — SQLite holds all state.
+    scheduler = Scheduler(schedule_repo, handlers.launch_scheduled)
+    _wire_startup(app, handlers, settings, adb, scheduler)
 
     # bootstrap_retries: on a throttled link the first getMe can still time
     # out even with the bumped timeouts; retry a handful of times (with PTB's
@@ -203,26 +214,32 @@ def main() -> None:
     app.run_polling(bootstrap_retries=5)
 
 
-def _wire_webhook(app, handlers, settings, adb) -> None:
-    """Start an aiohttp trigger server alongside polling, if configured.
+def _wire_startup(app, handlers, settings, adb, scheduler) -> None:
+    """Start background services on the bot's event loop (post_init/shutdown).
 
-    Runs inside Telegram's own event loop via post_init / post_shutdown so we
-    don't spawn a second loop. No-op unless WEBHOOK_SECRET is set.
+    Always starts the recurring-task scheduler; additionally starts the aiohttp
+    trigger webhook when WEBHOOK_SECRET (+ an owner) is configured. Both run
+    inside Telegram's own event loop — no second loop — so the scheduler can
+    reuse the handlers' one-task-per-user guard and the webhook can tap the
+    same handlers.
     """
-    if not settings.webhook_secret:
-        return
-    if settings.webhook_owner_user_id is None:
+    webhook_enabled = bool(settings.webhook_secret)
+    if webhook_enabled and settings.webhook_owner_user_id is None:
         log.warning(
             "WEBHOOK_SECRET is set but no owner resolved "
             "(set WEBHOOK_OWNER_USER_ID or TELEGRAM_ADMIN_ID). Webhook disabled."
         )
-        return
-
-    from aiohttp import web
-
-    from bot.webhook import build_webhook_app
+        webhook_enabled = False
 
     async def _start(application) -> None:
+        if scheduler is not None:
+            await scheduler.start()
+        if not webhook_enabled:
+            return
+        from aiohttp import web
+
+        from bot.webhook import build_webhook_app
+
         # Tunnel the device's localhost:<port> to ours over USB so an
         # on-device trigger reaches the webhook with nothing on the network.
         if await adb.reverse_tcp(settings.webhook_port):
@@ -249,6 +266,8 @@ def _wire_webhook(app, handlers, settings, adb) -> None:
         )
 
     async def _stop(application) -> None:
+        if scheduler is not None:
+            await scheduler.stop()
         runner = application.bot_data.get("_webhook_runner")
         if runner is not None:
             await runner.cleanup()

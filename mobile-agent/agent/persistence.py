@@ -80,6 +80,31 @@ CREATE TABLE IF NOT EXISTS saved_tasks (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_user_slug
     ON saved_tasks (user_id, slug);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    freq TEXT NOT NULL,             -- once | daily | weekly | monthly
+    at_minute INTEGER NOT NULL,     -- local minutes since midnight (0..1439)
+    weekday INTEGER,                -- 0=Mon..6=Sun (weekly)
+    day_of_month INTEGER,           -- 1..31 (monthly)
+    tz TEXT NOT NULL,               -- IANA tz the recurrence is expressed in
+    app_id TEXT,
+    task_id TEXT,
+    param TEXT,
+    raw_description TEXT NOT NULL,
+    launch_package TEXT,
+    pay_automatically INTEGER NOT NULL DEFAULT 0,
+    next_run_at TEXT NOT NULL,      -- absolute UTC ISO timestamp
+    last_run_at TEXT,
+    last_state TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sched_due
+    ON schedules (enabled, next_run_at);
 """
 
 # Terminal states — used to flag what counts as a "still-running" orphan at
@@ -158,6 +183,29 @@ class SavedTaskRow:
     created_at: str
     last_run_at: str | None
     run_count: int
+
+
+@dataclass(frozen=True)
+class ScheduleRow:
+    id: int
+    user_id: int
+    name: str
+    freq: str
+    at_minute: int
+    weekday: int | None
+    day_of_month: int | None
+    tz: str
+    app_id: str | None
+    task_id: str | None
+    param: str | None
+    raw_description: str
+    launch_package: str | None
+    pay_automatically: int
+    next_run_at: str
+    last_run_at: str | None
+    last_state: str | None
+    enabled: int
+    created_at: str
 
 
 class TaskRepository:
@@ -438,5 +486,125 @@ class SavedTaskRepository:
                 WHERE user_id = ? AND slug = ?
                 """,
                 (_utcnow(), user_id, slug),
+            )
+            await db.commit()
+
+
+class ScheduleRepository:
+    """Async DAO for recurring/scheduled tasks (feature #5).
+
+    Shares the SQLite file with TaskRepository (schema in _SCHEMA). `next_run_at`
+    is an absolute UTC ISO timestamp and is the dispatch key — the scheduler
+    polls `list_due` and advances it after each fire.
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._path = db_path
+
+    async def insert(
+        self,
+        *,
+        user_id: int,
+        name: str,
+        freq: str,
+        at_minute: int,
+        tz: str,
+        raw_description: str,
+        next_run_at: str,
+        weekday: int | None = None,
+        day_of_month: int | None = None,
+        app_id: str | None = None,
+        task_id: str | None = None,
+        param: str | None = None,
+        launch_package: str | None = None,
+        pay_automatically: bool = False,
+    ) -> int:
+        async with aiosqlite.connect(self._path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO schedules
+                    (user_id, name, freq, at_minute, weekday, day_of_month, tz,
+                     app_id, task_id, param, raw_description, launch_package,
+                     pay_automatically, next_run_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id, name, freq, at_minute, weekday, day_of_month, tz,
+                    app_id, task_id, param, raw_description, launch_package,
+                    1 if pay_automatically else 0, next_run_at, _utcnow(),
+                ),
+            )
+            await db.commit()
+            return cursor.lastrowid  # type: ignore[return-value]
+
+    async def list_for(self, user_id: int) -> list[ScheduleRow]:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM schedules
+                WHERE user_id = ?
+                ORDER BY enabled DESC, next_run_at ASC
+                """,
+                (user_id,),
+            )
+            return [ScheduleRow(**dict(r)) for r in await cursor.fetchall()]
+
+    async def list_due(self, now_utc_iso: str) -> list[ScheduleRow]:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM schedules
+                WHERE enabled = 1 AND next_run_at <= ?
+                ORDER BY next_run_at ASC
+                """,
+                (now_utc_iso,),
+            )
+            return [ScheduleRow(**dict(r)) for r in await cursor.fetchall()]
+
+    async def get(self, schedule_id: int) -> ScheduleRow | None:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM schedules WHERE id = ?", (schedule_id,)
+            )
+            row = await cursor.fetchone()
+            return ScheduleRow(**dict(row)) if row else None
+
+    async def delete(self, user_id: int, schedule_id: int) -> bool:
+        async with aiosqlite.connect(self._path) as db:
+            cursor = await db.execute(
+                "DELETE FROM schedules WHERE user_id = ? AND id = ?",
+                (user_id, schedule_id),
+            )
+            await db.commit()
+            return (cursor.rowcount or 0) > 0
+
+    async def advance(
+        self,
+        schedule_id: int,
+        *,
+        next_run_at: str,
+        last_run_at: str,
+        enabled: bool = True,
+    ) -> None:
+        """Move a schedule forward after it fires (or disable a one-shot)."""
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                UPDATE schedules
+                SET next_run_at = ?, last_run_at = ?, enabled = ?
+                WHERE id = ?
+                """,
+                (next_run_at, last_run_at, 1 if enabled else 0, schedule_id),
+            )
+            await db.commit()
+
+    async def set_last_state(self, schedule_id: int, state: str) -> None:
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                "UPDATE schedules SET last_state = ? WHERE id = ?",
+                (state, schedule_id),
             )
             await db.commit()
