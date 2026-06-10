@@ -386,6 +386,7 @@ class Orchestrator:
         enable_vision_hitl: bool = False,
         artifact_dir: Path | None = None,
         profile_resolver: ProfileResolver | None = None,
+        event_bus=None,
     ) -> None:
         self._adb = adb
         self._hitl = hitl
@@ -401,6 +402,11 @@ class Orchestrator:
         # the shopping validators accordingly. Without one (tests / ad-hoc),
         # `_active_profile` stays COMMERCE so behaviour is unchanged.
         self._profile_resolver = profile_resolver
+        # Optional in-process event bus (bot.events.EventBus). When set, each
+        # step/state is published to dashboard SSE subscribers — IN ADDITION to
+        # the Telegram status path, and un-throttled (the dashboard gets every
+        # step). None in tests / when the dashboard is disabled.
+        self._event_bus = event_bus
         self._active_profile: AppProfile = COMMERCE
         # Root directory for per-task screenshot+UI-dump+action artifacts.
         # None disables persistence (used by unit tests). When set, every
@@ -482,9 +488,17 @@ class Orchestrator:
         self._consecutive_stale_tree = 0
         self._read_only = read_only
         self._approval_timeout = approval_timeout
+        # Attribution + replay metadata for the dashboard (persisted at insert).
+        task.launch_package = launch_package
+        task.artifact_dir = (
+            str(self._current_task_artifact_dir)
+            if self._current_task_artifact_dir is not None
+            else None
+        )
         task.state = TaskState.RUNNING
         await self._persist_insert(task)
         await self._status(task, f"starting: {task.description}")
+        self._emit_state(task)
         # Wake the screen before anything else. A sleeping display returns
         # all-black screenshots, on which the model can only ever emit "wait"
         # — a live run wasted its whole session that way after the device dozed
@@ -550,6 +564,7 @@ class Orchestrator:
             except Exception:
                 pass
         await self._persist_update(task)
+        self._emit_state(task)
         return task
 
     async def _loop(self, task: Task) -> None:
@@ -681,6 +696,10 @@ class Orchestrator:
                     task.step_count, screenshot, ui_xml, action,
                     "(pending)", ui_prompt=ui_tree,
                 )
+                # Stream the intended action + its screenshot to the dashboard
+                # BEFORE we decide to execute/reject it (the file is on disk, so
+                # the screenshot URL is already valid). Un-throttled.
+                self._emit_step(task, action, "(pending)", phase="pending")
 
             # Consecutive-wait cap: a model that keeps waiting on a screen that
             # never changes (frozen app, or a sleeping/blank display) makes no
@@ -1078,6 +1097,7 @@ class Orchestrator:
             )
             await self._persist_step(task, action, result)
             self._finalize_step_result(task.step_count, action, result)
+            self._emit_step(task, action, result, phase="final")
             note = str(action.get("note", "")).strip()
             status_msg = (
                 f"step {task.step_count}: {result} — {note}"
@@ -2267,6 +2287,71 @@ class Orchestrator:
             return sub
         except OSError:
             return None
+
+    def _emit_step(self, task: Task, action: dict, result: str, *, phase: str) -> None:
+        """Publish a per-step event to the dashboard event bus (best-effort).
+
+        Sync + non-blocking (the bus's publish never awaits/raises), so it can
+        never stall the agent loop. No-op when no bus is wired.
+        """
+        if self._event_bus is None:
+            return
+        a = action or {}
+        atype = a.get("action")
+        coords: dict = {}
+        if atype == "tap":
+            coords["tap"] = {"x": a.get("x"), "y": a.get("y")}
+        elif atype == "swipe":
+            coords["swipe"] = {k: a.get(k) for k in ("x1", "y1", "x2", "y2")}
+        elif atype == "type":
+            coords["text"] = a.get("text")
+        db_id = self._current_task_db_id
+        screenshot_url = (
+            f"/api/tasks/{db_id}/steps/{task.step_count}/screenshot"
+            if db_id is not None
+            else None
+        )
+        try:
+            self._event_bus.publish({
+                "type": "step",
+                "task_id": db_id,
+                "user_id": task.user_id,
+                "step": task.step_count,
+                "phase": phase,
+                "action_type": atype,
+                "note": str(a.get("note", "")),
+                "coords": coords,
+                "result": result,
+                "rejected": isinstance(result, str) and result.startswith("REJECTED"),
+                "state": task.state.value,
+                "screenshot_url": screenshot_url,
+                "tokens": {
+                    "in": task.total_input_tokens,
+                    "out": task.total_output_tokens,
+                },
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception:
+            pass
+
+    def _emit_state(self, task: Task) -> None:
+        """Publish a task lifecycle (state) event to the dashboard bus."""
+        if self._event_bus is None:
+            return
+        try:
+            self._event_bus.publish({
+                "type": "state",
+                "task_id": self._current_task_db_id,
+                "user_id": task.user_id,
+                "state": task.state.value,
+                "step": task.step_count,
+                "description": task.description,
+                "final_summary": task.final_summary,
+                "failure_reason": task.failure_reason,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception:
+            pass
 
     def _finalize_step_result(
         self, step: int, action: dict | None, result: str

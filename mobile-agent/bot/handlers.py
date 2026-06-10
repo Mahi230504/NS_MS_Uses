@@ -162,6 +162,7 @@ class Handlers:
         saved: SavedTaskRepository | None = None,
         schedules: ScheduleRepository | None = None,
         timezone_name: str = "Asia/Kolkata",
+        event_bus=None,
     ) -> None:
         self._app = application
         self._orch = orchestrator
@@ -180,6 +181,8 @@ class Handlers:
         # Recurring/scheduled tasks (#5). None disables scheduling.
         self._schedules = schedules
         self._tz = timezone_name
+        # Dashboard event bus (#6 viz). None when the dashboard is off.
+        self._event_bus = event_bus
         self._sessions = SessionStore()
         self._running: dict[int, asyncio.Task] = {}
         # External-trigger proposals awaiting a spoken yes/no, keyed by user.
@@ -1463,6 +1466,20 @@ class Handlers:
             ),
             reply_markup=keyboard,
         )
+        # Mirror the approval to the dashboard (view-only — it shows a banner
+        # "respond in Telegram"; it never grants approvals itself).
+        if self._event_bus is not None:
+            try:
+                self._event_bus.publish({
+                    "type": "approval",
+                    "user_id": task.user_id,
+                    "reason": str(reason),
+                    "action_type": action.get("action"),
+                    "note": "Approve/Deny in Telegram",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
 
     async def on_status_update(self, task: Task, message: str) -> None:
         await self._app.bot.send_message(

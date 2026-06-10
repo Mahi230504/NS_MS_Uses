@@ -15,6 +15,7 @@ from agent.persistence import (
 from agent.profiles import resolve_profile
 from agent.providers import make_provider
 from agent.skills import SkillRegistry
+from bot.events import EventBus
 from bot.handlers import Handlers
 from bot.intent import IntentClassifier
 from bot.pairing import PairCodeIssuer
@@ -146,6 +147,10 @@ def main() -> None:
             recovered,
         )
 
+    # In-process event bus: the orchestrator publishes each step/state to it,
+    # the dashboard's SSE endpoint subscribes. No-op cost when no one's watching.
+    event_bus = EventBus()
+
     orchestrator = Orchestrator(
         adb,
         hitl,
@@ -157,6 +162,7 @@ def main() -> None:
         repo=repo,
         enable_vision_hitl=settings.enable_vision_hitl,
         artifact_dir=settings.log_dir / "screenshots",
+        event_bus=event_bus,
         # Activate per-app grounding: commerce packages → COMMERCE profile
         # (shopping validators + [ACTION]/[CART]/... tags), everything else →
         # GENERIC (lean structural-only path). Without this the orchestrator
@@ -196,6 +202,7 @@ def main() -> None:
         saved=saved_repo,
         schedules=schedule_repo,
         timezone_name=settings.timezone,
+        event_bus=event_bus,
     )
 
     orchestrator.on_approval_request = handlers.on_approval_request
@@ -206,7 +213,30 @@ def main() -> None:
     # Recurring-task scheduler: a minute-resolution async loop started on the
     # bot's own event loop (post_init). Restart-safe — SQLite holds all state.
     scheduler = Scheduler(schedule_repo, handlers.launch_scheduled)
-    _wire_startup(app, handlers, settings, adb, scheduler)
+
+    # Personal-assistant dashboard (#6 visualization). Built only when a token
+    # is configured and an owner is resolvable; reuses the webhook owner.
+    dashboard_app = None
+    if settings.dashboard_token and settings.webhook_owner_user_id is not None:
+        from bot.dashboard_api import build_dashboard_app
+
+        dashboard_app = build_dashboard_app(
+            repo=repo,
+            saved_repo=saved_repo,
+            schedule_repo=schedule_repo,
+            event_bus=event_bus,
+            token=settings.dashboard_token,
+            owner_user_id=settings.webhook_owner_user_id,
+            cors_origin=settings.dashboard_cors_origin,
+            dist_dir=Path(settings.dashboard_dist_dir),
+        )
+    elif settings.dashboard_token:
+        log.warning(
+            "DASHBOARD_TOKEN is set but no owner resolved "
+            "(set WEBHOOK_OWNER_USER_ID or TELEGRAM_ADMIN_ID). Dashboard disabled."
+        )
+
+    _wire_startup(app, handlers, settings, adb, scheduler, dashboard_app)
 
     # bootstrap_retries: on a throttled link the first getMe can still time
     # out even with the bumped timeouts; retry a handful of times (with PTB's
@@ -214,15 +244,17 @@ def main() -> None:
     app.run_polling(bootstrap_retries=5)
 
 
-def _wire_startup(app, handlers, settings, adb, scheduler) -> None:
+def _wire_startup(app, handlers, settings, adb, scheduler, dashboard_app=None) -> None:
     """Start background services on the bot's event loop (post_init/shutdown).
 
     Always starts the recurring-task scheduler; additionally starts the aiohttp
-    trigger webhook when WEBHOOK_SECRET (+ an owner) is configured. Both run
-    inside Telegram's own event loop — no second loop — so the scheduler can
-    reuse the handlers' one-task-per-user guard and the webhook can tap the
-    same handlers.
+    trigger webhook (when WEBHOOK_SECRET + owner) and the dashboard server (when
+    a dashboard_app was built). All run inside Telegram's own event loop — no
+    second loop — so the scheduler reuses the handlers' one-task guard, the
+    webhook taps the same handlers, and the dashboard taps the live EventBus.
     """
+    from aiohttp import web
+
     webhook_enabled = bool(settings.webhook_secret)
     if webhook_enabled and settings.webhook_owner_user_id is None:
         log.warning(
@@ -234,43 +266,57 @@ def _wire_startup(app, handlers, settings, adb, scheduler) -> None:
     async def _start(application) -> None:
         if scheduler is not None:
             await scheduler.start()
-        if not webhook_enabled:
-            return
-        from aiohttp import web
 
-        from bot.webhook import build_webhook_app
+        if webhook_enabled:
+            from bot.webhook import build_webhook_app
 
-        # Tunnel the device's localhost:<port> to ours over USB so an
-        # on-device trigger reaches the webhook with nothing on the network.
-        if await adb.reverse_tcp(settings.webhook_port):
-            log.info(
-                "adb reverse tcp:%d active — device localhost:%d -> host",
-                settings.webhook_port,
-                settings.webhook_port,
+            # Tunnel the device's localhost:<port> to ours over USB so an
+            # on-device trigger reaches the webhook with nothing on the network.
+            if await adb.reverse_tcp(settings.webhook_port):
+                log.info(
+                    "adb reverse tcp:%d active — device localhost:%d -> host",
+                    settings.webhook_port, settings.webhook_port,
+                )
+            web_app = build_webhook_app(
+                handlers,
+                secret=settings.webhook_secret,
+                owner_user_id=settings.webhook_owner_user_id,
             )
-        web_app = build_webhook_app(
-            handlers,
-            secret=settings.webhook_secret,
-            owner_user_id=settings.webhook_owner_user_id,
-        )
-        runner = web.AppRunner(web_app)
-        await runner.setup()
-        site = web.TCPSite(runner, settings.webhook_host, settings.webhook_port)
-        await site.start()
-        application.bot_data["_webhook_runner"] = runner
-        log.info(
-            "Trigger webhook listening on http://%s:%d/trigger (owner=%s)",
-            settings.webhook_host,
-            settings.webhook_port,
-            settings.webhook_owner_user_id,
-        )
+            runner = web.AppRunner(web_app)
+            await runner.setup()
+            site = web.TCPSite(runner, settings.webhook_host, settings.webhook_port)
+            await site.start()
+            application.bot_data["_webhook_runner"] = runner
+            log.info(
+                "Trigger webhook listening on http://%s:%d/trigger (owner=%s)",
+                settings.webhook_host, settings.webhook_port,
+                settings.webhook_owner_user_id,
+            )
+
+        if dashboard_app is not None:
+            # adb-reverse the dashboard port too so the phone's browser can
+            # reach it over USB (the host browser uses localhost directly).
+            await adb.reverse_tcp(settings.dashboard_port)
+            d_runner = web.AppRunner(dashboard_app)
+            await d_runner.setup()
+            d_site = web.TCPSite(
+                d_runner, settings.dashboard_host, settings.dashboard_port
+            )
+            await d_site.start()
+            application.bot_data["_dashboard_runner"] = d_runner
+            log.info(
+                "Dashboard listening on http://%s:%d (owner=%s)",
+                settings.dashboard_host, settings.dashboard_port,
+                settings.webhook_owner_user_id,
+            )
 
     async def _stop(application) -> None:
         if scheduler is not None:
             await scheduler.stop()
-        runner = application.bot_data.get("_webhook_runner")
-        if runner is not None:
-            await runner.cleanup()
+        for key in ("_webhook_runner", "_dashboard_runner"):
+            runner = application.bot_data.get(key)
+            if runner is not None:
+                await runner.cleanup()
 
     app.post_init = _start
     app.post_shutdown = _stop

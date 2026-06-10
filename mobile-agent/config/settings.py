@@ -56,6 +56,13 @@ class Settings:
     # IANA timezone the user's schedules (#5) are expressed in. Local wall-clock
     # ("every day at 9am") is interpreted in this tz and stored as absolute UTC.
     timezone: str
+    # Personal-assistant dashboard (#6 visualization). Disabled when the token is
+    # empty (no port opened). Bound to localhost by default like the webhook.
+    dashboard_token: str
+    dashboard_host: str
+    dashboard_port: int
+    dashboard_cors_origin: str
+    dashboard_dist_dir: str
 
 
 def _resolve_config_dir() -> Path:
@@ -197,6 +204,21 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
     except Exception as e:
         raise RuntimeError(f"TIMEZONE {tz_name!r} is not a valid IANA zone: {e}")
 
+    dashboard_token = os.environ.get("DASHBOARD_TOKEN", "").strip()
+    dashboard_host = os.environ.get("DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        dashboard_port = int(os.environ.get("DASHBOARD_PORT", "8770"))
+    except ValueError as e:
+        raise RuntimeError(f"DASHBOARD_PORT must be an integer: {e}")
+    dashboard_cors_origin = (
+        os.environ.get("DASHBOARD_CORS_ORIGIN", "http://localhost:5173").strip()
+        or "http://localhost:5173"
+    )
+    dashboard_dist_dir = os.environ.get(
+        "DASHBOARD_DIST_DIR",
+        str(Path(__file__).resolve().parent.parent / "dashboard" / "dist"),
+    ).strip()
+
     # Opt-in override of the emulator-only safety rule. Set to "1" / "true" /
     # "yes" to run on a physical device. Leave empty (default) to refuse.
     allow_physical = os.environ.get("ALLOW_PHYSICAL_DEVICE", "").strip().lower() in (
@@ -236,4 +258,9 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
         webhook_port=webhook_port,
         comparison_max_candidates=comparison_max_candidates,
         timezone=tz_name,
+        dashboard_token=dashboard_token,
+        dashboard_host=dashboard_host,
+        dashboard_port=dashboard_port,
+        dashboard_cors_origin=dashboard_cors_origin,
+        dashboard_dist_dir=dashboard_dist_dir,
     )

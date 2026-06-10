@@ -135,6 +135,8 @@ class TaskRow:
     step_count: int
     total_input_tokens: int
     total_output_tokens: int
+    launch_package: str | None = None
+    artifact_dir: str | None = None
 
     def duration_seconds(self) -> float | None:
         if self.ended_at is None:
@@ -223,6 +225,14 @@ class TaskRepository:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self._path) as db:
             await db.executescript(_SCHEMA)
+            # Idempotent column adds for an existing tasks table (CREATE TABLE
+            # IF NOT EXISTS won't alter one that already exists). Used by the
+            # dashboard to attribute a task to its app and find its screenshots.
+            cursor = await db.execute("PRAGMA table_info(tasks)")
+            existing = {row[1] for row in await cursor.fetchall()}
+            for col in ("launch_package", "artifact_dir"):
+                if col not in existing:
+                    await db.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
             await db.commit()
 
     async def insert_task(self, task: Task) -> int:
@@ -231,10 +241,14 @@ class TaskRepository:
         async with aiosqlite.connect(self._path) as db:
             cursor = await db.execute(
                 """
-                INSERT INTO tasks (user_id, description, state, started_at, step_count)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO tasks (user_id, description, state, started_at,
+                                   step_count, launch_package, artifact_dir)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (task.user_id, task.description, task.state.value, started, task.step_count),
+                (
+                    task.user_id, task.description, task.state.value, started,
+                    task.step_count, task.launch_package, task.artifact_dir,
+                ),
             )
             await db.commit()
             return cursor.lastrowid  # type: ignore[return-value]
@@ -288,14 +302,18 @@ class TaskRepository:
             )
             await db.commit()
 
+    _TASK_COLS = (
+        "id, user_id, description, state, started_at, ended_at, "
+        "final_summary, failure_reason, step_count, total_input_tokens, "
+        "total_output_tokens, launch_package, artifact_dir"
+    )
+
     async def list_recent(self, user_id: int, limit: int = 10) -> list[TaskRow]:
         async with aiosqlite.connect(self._path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                """
-                SELECT id, user_id, description, state, started_at, ended_at,
-                       final_summary, failure_reason, step_count,
-                       total_input_tokens, total_output_tokens
+                f"""
+                SELECT {self._TASK_COLS}
                 FROM tasks
                 WHERE user_id = ?
                 ORDER BY started_at DESC
@@ -305,6 +323,95 @@ class TaskRepository:
             )
             rows = await cursor.fetchall()
             return [TaskRow(**dict(r)) for r in rows]
+
+    async def list_paged(
+        self,
+        user_id: int,
+        *,
+        launch_package: str | None = None,
+        state: str | None = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> list[TaskRow]:
+        """History for the dashboard, optionally filtered by app/state."""
+        clauses = ["user_id = ?"]
+        params: list = [user_id]
+        if launch_package:
+            clauses.append("launch_package = ?")
+            params.append(launch_package)
+        if state:
+            clauses.append("state = ?")
+            params.append(state)
+        params.extend([limit, offset])
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"""
+                SELECT {self._TASK_COLS}
+                FROM tasks
+                WHERE {' AND '.join(clauses)}
+                ORDER BY started_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            )
+            return [TaskRow(**dict(r)) for r in await cursor.fetchall()]
+
+    async def get_task_row(self, task_id: int) -> TaskRow | None:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"SELECT {self._TASK_COLS} FROM tasks WHERE id = ?", (task_id,)
+            )
+            row = await cursor.fetchone()
+            return TaskRow(**dict(row)) if row else None
+
+    async def list_steps(self, task_id: int) -> list[dict]:
+        """All persisted steps for a task, oldest-first (for replay)."""
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT idx, action_json, result, timestamp
+                FROM steps WHERE task_id = ? ORDER BY idx ASC
+                """,
+                (task_id,),
+            )
+            out: list[dict] = []
+            for r in await cursor.fetchall():
+                try:
+                    action = json.loads(r["action_json"])
+                except (json.JSONDecodeError, TypeError):
+                    action = {}
+                out.append(
+                    {
+                        "idx": r["idx"],
+                        "action": action,
+                        "result": r["result"],
+                        "timestamp": r["timestamp"],
+                    }
+                )
+            return out
+
+    async def app_usage(self, user_id: int) -> list[dict]:
+        """Aggregate per-app usage for the 'preferred apps' analytics view."""
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT launch_package,
+                       COUNT(*) AS run_count,
+                       SUM(CASE WHEN state = 'done' THEN 1 ELSE 0 END) AS done_count,
+                       MAX(started_at) AS last_used_at,
+                       AVG(step_count) AS avg_steps
+                FROM tasks
+                WHERE user_id = ?
+                GROUP BY launch_package
+                ORDER BY run_count DESC
+                """,
+                (user_id,),
+            )
+            return [dict(r) for r in await cursor.fetchall()]
 
     # ------------------------------------------------------------------
     # Cross-app comparison records (feature #6)
