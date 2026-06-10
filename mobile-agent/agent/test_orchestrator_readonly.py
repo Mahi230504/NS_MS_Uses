@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from agent.orchestrator import Orchestrator, _taps_since_last_type
+from agent.orchestrator import (
+    Orchestrator,
+    _repeated_rejection_count,
+    _taps_since_last_type,
+)
 from agent.state_machine import Task, TaskState
 from agent.ui_tree import UiElement
 from security.audit_logger import AuditLogger
@@ -149,6 +153,29 @@ class TestProbeCompletenessUnit:
         ) is None
 
 
+class TestRepeatedRejectionCount:
+    def _rej(self, x=5, y=5):
+        return {"action": {"action": "tap", "x": x, "y": y}, "result": "REJECTED: nope"}
+
+    def test_counts_identical(self) -> None:
+        assert _repeated_rejection_count([self._rej()] * 4) == 4
+
+    def test_different_action_breaks(self) -> None:
+        # >5px apart so they aren't treated as the same gesture.
+        assert _repeated_rejection_count([self._rej(5, 5), self._rej(500, 600)]) == 1
+
+    def test_executed_breaks(self) -> None:
+        h = [
+            self._rej(5, 5),
+            {"action": {"action": "tap", "x": 5, "y": 5}, "result": "tapped (5,5)"},
+            self._rej(5, 5),
+        ]
+        assert _repeated_rejection_count(h) == 1
+
+    def test_empty(self) -> None:
+        assert _repeated_rejection_count([]) == 0
+
+
 class TestTapsSinceLastType:
     def test_counts_taps_after_type(self) -> None:
         hist = [
@@ -192,6 +219,24 @@ class TestProbeCompletenessLoop:
         assert task.state is TaskState.DONE
         assert task.report == {"price": 199, "item_name": "Margherita"}
         assert (30, 40) in adb.taps  # it opened a result
+
+    async def test_repeated_rejection_aborts_fast(self, tmp_path: Path) -> None:
+        # Model keeps proposing the same cart tap (rejected in read-only). The
+        # breaker aborts after MAX_CONSECUTIVE_REJECTS instead of burning the
+        # whole budget; nothing is ever executed.
+        adb = _FakeAdb()
+        add_tap = (
+            {"action": "tap", "x": 10, "y": 20, "note": "tap ADD to cart for milk"},
+            _usage(),
+        )
+        vision = _ScriptedVision([add_tap] * 10)
+        task = Task(user_id=1, description="probe")
+        await _orch(adb, vision, tmp_path).run_task(task, read_only=True)
+        assert task.state is TaskState.FAILED
+        assert "rejected action" in (task.failure_reason or "")
+        assert adb.taps == []  # never executed
+        # Aborted well before the 10 scripted steps (saved LLM calls).
+        assert len(vision.calls) <= 5
 
     async def test_priceless_bail_is_bounded_not_infinite(self, tmp_path: Path) -> None:
         # Model keeps reporting null without drilling — nudged MAX_PROBE_NUDGES

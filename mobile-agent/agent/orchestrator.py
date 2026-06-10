@@ -39,10 +39,12 @@ from security.hitl_gate import HitlGate, ReadOnlyViolation
 
 MAX_LOOP_ITERATIONS = 30
 # A read-only price probe (cross-app comparison) should be SHORT — search, open
-# the result, read the price, report. Cap it well below the full budget so a
-# 3-app comparison can't run ~3x30 steps; a probe that can't get a price in this
-# many steps reports price=null and moves on.
-MAX_PROBE_ITERATIONS = 14
+# the result, read the price, report. Cap it below the full order budget so a
+# 3-app comparison can't run ~3x30 steps. Headroom note: a COLD app start burns
+# several steps on its splash/load before search is usable (a live run lost a
+# whole probe to Zomato's red splash at 14), so this is set above the warm-path
+# minimum (~8) to absorb a cold start while staying well under 30.
+MAX_PROBE_ITERATIONS = 20
 # How many times a probe is nudged to finish properly (emit a `report` after
 # actually opening a result) before we accept whatever it gives. Bounded so a
 # stubborn model can't loop the probe forever.
@@ -350,6 +352,12 @@ MAX_CART_RECOVER_BACKS = 1
 # After this many loop-detected events in a single task we give up — the model
 # isn't going to escape on its own. Hard-fail with a clear reason.
 MAX_LOOPS_BEFORE_ABORT = 4
+# After this many CONSECUTIVE identical REJECTED actions, abort. Loop detection
+# only counts EXECUTED actions, so a model that keeps proposing the same tap the
+# grounding guard rejects (e.g. coords that don't match any tree element) would
+# otherwise burn the entire iteration budget — and a paid LLM call each step —
+# making no progress. Fail fast instead.
+MAX_CONSECUTIVE_REJECTS = 4
 # Outcome-verification: if the screen doesn't change after this many state-
 # changing actions in a row, try a back-button recovery, then give up.
 UNCHANGED_STREAK_RECOVERY = 2
@@ -586,6 +594,17 @@ class Orchestrator:
         for _ in range(max_iters):
             task.step_count += 1
             _log.info("step %d: begin", task.step_count)
+
+            # Repeated-rejection breaker: if the model keeps proposing the same
+            # action the guards reject (it never executes), it makes no progress
+            # and wastes an LLM call per step. Abort before screencap/vision so
+            # we don't burn the rest of the budget on a guaranteed-rejected tap.
+            if _repeated_rejection_count(task.history) >= MAX_CONSECUTIVE_REJECTS:
+                raise OrchestratorError(
+                    "stuck: the model repeated the same rejected action "
+                    f"{MAX_CONSECUTIVE_REJECTS}x (its coords/intent don't match "
+                    "any on-screen element). Aborting instead of burning the budget."
+                )
 
             _log.info("step %d: screencap", task.step_count)
             screenshot = await self._adb.screencap()
@@ -2539,6 +2558,31 @@ def _summarize_report(report: dict) -> str:
     if name:
         bits.append(name)
     return " · ".join(bits) if bits else "no result"
+
+
+def _repeated_rejection_count(history: list[dict]) -> int:
+    """Count trailing entries that are the SAME rejected action.
+
+    A rejected step has a result starting "REJECTED" and was never executed, so
+    loop detection (which only sees executed actions) misses it. This lets the
+    orchestrator notice a model stuck re-proposing one guard-rejected action and
+    bail before wasting the whole budget. Counts back from the most recent entry
+    until a non-rejected step or a different action breaks the streak.
+    """
+    streak = 0
+    anchor: dict | None = None
+    for h in reversed(history):
+        if not str(h.get("result", "")).startswith("REJECTED"):
+            break
+        action = h.get("action", {}) or {}
+        if anchor is None:
+            anchor = action
+            streak = 1
+        elif _actions_equivalent(action, anchor):
+            streak += 1
+        else:
+            break
+    return streak
 
 
 def _taps_since_last_type(history: list[dict]) -> int:
