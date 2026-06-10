@@ -531,6 +531,18 @@ def get_task(app: App, task_id: str) -> TaskTemplate | None:
     return None
 
 
+def apps_in_category(category: str) -> tuple[App, ...]:
+    """Every registered app in a category, in registry order.
+
+    The comparison feature uses this to expand a category-only request
+    ("which app is cheapest for milk") into concrete candidate apps, and to
+    keep a comparison within one comparable family (groceries vs groceries,
+    food vs food). Note Swiggy (food) and Instamart (groceries) are distinct
+    App entries despite sharing a package, so they never cross categories.
+    """
+    return tuple(a for a in APPS if a.category == category)
+
+
 def render_prompt(template: str, param: str | None) -> str:
     """Substitute {param} into a template safely."""
     if param is None:

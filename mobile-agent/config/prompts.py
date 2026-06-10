@@ -220,3 +220,43 @@ ANTI-PATTERNS the orchestrator detects and rejects (extends rule 6):
        Go to the cart, or find the other product's own [ACTION] ADD (different
        coords).
 """
+
+
+# Injected (via the per-app guidance channel) INSTEAD of COMMERCE_ADDENDUM when a
+# commerce app is driven in read-only "probe" mode (cross-app comparison). The
+# goal is a PRICE CHECK, not an order — so the cart-driving rules are replaced by
+# read-and-report rules. The orchestrator rejects any add-to-cart/checkout/pay tap
+# in this mode (see Orchestrator._readonly_violation_rejection).
+PROBE_ADDENDUM = """This is a shopping/commerce app, but THIS run is a READ-ONLY PRICE CHECK, not an
+order. Your only goal: find one specific item, READ its price (and delivery
+time/ETA if shown), and finish with a `report` action. The following rules apply
+IN ADDITION to the base rules:
+
+DO NOT — under any circumstances — tap ADD / + / − / Buy / Buy Now / Checkout /
+   Place Order / Pay, or otherwise change the cart. There is NOTHING to add. The
+   orchestrator REJECTS any such tap. You only look and read.
+
+WHAT TO DO:
+   1. Find the search bar (a real EditText/SearchView, NOT the [LOCATION] address
+      header) and search for the item.
+   2. Identify the best-matching product card. Brand matters: "Amul milk" → only
+      an Amul card; don't substitute brands. The closest relevant result is fine.
+   3. Read its PRICE off the card or, if the card doesn't show it clearly, tap the
+      product NAME/IMAGE to open the detail page (that's a read, not an add) and
+      read the price there. Note the delivery time/ETA if the app shows one.
+   4. Finish with EXACTLY this terminal action (no add, no cart):
+        {"action":"report","data":{"price":<number or null>,"currency":"INR",
+         "eta":"<e.g. '10 mins' or null>","available":true,
+         "item_name":"<the product you actually found>","notes":"<short, optional>"}}
+      Use a plain number for price (e.g. 229, not "₹229"). If the item genuinely
+      isn't available, report {"available":false,"price":null,...}.
+
+UI TAGS (same meanings as ordering mode): [ACTION] = ADD/+/checkout buttons — do
+   NOT tap them here. [CATEGORY?] = a navigation tile/suggestion — don't tap it to
+   browse. [LOCATION] = the delivery-address header, never the search bar. Use the
+   real search element's coords.
+
+If after one or two ACTUAL swipes you still can't find the item, report
+   {"available":false,"price":null,...}. Do not keep wandering — a read-only probe
+   should be quick.
+"""

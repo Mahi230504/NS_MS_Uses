@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, ContextTypes
 
+from agent.comparison import ComparisonEngine, ComparisonResult, ProbeTarget
 from agent.orchestrator import Orchestrator
 from agent.persistence import TaskRepository
 from agent.state_machine import Task
@@ -19,6 +20,7 @@ from bot.apps import (
     get_task,
     render_prompt,
 )
+from bot.intent import CompareIntent, IntentClassifier, SingleIntent
 from bot.pairing import PairCodeIssuer
 from bot.router import Route, Router
 from bot.session import Session, SessionState, SessionStore
@@ -34,6 +36,16 @@ _TASK_BUTTONS_PER_ROW = 2
 # spoken yes/no. The proposal expires after this long so a stale "yes" can't
 # fire something the user said minutes ago.
 _PENDING_TTL_SECONDS = 90
+
+# A finished comparison keeps its "order from which app?" buttons live this
+# long. Longer than _PENDING_TTL_SECONDS because the user may take a while to
+# read a ranked table and decide before tapping an app.
+_COMPARISON_TTL_SECONDS = 600
+
+# Task ids that represent the orderable/primary action for an app, in priority
+# order. Used to pick which task to run when the user selects an app from a
+# comparison (groceries/food -> order, shopping -> search, mobility -> book).
+_ORDER_TASK_PRIORITY = ("order", "book", "search", "play", "nav", "recharge")
 
 # Wake-word prefixes the trigger client (AutoVoice "Atlas") prepends to every
 # spoken task. We strip them here so the router prompt sees just the command
@@ -75,10 +87,25 @@ def _strip_wake_word(text: str) -> str:
 
 @dataclass
 class _PendingIntent:
-    """A parsed-but-not-yet-launched task awaiting voice confirmation."""
+    """A parsed-but-not-yet-launched task awaiting voice confirmation.
+
+    `compare` is set when the pending item is a cross-app comparison rather than
+    a single task — handle_external_confirm launches the comparison flow instead
+    of a direct run_task.
+    """
 
     description: str
     launch_package: str | None
+    created_at: float
+    compare: CompareIntent | None = None
+
+
+@dataclass
+class _PendingComparison:
+    """A finished comparison whose 'order from which app?' buttons are live."""
+
+    result: ComparisonResult
+    comparison_id: int | None
     created_at: float
 
 
@@ -95,6 +122,8 @@ class Handlers:
         admin_id: int | None,
         repo: TaskRepository | None = None,
         router: Router | None = None,
+        classifier: IntentClassifier | None = None,
+        comparison: ComparisonEngine | None = None,
     ) -> None:
         self._app = application
         self._orch = orchestrator
@@ -104,10 +133,16 @@ class Handlers:
         self._admin_id = admin_id
         self._repo = repo
         self._router = router
+        # Intent classifier (wraps the router; adds comparison detection). When
+        # present it supersedes the bare router on the message + voice paths.
+        self._classifier = classifier
+        self._comparison = comparison
         self._sessions = SessionStore()
         self._running: dict[int, asyncio.Task] = {}
         # External-trigger proposals awaiting a spoken yes/no, keyed by user.
         self._pending: dict[int, _PendingIntent] = {}
+        # Finished comparisons whose order buttons are still live, keyed by user.
+        self._pending_comparison: dict[int, _PendingComparison] = {}
 
     # ------------------------------------------------------------------
     # Auth helpers
@@ -186,17 +221,28 @@ class Handlers:
             )
             return
 
-        # Try the router first — if the user's free text maps cleanly to a
-        # known (app, task) pair, skip the menu entirely and execute. This is
-        # the daily-driver path: one Telegram message, no taps.
+        # Classifier first (when wired): it recognizes a cross-app COMPARISON
+        # ("cheapest pizza on swiggy or zomato") and otherwise resolves a
+        # single-app route (delegating to the router internally). This is the
+        # daily-driver path: one Telegram message, no taps.
+        if self._classifier is not None:
+            intent = await self._classifier.classify(text)
+            if isinstance(intent, CompareIntent):
+                await self._launch_comparison(update.message, user.id, intent)
+                return
+            if isinstance(intent, SingleIntent):
+                await self._launch_route(update, user.id, intent.route)
+                return
+            await self._launch_freeform_task(update, user.id, text)
+            return
+
+        # No classifier wired — legacy router-only path. If the text maps to a
+        # known (app, task) pair, execute it; else fall back to freeform.
         if self._router is not None:
             route = await self._router.route(text)
             if route is not None:
                 await self._launch_route(update, user.id, route)
                 return
-
-        # Router didn't find a match (or isn't configured) — fall back to the
-        # free-form agent path: model figures out everything from scratch.
         await self._launch_freeform_task(update, user.id, text)
 
     # ------------------------------------------------------------------
@@ -225,6 +271,8 @@ class Handlers:
             await self._on_app_pick(query, user_id, data[4:])
         elif data.startswith("task:"):
             await self._on_task_pick(query, user_id, data[5:])
+        elif data.startswith("cmp:"):
+            await self._on_comparison_pick(query, user_id, data[4:])
         elif data == "back:apps":
             await self._on_back_to_apps(query, user_id)
         elif data == "freeform":
@@ -391,6 +439,157 @@ class Handlers:
         )
 
     # ------------------------------------------------------------------
+    # Cross-app comparison (feature #6)
+
+    async def _launch_comparison(
+        self, message, user_id: int, intent: CompareIntent
+    ) -> None:
+        """Kick off a comparison as the user's single running task."""
+        if self._comparison is None:
+            await message.reply_text(
+                "Cross-app comparison isn't available right now."
+            )
+            return
+        if self._has_running_task(user_id):
+            await message.reply_text(
+                "A task is already running. Use /abort first or wait for it to finish."
+            )
+            return
+        names = ", ".join(a.name for a in intent.candidates)
+        sess = self._sessions.get(user_id)
+        sess.state = SessionState.RUNNING
+        sess.app_id = None
+        sess.task_id = None
+        await message.reply_text(
+            f"{_ranking_label(intent.ranking_key.value)} '{intent.item}' across "
+            f"{names} — checking each app one at a time, give it a moment…"
+        )
+        self._running[user_id] = asyncio.create_task(
+            self._run_comparison(user_id, intent)
+        )
+
+    async def _run_comparison(self, user_id: int, intent: CompareIntent) -> None:
+        """Run the probes, persist, present the ranked table + order buttons.
+
+        Runs as the user's `_running` task, so /abort cancels it cleanly. Status
+        and the final table go to the user's Telegram chat (chat_id == user_id).
+        """
+        chat_id = user_id
+
+        async def _progress(msg: str) -> None:
+            try:
+                await self._app.bot.send_message(chat_id=chat_id, text=msg)
+            except Exception:
+                pass
+
+        try:
+            targets = [
+                ProbeTarget(a.id, a.name, a.package) for a in intent.candidates
+            ]
+            result = await self._comparison.run(
+                targets=targets,
+                item=intent.item,
+                category=intent.category,
+                ranking_key=intent.ranking_key.value,
+                user_id=user_id,
+                on_progress=_progress,
+            )
+            comparison_id: int | None = None
+            if self._repo is not None:
+                try:
+                    comparison_id = await self._repo.insert_comparison(
+                        user_id=user_id,
+                        query=intent.item,
+                        category=intent.category,
+                        ranking_key=intent.ranking_key.value,
+                        quotes=result.quotes_as_dicts(),
+                        winner_app_id=(
+                            result.winner.app_id if result.winner else None
+                        ),
+                    )
+                except Exception:
+                    comparison_id = None
+            text, markup = _render_comparison(result)
+            await self._app.bot.send_message(
+                chat_id=chat_id, text=text, reply_markup=markup
+            )
+            self._pending_comparison[user_id] = _PendingComparison(
+                result=result,
+                comparison_id=comparison_id,
+                created_at=time.monotonic(),
+            )
+            # Voice convenience: stage the winner's order so a spoken "yes"
+            # (handle_external_confirm) can order it without the buttons.
+            if result.winner is not None:
+                app = get_app(result.winner.app_id)
+                tpl = _primary_order_task(app) if app is not None else None
+                if app is not None and tpl is not None:
+                    self._pending[user_id] = _PendingIntent(
+                        description=render_prompt(tpl.template, intent.item),
+                        launch_package=app.package,
+                        created_at=time.monotonic(),
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - defensive
+            try:
+                await self._app.bot.send_message(
+                    chat_id=chat_id, text=f"Comparison failed: {e}"
+                )
+            except Exception:
+                pass
+        finally:
+            sess = self._sessions.get(user_id)
+            if sess.state == SessionState.RUNNING:
+                sess.state = SessionState.IDLE
+
+    async def _on_comparison_pick(self, query, user_id: int, app_id: str) -> None:
+        """Handle a `cmp:<app_id>` button — order from the chosen app."""
+        pending = self._pending_comparison.pop(user_id, None)
+        if pending is None or (
+            time.monotonic() - pending.created_at > _COMPARISON_TTL_SECONDS
+        ):
+            await query.edit_message_text(
+                "That comparison has expired — send it again for fresh prices."
+            )
+            return
+        if app_id == "none":
+            await query.edit_message_text("Okay — no order placed.")
+            return
+        app = get_app(app_id)
+        if app is None:
+            await query.edit_message_text("That app is no longer available.")
+            return
+        if self._has_running_task(user_id):
+            await query.edit_message_text(
+                "A task is already running. Use /abort first."
+            )
+            return
+        tpl = _primary_order_task(app)
+        if tpl is None:
+            await query.edit_message_text(
+                f"I don't have an order action for {app.name}."
+            )
+            return
+        if self._repo is not None and pending.comparison_id is not None:
+            try:
+                await self._repo.set_comparison_chosen(pending.comparison_id, app_id)
+            except Exception:
+                pass
+        # Hand off to the real single-app order flow: full shopping guards +
+        # payment/OTP HITL are armed here (read_only defaults False).
+        description = render_prompt(tpl.template, pending.result.item)
+        task = Task(user_id=user_id, description=description)
+        sess = self._sessions.get(user_id)
+        sess.state = SessionState.RUNNING
+        sess.app_id = app.id
+        sess.task_id = tpl.id
+        await query.edit_message_text(f"{app.emoji} {app.name}: {description}")
+        self._running[user_id] = asyncio.create_task(
+            self._orch.run_task(task, launch_package=app.package)
+        )
+
+    # ------------------------------------------------------------------
     # External trigger (Android voice / widget -> webhook)
     #
     # Two phases so the user hears what was understood before anything runs:
@@ -435,27 +634,50 @@ class Handlers:
         launch_package: str | None = None
         spoken = text
 
-        if self._router is not None:
+        # Resolve the intent. With the classifier wired we also recognize a
+        # cross-app comparison; otherwise fall back to the single-app router.
+        route: Route | None = None
+        if self._classifier is not None:
+            intent = await self._classifier.classify(text)
+            if isinstance(intent, CompareIntent):
+                # A comparison runs several probes (tens of seconds each) — far
+                # too long to finish inside this trigger call. Stage it; on a
+                # spoken "yes" it launches and posts the result to Telegram.
+                names = ", ".join(a.name for a in intent.candidates)
+                self._pending[user_id] = _PendingIntent(
+                    description=f"compare {intent.item}",
+                    launch_package=None,
+                    created_at=time.monotonic(),
+                    compare=intent,
+                )
+                return (
+                    f"Got it — compare {intent.item} on {names}. "
+                    "I'll show the result on Telegram. Confirm?"
+                )
+            if isinstance(intent, SingleIntent):
+                route = intent.route
+        elif self._router is not None:
             route = await self._router.route(text)
-            if route is not None:
-                if route.task.needs_param and not route.param:
-                    # A missing slot can't be gathered over voice (we cancel on
-                    # "no", no re-listen) — defer to the Telegram param prompt.
-                    sess = self._sessions.get(user_id)
-                    sess.app_id = route.app.id
-                    sess.task_id = route.task.id
-                    sess.state = SessionState.AWAITING_PARAM
-                    await self._app.bot.send_message(
-                        chat_id=user_id,
-                        text=(
-                            f"{route.app.emoji} {route.app.name} → {route.task.label}\n\n"
-                            f"{route.task.param_prompt}"
-                        ),
-                    )
-                    return f"{route.app.name} needs a detail — check Telegram to continue."
-                description = render_prompt(route.task.template, route.param)
-                launch_package = route.app.package
-                spoken = f"{route.app.name}: {description}"
+
+        if route is not None:
+            if route.task.needs_param and not route.param:
+                # A missing slot can't be gathered over voice (we cancel on
+                # "no", no re-listen) — defer to the Telegram param prompt.
+                sess = self._sessions.get(user_id)
+                sess.app_id = route.app.id
+                sess.task_id = route.task.id
+                sess.state = SessionState.AWAITING_PARAM
+                await self._app.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"{route.app.emoji} {route.app.name} → {route.task.label}\n\n"
+                        f"{route.task.param_prompt}"
+                    ),
+                )
+                return f"{route.app.name} needs a detail — check Telegram to continue."
+            description = render_prompt(route.task.template, route.param)
+            launch_package = route.app.package
+            spoken = f"{route.app.name}: {description}"
 
         self._pending[user_id] = _PendingIntent(
             description=description,
@@ -501,6 +723,18 @@ class Handlers:
             return "Okay, cancelled."
         if self._has_running_task(user_id):
             return "A task is already running. Finish or abort it first."
+
+        # A staged comparison: launch the multi-app probe flow instead of a
+        # single task. Results + order buttons land on Telegram.
+        if pending.compare is not None:
+            sess = self._sessions.get(user_id)
+            sess.state = SessionState.RUNNING
+            sess.app_id = None
+            sess.task_id = None
+            self._running[user_id] = asyncio.create_task(
+                self._run_comparison(user_id, pending.compare)
+            )
+            return "On it — comparing now; I'll post the result on Telegram."
 
         sess = self._sessions.get(user_id)
         sess.state = SessionState.RUNNING
@@ -710,6 +944,102 @@ class Handlers:
             chat_id=task.user_id,
             text=f"[{task.state.value}] {message}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Cross-app comparison rendering
+
+_RANKING_LABELS = {
+    "cheapest": "💰 Comparing cheapest",
+    "fastest": "⚡ Comparing fastest",
+    "best": "⭐ Comparing best",
+}
+_RANKING_HEADERS = {"cheapest": "Cheapest", "fastest": "Fastest", "best": "Best"}
+
+
+def _ranking_label(ranking_key: str) -> str:
+    return _RANKING_LABELS.get(ranking_key, "🔎 Comparing")
+
+
+def _primary_order_task(app: App) -> TaskTemplate | None:
+    """The app's main param-taking action, used to order after a comparison."""
+    by_id = {t.id: t for t in app.tasks}
+    for tid in _ORDER_TASK_PRIORITY:
+        t = by_id.get(tid)
+        if t is not None and t.needs_param:
+            return t
+    for t in app.tasks:
+        if t.needs_param and t.id != "free":
+            return t
+    return None
+
+
+def _fmt_price(price: float, currency: str) -> str:
+    amount = int(price) if float(price).is_integer() else round(price, 2)
+    if (currency or "INR").upper() == "INR":
+        return f"₹{amount}"
+    return f"{currency} {amount}"
+
+
+def _render_comparison(
+    result: ComparisonResult,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Render a ranked comparison to Telegram text + per-app order buttons."""
+    header = _RANKING_HEADERS.get(result.ranking_key, "Comparison")
+    lines = [f"{header} for '{result.item}' ({result.category}):", ""]
+    for q in result.quotes:
+        app = get_app(q.app_id)
+        emoji = app.emoji if app else "•"
+        if not q.ok:
+            lines.append(
+                f"{emoji} {q.app_name} — couldn't check "
+                f"({q.failure_reason or 'failed'})"
+            )
+            continue
+        if q.available is False:
+            lines.append(f"{emoji} {q.app_name} — unavailable")
+            continue
+        bits: list[str] = []
+        if q.price is not None:
+            bits.append(_fmt_price(q.price, q.currency))
+        if q.eta:
+            bits.append(q.eta)
+        detail = " · ".join(bits) if bits else "no price found"
+        crown = (
+            "  🏆"
+            if result.winner is not None and q.app_id == result.winner.app_id
+            else ""
+        )
+        lines.append(f"{emoji} {q.app_name} — {detail}{crown}")
+
+    if result.winner is None:
+        lines += [
+            "",
+            "Couldn't get a comparable price from any app. Try again, or open "
+            "one directly.",
+        ]
+        return "\n".join(lines), None
+
+    lines += ["", "Order from which app?"]
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for q in result.ranked:
+        app = get_app(q.app_id)
+        emoji = app.emoji if app else ""
+        tail = (
+            _fmt_price(q.price, q.currency)
+            if q.price is not None
+            else (q.eta or "")
+        )
+        label = f"{emoji} {q.app_name} {tail}".strip()
+        row.append(InlineKeyboardButton(label, callback_data=f"cmp:{q.app_id}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✖ None", callback_data="cmp:none")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
 # ---------------------------------------------------------------------------

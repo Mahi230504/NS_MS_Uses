@@ -48,6 +48,11 @@ class Settings:
     webhook_owner_user_id: int | None
     webhook_host: str
     webhook_port: int
+    # Cross-app comparison (#6): how many candidate apps a single comparison
+    # probes. Each probe is a full agent run on the one device, so this bounds
+    # latency. Only used when the provider supports text completion (router/
+    # classifier path).
+    comparison_max_candidates: int
 
 
 def _resolve_config_dir() -> Path:
@@ -173,6 +178,14 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
     except ValueError as e:
         raise RuntimeError(f"WEBHOOK_PORT must be an integer: {e}")
 
+    try:
+        comparison_max_candidates = int(
+            os.environ.get("COMPARISON_MAX_CANDIDATES", "3")
+        )
+    except ValueError as e:
+        raise RuntimeError(f"COMPARISON_MAX_CANDIDATES must be an integer: {e}")
+    comparison_max_candidates = max(2, comparison_max_candidates)
+
     # Opt-in override of the emulator-only safety rule. Set to "1" / "true" /
     # "yes" to run on a physical device. Leave empty (default) to refuse.
     allow_physical = os.environ.get("ALLOW_PHYSICAL_DEVICE", "").strip().lower() in (
@@ -210,4 +223,5 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
         webhook_owner_user_id=webhook_owner_user_id,
         webhook_host=webhook_host,
         webhook_port=webhook_port,
+        comparison_max_candidates=comparison_max_candidates,
     )

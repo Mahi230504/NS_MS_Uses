@@ -109,9 +109,10 @@ class TestValidate:
 
     def test_allowed_action_set_is_locked_down(self) -> None:
         # The allowed set is small and intentional; this test fails if anyone
-        # widens it without thinking.
+        # widens it without thinking. `report` is the read-only probe terminal
+        # used by cross-app comparison (never dispatched to the device).
         assert ALLOWED_ACTIONS == frozenset(
-            {"tap", "type", "swipe", "done", "need_approval", "wait"}
+            {"tap", "type", "swipe", "done", "need_approval", "wait", "report"}
         )
 
     # ------------------------------------------------------------------

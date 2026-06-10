@@ -18,6 +18,7 @@ from agent.persistence import TaskRepository
 from agent.phash import compute as compute_phash
 from agent.profiles import COMMERCE, AppProfile
 from agent.providers.base import VisionProvider
+from config import prompts
 from agent.skills import SkillRegistry
 from agent.state_machine import Task, TaskState
 from agent.ui_tree import (
@@ -100,6 +101,21 @@ _ADD_INTENT_RE = re.compile(
     r"\b(tap\s+add|press\s+add|add\s+to\s+cart|add\s+button|"
     r"\+\s?button|plus\s+button|increment|qty|quantity\s+(\+|plus)|"
     r"checkout|place\s+order|proceed\s+to|buy\s+now|pay\s+now)\b",
+    re.IGNORECASE,
+)
+# Cart/commit-intent note patterns forbidden during a READ-ONLY probe (cross-app
+# comparison). Broader than _ADD_INTENT_RE on purpose: it must also catch
+# non-commerce commits — booking/confirming/requesting a ride — because mobility
+# apps resolve to GENERIC (no [ACTION] tags), so the structural element check
+# can't see them and the note is the only signal. Used by
+# Orchestrator._readonly_violation_rejection.
+_READONLY_FORBIDDEN_NOTE_RE = re.compile(
+    r"\b(add\s+to\s+cart|tap\s+add|press\s+add|add\s+button|\+\s?button|"
+    r"plus\s+button|increment|buy\s+now|buy\b|checkout|check\s*out|"
+    r"place\s+(the\s+)?order|order\s+now|proceed\s+to|pay\s+now|pay\b|"
+    r"confirm\s+(booking|order|ride|trip|payment|purchase)|"
+    r"book\s+(the\s+)?(ride|cab|trip|now)|request\s+(ride|trip|now)|"
+    r"schedule\s+(ride|trip))\b",
     re.IGNORECASE,
 )
 # Reasons that represent a LEGITIMATE sensitive handoff to the user — cart
@@ -414,6 +430,13 @@ class Orchestrator:
         # let the model act on the screenshot alone — a possibly-imperfect
         # tap beats a guaranteed dead loop. Reset whenever a tree is seen.
         self._consecutive_stale_tree: int = 0
+        # Read-only "probe" mode (cross-app comparison). When True the loop
+        # rejects add-to-cart / +/- / checkout / pay taps, disarms the
+        # cart-seeking guards (auto-back, cart-reveal hint, giveup, premature
+        # cart-review), and injects the read-only PROBE_ADDENDUM instead of the
+        # COMMERCE shopping rules. Set per-run by run_task(read_only=...);
+        # defaults False so ordinary order runs are byte-identical.
+        self._read_only: bool = False
 
     def get_task(self, user_id: int) -> Task | None:
         return self._tasks.get(user_id)
@@ -423,6 +446,7 @@ class Orchestrator:
         task: Task,
         *,
         launch_package: str | None = None,
+        read_only: bool = False,
     ) -> Task:
         self._tasks[task.user_id] = task
         self._last_step_status_at = 0.0
@@ -441,6 +465,7 @@ class Orchestrator:
         self._active_profile = COMMERCE
         self._task_tree_ever_seen = False
         self._consecutive_stale_tree = 0
+        self._read_only = read_only
         task.state = TaskState.RUNNING
         await self._persist_insert(task)
         await self._status(task, f"starting: {task.description}")
@@ -573,6 +598,7 @@ class Orchestrator:
                 # app. Deterministic action, no provider call this step.
                 if (
                     self._active_profile.enforce_shopping_guards
+                    and not self._read_only
                     and self._cart_recover_backs < MAX_CART_RECOVER_BACKS
                     and self._should_auto_back_to_cart(task, ui_elements)
                 ):
@@ -598,7 +624,8 @@ class Orchestrator:
                 # apps only.
                 cart_hint = (
                     self._cart_reveal_hint(task, ui_elements)
-                    if self._active_profile.enforce_shopping_guards else ""
+                    if self._active_profile.enforce_shopping_guards
+                    and not self._read_only else ""
                 )
                 if cart_hint:
                     self._audit.log_action(
@@ -765,6 +792,31 @@ class Orchestrator:
                 self._last_phash = None
                 continue
 
+            # Read-only probe rejection (cross-app comparison): this run is a
+            # price check, so any tap on an ADD / +/- / Buy / Checkout / Pay
+            # button is forbidden — it would mutate the cart. Reject before
+            # execution so the model reads the price and finishes with a
+            # `report` action instead. Only active in read_only mode.
+            readonly_problem = (
+                self._readonly_violation_rejection(action, ui_elements)
+                if self._read_only else None
+            )
+            if readonly_problem is not None:
+                hint = f"REJECTED: {readonly_problem}"
+                task.history.append({"action": action, "result": hint})
+                self._audit.log_action(
+                    task.user_id, task.description, action,
+                    "READONLY_VIOLATION_REJECTED",
+                )
+                await self._step_status(
+                    task,
+                    f"step {task.step_count}: read-only probe — cart taps "
+                    "blocked, reading price only",
+                )
+                self._finalize_step_result(task.step_count, action, hint)
+                self._last_phash = None
+                continue
+
             # Product-name vs tap-coords check: the model claimed
             # "tap ADD on <product>" but the UI elements near the tap
             # coords don't mention <product> at all. Real failure case:
@@ -888,7 +940,8 @@ class Orchestrator:
             # grant a payment latch on a stale screen.
             premature_reason = (
                 self._premature_cart_review_rejection(action, ui_elements)
-                if self._active_profile.enforce_shopping_guards else None
+                if self._active_profile.enforce_shopping_guards
+                and not self._read_only else None
             )
             if premature_reason is not None:
                 hint = f"REJECTED need_approval: {premature_reason}"
@@ -915,7 +968,8 @@ class Orchestrator:
             # method, etc.) doesn't trip this.
             giveup_reason = (
                 self._giveup_rejection(task, action)
-                if self._active_profile.enforce_shopping_guards else None
+                if self._active_profile.enforce_shopping_guards
+                and not self._read_only else None
             )
             if giveup_reason is not None:
                 hint = (
@@ -985,6 +1039,22 @@ class Orchestrator:
                 await self._status(task, f"done: {task.final_summary}")
                 return
 
+            if action_type == "report":
+                # Read-only probe terminal (cross-app comparison). Like `done`,
+                # but carries a structured quote in `data` that the comparison
+                # engine reads off task.report. Never dispatched to the device.
+                data = action.get("data")
+                task.report = data if isinstance(data, dict) else {}
+                task.state = TaskState.DONE
+                task.final_summary = action.get("summary", "") or _summarize_report(
+                    task.report
+                )
+                task.history.append({"action": action, "result": "report"})
+                await self._persist_step(task, action, "report")
+                self._finalize_step_result(task.step_count, action, "report")
+                await self._status(task, f"report: {task.final_summary}")
+                return
+
             result = await self._execute_with_retry(task, action)
             task.history.append({"action": action, "result": result})
             self._audit.log_action(
@@ -1049,7 +1119,14 @@ class Orchestrator:
         """
         parts: list[str] = []
         if profile.prompt_addendum:
-            parts.append(profile.prompt_addendum)
+            # In read-only probe mode (cross-app comparison) the COMMERCE
+            # shopping rules — which actively drive toward add-to-cart — are
+            # exactly wrong. Swap in the read-only PROBE_ADDENDUM so the model
+            # only reads the price and finishes with a `report` action.
+            if self._read_only and profile.enforce_shopping_guards:
+                parts.append(prompts.PROBE_ADDENDUM)
+            else:
+                parts.append(profile.prompt_addendum)
         skill = self._skills.get(package) if self._skills else None
         if skill:
             parts.append(skill)
@@ -1229,6 +1306,43 @@ class Orchestrator:
             "is added and no [CART] element is listed, swipe up to reveal the "
             "cart bar (the orchestrator will return you toward the home screen if "
             "that fails), then tap the visible cart bar/icon"
+        )
+
+    @staticmethod
+    def _readonly_violation_rejection(
+        action: dict, elements: list[UiElement]
+    ) -> str | None:
+        """Reject a cart-mutating tap during a read-only price probe.
+
+        A probe (cross-app comparison) may search, open a product, scroll, and
+        read the price — but it must NOT add to cart. Two signals, either is
+        enough: (1) the element under the tap coords is a primary [ACTION]
+        button (ADD / +/- / Buy / Checkout / Pay — `find_action_at`), or
+        (2) the model's own `note` states an add/checkout/pay intent
+        (`_ADD_INTENT_RE`). Returns a hint steering the model to `report`
+        instead, or None when the tap is a benign navigation/read.
+        """
+        if action.get("action") != "tap":
+            return None
+        note = str(action.get("note", ""))
+        target = None
+        try:
+            x = int(action.get("x"))
+            y = int(action.get("y"))
+            target = find_action_at(x, y, elements)
+        except (TypeError, ValueError):
+            target = None
+        if target is None and not _READONLY_FORBIDDEN_NOTE_RE.search(note):
+            return None
+        return (
+            "this is a READ-ONLY price check — do NOT tap ADD / +/- / Buy / "
+            "Checkout / Pay / Place Order / Book / Confirm / Request (those "
+            "commit an order or booking). Just read "
+            "the displayed price and delivery time. Open the product if you "
+            "need the price, then finish with a report action: "
+            '{"action":"report","data":{"price":<number or null>,'
+            '"currency":"INR","eta":"<string or null>","available":true,'
+            '"item_name":"<what you found>","notes":"<short>"}}'
         )
 
     @staticmethod
@@ -2194,6 +2308,32 @@ class Orchestrator:
             )
         except Exception:
             pass
+
+
+def _summarize_report(report: dict) -> str:
+    """One-line human summary of a probe `report` payload.
+
+    Used as the task's final_summary when the model didn't supply its own
+    `summary` string on a `report` action. Tolerant of missing keys — a probe
+    that found nothing still produces a readable line.
+    """
+    if not report:
+        return "no result"
+    name = str(report.get("item_name") or "").strip()
+    if report.get("available") is False:
+        return f"{name or 'item'}: unavailable"
+    bits: list[str] = []
+    price = report.get("price")
+    if price is not None:
+        currency = str(report.get("currency") or "INR").strip()
+        symbol = "₹" if currency.upper() == "INR" else f"{currency} "
+        bits.append(f"{symbol}{price}")
+    eta = str(report.get("eta") or "").strip()
+    if eta:
+        bits.append(eta)
+    if name:
+        bits.append(name)
+    return " · ".join(bits) if bits else "no result"
 
 
 def _actions_equivalent(a: dict, b: dict) -> bool:

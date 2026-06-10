@@ -35,3 +35,8 @@ class Task:
     # confirms once per checkout. Reset implicitly per task (new Task
     # instance = fresh flag).
     payment_pre_approved: bool = False
+    # Structured payload from a `report` terminal action (the read-only probe
+    # path used by cross-app comparison). None for ordinary tasks that finish
+    # with `done`. Carries e.g. {price, currency, eta, available, item_name,
+    # notes} — see config.prompts.PROBE_ADDENDUM for the schema the model fills.
+    report: dict | None = None

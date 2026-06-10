@@ -5,7 +5,7 @@ import json
 
 
 ALLOWED_ACTIONS: frozenset[str] = frozenset(
-    {"tap", "type", "swipe", "done", "need_approval", "wait"}
+    {"tap", "type", "swipe", "done", "need_approval", "wait", "report"}
 )
 
 # Common synonyms from different model families. Qwen / GUI-agent models
@@ -36,7 +36,11 @@ BLOCKED_ACTIONS: tuple[str, ...] = (
 #   - summary: the final summary on done
 #   - note:    short human-readable description on state-changing actions
 #              (e.g. "tapping ADD on Amul Taaza Milk 500ml")
-_CONTENT_FIELDS = frozenset({"text", "reason", "summary", "note"})
+#   - data:    structured model-generated payload on a `report` terminal action
+#              (price/eta/item_name/notes). It's never dispatched to the device,
+#              so a product name like "remove-bee balm" must not false-trip the
+#              blocklist substring scan.
+_CONTENT_FIELDS = frozenset({"text", "reason", "summary", "note", "data"})
 
 
 _TAP_POINT_KEYS = ("coordinate", "point", "coord", "position", "bbox_2d", "box_2d")
@@ -191,6 +195,16 @@ def validate(action_json: dict) -> tuple[bool, str]:
                     f"(got {type(action_json.get(k)).__name__}); "
                     "expected integer pixel coordinate"
                 )
+    elif action_type == "report":
+        # Read-only probe terminal. `data` carries the structured quote; if the
+        # model includes it, it must be a JSON object. A missing `data` is
+        # tolerated — the orchestrator coerces it to {} — so a probe that found
+        # nothing can still report cleanly.
+        data = action_json.get("data")
+        if data is not None and not isinstance(data, dict):
+            return False, (
+                f"report 'data' must be an object, got {type(data).__name__}"
+            )
 
     structural = {k: v for k, v in action_json.items() if k not in _CONTENT_FIELDS}
     blob = json.dumps(structural, default=str).lower()

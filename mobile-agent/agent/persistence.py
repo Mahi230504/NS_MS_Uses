@@ -46,6 +46,22 @@ CREATE TABLE IF NOT EXISTS steps (
 );
 
 CREATE INDEX IF NOT EXISTS idx_steps_task ON steps (task_id, idx);
+
+CREATE TABLE IF NOT EXISTS comparisons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    query TEXT NOT NULL,
+    category TEXT NOT NULL,
+    ranking_key TEXT NOT NULL,
+    quotes_json TEXT NOT NULL,
+    winner_app_id TEXT,
+    chosen_app_id TEXT,
+    created_at TEXT NOT NULL,
+    ordered_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_comparisons_user_created
+    ON comparisons (user_id, created_at DESC);
 """
 
 # Terminal states — used to flag what counts as a "still-running" orphan at
@@ -86,6 +102,28 @@ class TaskRow:
         except ValueError:
             return None
         return (end - start).total_seconds()
+
+
+@dataclass(frozen=True)
+class ComparisonRow:
+    id: int
+    user_id: int
+    query: str
+    category: str
+    ranking_key: str
+    quotes_json: str
+    winner_app_id: str | None
+    chosen_app_id: str | None
+    created_at: str
+    ordered_at: str | None
+
+    def quotes(self) -> list[dict]:
+        """Parsed per-app quotes; [] if the JSON is somehow malformed."""
+        try:
+            data = json.loads(self.quotes_json)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return data if isinstance(data, list) else []
 
 
 class TaskRepository:
@@ -185,6 +223,75 @@ class TaskRepository:
             )
             rows = await cursor.fetchall()
             return [TaskRow(**dict(r)) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Cross-app comparison records (feature #6)
+
+    async def insert_comparison(
+        self,
+        *,
+        user_id: int,
+        query: str,
+        category: str,
+        ranking_key: str,
+        quotes: list[dict],
+        winner_app_id: str | None,
+    ) -> int:
+        """Persist a completed comparison; returns the new row id."""
+        async with aiosqlite.connect(self._path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO comparisons
+                    (user_id, query, category, ranking_key, quotes_json,
+                     winner_app_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    query,
+                    category,
+                    ranking_key,
+                    json.dumps(quotes, default=str),
+                    winner_app_id,
+                    _utcnow(),
+                ),
+            )
+            await db.commit()
+            return cursor.lastrowid  # type: ignore[return-value]
+
+    async def set_comparison_chosen(
+        self, comparison_id: int, chosen_app_id: str
+    ) -> None:
+        """Record which app the user chose to order from (and when)."""
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                UPDATE comparisons
+                SET chosen_app_id = ?, ordered_at = ?
+                WHERE id = ?
+                """,
+                (chosen_app_id, _utcnow(), comparison_id),
+            )
+            await db.commit()
+
+    async def list_recent_comparisons(
+        self, user_id: int, limit: int = 10
+    ) -> list[ComparisonRow]:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT id, user_id, query, category, ranking_key, quotes_json,
+                       winner_app_id, chosen_app_id, created_at, ordered_at
+                FROM comparisons
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            )
+            rows = await cursor.fetchall()
+            return [ComparisonRow(**dict(r)) for r in rows]
 
     async def recover_orphans(self) -> int:
         """Flip any non-terminal rows to FAILED("bot restarted while running").

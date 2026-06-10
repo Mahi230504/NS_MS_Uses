@@ -5,12 +5,14 @@ import asyncio
 import logging
 from pathlib import Path
 
+from agent.comparison import ComparisonEngine
 from agent.orchestrator import Orchestrator
 from agent.persistence import TaskRepository
 from agent.profiles import resolve_profile
 from agent.providers import make_provider
 from agent.skills import SkillRegistry
 from bot.handlers import Handlers
+from bot.intent import IntentClassifier
 from bot.pairing import PairCodeIssuer
 from bot.router import Router
 from bot.telegram_bot import build_application, register_handlers
@@ -155,11 +157,22 @@ def main() -> None:
         profile_resolver=resolve_profile,
     )
 
-    # Intent router — only wire if the provider supports text completion
-    # (currently OpenRouter). Other providers fall back to menu-only flow.
+    # Intent router + classifier + comparison engine — only wire if the
+    # provider supports text completion (currently OpenRouter). Other providers
+    # fall back to menu-only flow with no router/comparison.
     router_instance: Router | None = None
+    classifier_instance: IntentClassifier | None = None
+    comparison_engine: ComparisonEngine | None = None
     if hasattr(vision, "complete_text"):
         router_instance = Router(vision)  # type: ignore[arg-type]
+        classifier_instance = IntentClassifier(
+            vision,  # type: ignore[arg-type]
+            router_instance,
+            max_candidates=settings.comparison_max_candidates,
+        )
+        # Salvage provider == the same vision provider (uses complete_text to
+        # recover a quote when a probe forgets to `report`).
+        comparison_engine = ComparisonEngine(orchestrator, salvage_provider=vision)
 
     app = build_application(settings.telegram_bot_token)
     handlers = Handlers(
@@ -171,6 +184,8 @@ def main() -> None:
         repo=repo,
         admin_id=settings.telegram_admin_id,
         router=router_instance,
+        classifier=classifier_instance,
+        comparison=comparison_engine,
     )
 
     orchestrator.on_approval_request = handlers.on_approval_request
