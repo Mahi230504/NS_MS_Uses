@@ -92,6 +92,7 @@ def build_dashboard_app(
     event_bus,
     token: str,
     owner_user_id: int,
+    hitl=None,
     cors_origin: str = "http://localhost:5173",
     dist_dir: Path | None = None,
 ) -> web.Application:
@@ -101,7 +102,7 @@ def build_dashboard_app(
     def _cors(resp: web.StreamResponse) -> web.StreamResponse:
         resp.headers["Access-Control-Allow-Origin"] = cors_origin
         resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         return resp
 
     def _authorized(request: web.Request) -> bool:
@@ -256,6 +257,31 @@ def build_dashboard_app(
             for r in rows
         ]})
 
+    async def approval(request: web.Request) -> web.Response:
+        """Approve/deny the pending HITL request from the dashboard.
+
+        Mirrors the Telegram Approve/Deny buttons — grants/denies the SAME gate
+        the orchestrator is awaiting. No-op (applied=false) when nothing is
+        pending, so a stale tap can't grant a future approval.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        decision = str((body or {}).get("decision", "")).strip().lower()
+        if decision not in ("approve", "deny"):
+            return web.json_response(
+                {"ok": False, "error": "decision must be 'approve' or 'deny'"},
+                status=400,
+            )
+        if hitl is None or not hitl.has_pending(owner_user_id):
+            return web.json_response({"ok": True, "applied": False})
+        if decision == "approve":
+            hitl.grant(owner_user_id)
+        else:
+            hitl.deny(owner_user_id)
+        return web.json_response({"ok": True, "applied": True, "decision": decision})
+
     async def comparisons(_: web.Request) -> web.Response:
         rows = await repo.list_recent_comparisons(owner_user_id, limit=25)
         return web.json_response({"items": [
@@ -280,6 +306,7 @@ def build_dashboard_app(
     r.add_get("/api/saved", saved)
     r.add_get("/api/schedules", schedules)
     r.add_get("/api/comparisons", comparisons)
+    r.add_post("/api/approval", approval)
 
     # Serve the built SPA (single process) when present. Unknown non-/api paths
     # fall back to index.html for client-side routing.

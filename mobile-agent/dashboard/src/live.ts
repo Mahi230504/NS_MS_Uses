@@ -26,6 +26,7 @@ interface LiveState {
   steps: Map<number, LiveStep>;
   approval: { reason: string; note: string } | null;
   setConnected: (b: boolean) => void;
+  clearApproval: () => void;
   apply: (ev: any) => void;
 }
 
@@ -38,6 +39,7 @@ export const useLive = create<LiveState>((set) => ({
   steps: new Map(),
   approval: null,
   setConnected: (b) => set({ connected: b }),
+  clearApproval: () => set({ approval: null }),
   apply: (ev) =>
     set((s) => {
       if (ev.type === "step") {

@@ -227,6 +227,7 @@ def main() -> None:
             event_bus=event_bus,
             token=settings.dashboard_token,
             owner_user_id=settings.webhook_owner_user_id,
+            hitl=hitl,
             cors_origin=settings.dashboard_cors_origin,
             dist_dir=Path(settings.dashboard_dist_dir),
         )

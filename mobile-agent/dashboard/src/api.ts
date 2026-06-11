@@ -110,6 +110,19 @@ export async function api<T>(path: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export async function apiPost<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`/api${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${getToken()}`,
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json() as Promise<T>;
+}
+
 /** Tiny data hook: fetch on mount + when `deps` change. */
 export function useApi<T>(path: string, deps: unknown[] = []): {
   data: T | null;

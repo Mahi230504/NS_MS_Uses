@@ -75,6 +75,86 @@ def _q(token: str = TOKEN) -> dict:
     return {"token": token}
 
 
+class _FakeHitl:
+    def __init__(self, pending: bool = True) -> None:
+        self._pending = pending
+        self.granted = False
+        self.denied = False
+
+    def has_pending(self, _uid: int) -> bool:
+        return self._pending
+
+    def grant(self, _uid: int) -> None:
+        self.granted = True
+        self._pending = False
+
+    def deny(self, _uid: int) -> None:
+        self.denied = True
+        self._pending = False
+
+
+async def _approval_client(tmp_path, hitl):
+    db = tmp_path / "t.db"
+    base = TaskRepository(db)
+    await base.initialize()
+    app = build_dashboard_app(
+        repo=base, saved_repo=SavedTaskRepository(db),
+        schedule_repo=ScheduleRepository(db), event_bus=EventBus(),
+        token=TOKEN, owner_user_id=OWNER, hitl=hitl, dist_dir=None,
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    return client
+
+
+class TestApproval:
+    async def test_approve_grants(self, tmp_path) -> None:
+        hitl = _FakeHitl(pending=True)
+        client = await _approval_client(tmp_path, hitl)
+        try:
+            r = await client.post("/api/approval", params=_q(), json={"decision": "approve"})
+            body = await r.json()
+            assert r.status == 200 and body["applied"] is True
+            assert hitl.granted is True and hitl.denied is False
+        finally:
+            await client.close()
+
+    async def test_deny_denies(self, tmp_path) -> None:
+        hitl = _FakeHitl(pending=True)
+        client = await _approval_client(tmp_path, hitl)
+        try:
+            await client.post("/api/approval", params=_q(), json={"decision": "deny"})
+            assert hitl.denied is True
+        finally:
+            await client.close()
+
+    async def test_no_pending_is_noop(self, tmp_path) -> None:
+        hitl = _FakeHitl(pending=False)
+        client = await _approval_client(tmp_path, hitl)
+        try:
+            r = await client.post("/api/approval", params=_q(), json={"decision": "approve"})
+            assert (await r.json())["applied"] is False
+            assert hitl.granted is False
+        finally:
+            await client.close()
+
+    async def test_bad_decision_400(self, tmp_path) -> None:
+        client = await _approval_client(tmp_path, _FakeHitl())
+        try:
+            r = await client.post("/api/approval", params=_q(), json={"decision": "maybe"})
+            assert r.status == 400
+        finally:
+            await client.close()
+
+    async def test_requires_token(self, tmp_path) -> None:
+        client = await _approval_client(tmp_path, _FakeHitl())
+        try:
+            r = await client.post("/api/approval", json={"decision": "approve"})
+            assert r.status == 401
+        finally:
+            await client.close()
+
+
 class TestAuth:
     async def test_health_open(self, ctx) -> None:
         r = await ctx.client.get("/api/health")

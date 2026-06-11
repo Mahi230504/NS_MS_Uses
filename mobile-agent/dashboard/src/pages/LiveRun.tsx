@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { apiPost } from "../api";
 import { DeviceCanvas } from "../components/DeviceCanvas";
 import { Card, Empty, StatePill } from "../components/bits";
 import { orderedSteps, useLive } from "../live";
@@ -9,7 +10,21 @@ export default function LiveRun() {
   const description = useLive((s) => s.description);
   const summary = useLive((s) => s.summary);
   const approval = useLive((s) => s.approval);
+  const clearApproval = useLive((s) => s.clearApproval);
   const steps = useLive((s) => orderedSteps(s.steps));
+  const [deciding, setDeciding] = useState(false);
+
+  const decide = async (decision: "approve" | "deny") => {
+    setDeciding(true);
+    try {
+      await apiPost("/approval", { decision });
+      clearApproval();
+    } catch {
+      /* leave the banner up so the user can retry (or use Telegram) */
+    } finally {
+      setDeciding(false);
+    }
+  };
 
   // Auto-follow the latest step unless the user scrubs back.
   const [manual, setManual] = useState<number | null>(null);
@@ -91,10 +106,29 @@ export default function LiveRun() {
         {approval && (
           <Card className="p-5 ring-amber-400/30">
             <div className="flex items-center gap-2 text-amber-300">
-              <span className="h-2 w-2 rounded-full bg-amber-400" />
-              Approval pending — respond in Telegram
+              <span className="h-2 w-2 rounded-full bg-amber-400 animate-ping2" />
+              Approval needed
             </div>
             <div className="mt-2 text-sm text-zinc-300">{approval.reason}</div>
+            <div className="mt-4 flex gap-3">
+              <button
+                disabled={deciding}
+                onClick={() => decide("approve")}
+                className="flex-1 rounded-lg bg-emerald-500/90 px-3 py-2 text-sm font-medium text-black hover:bg-emerald-400 disabled:opacity-50"
+              >
+                Approve
+              </button>
+              <button
+                disabled={deciding}
+                onClick={() => decide("deny")}
+                className="flex-1 rounded-lg bg-red-500/20 px-3 py-2 text-sm font-medium text-red-200 ring-1 ring-red-400/40 hover:bg-red-500/30 disabled:opacity-50"
+              >
+                Deny
+              </button>
+            </div>
+            <div className="mt-2 text-center text-xs text-zinc-500">
+              You can also approve in Telegram.
+            </div>
           </Card>
         )}
 
