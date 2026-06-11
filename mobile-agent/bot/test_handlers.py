@@ -131,6 +131,17 @@ class TestConfirm:
         assert 42 not in h._pending
         assert "cancel" in msg.lower()
 
+    async def test_confirm_survives_telegram_send_failure(self) -> None:
+        # A Telegram network blip on the "Starting…" status line must not crash
+        # the confirm — the task should still launch (status comes later).
+        h, app, orch = _make(router=_FixedRouter(_route("milk")))
+        await h.handle_external_trigger(42, "order milk on blinkit")
+        app.bot.send_message = AsyncMock(side_effect=RuntimeError("network down"))
+        msg = await h.handle_external_confirm(42, True)
+        await asyncio.sleep(0)
+        orch.run_task.assert_called_once()  # launched despite the send failure
+        assert "Telegram" in msg
+
     async def test_confirm_without_pending(self) -> None:
         h, app, orch = _make()
         msg = await h.handle_external_confirm(42, True)

@@ -1037,12 +1037,12 @@ class Handlers:
                 sess.app_id = route.app.id
                 sess.task_id = route.task.id
                 sess.state = SessionState.AWAITING_PARAM
-                await self._app.bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        f"{route.app.emoji} {route.app.name} → {route.task.label}\n\n"
-                        f"{route.task.param_prompt}"
-                    ),
+                # Best-effort: a Telegram network blip must not crash the
+                # voice trigger (the webhook would 500 and nothing proceeds).
+                await self._notify(
+                    user_id,
+                    f"{route.app.emoji} {route.app.name} → {route.task.label}\n\n"
+                    f"{route.task.param_prompt}",
                 )
                 return f"{route.app.name} needs a detail — check Telegram to continue."
             description = render_prompt(route.task.template, route.param)
@@ -1111,9 +1111,9 @@ class Handlers:
         sess.app_id = None
         sess.task_id = None
         task = Task(user_id=user_id, description=pending.description)
-        await self._app.bot.send_message(
-            chat_id=user_id, text=f"Starting: {pending.description}"
-        )
+        # Best-effort: a Telegram network blip on this status line must not
+        # crash the confirm and prevent the task from launching.
+        await self._notify(user_id, f"Starting: {pending.description}")
         self._spawn_task(
             user_id, task, launch_package=pending.launch_package,
             last_run=_LastRun(
