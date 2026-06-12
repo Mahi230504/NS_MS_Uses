@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -14,6 +15,8 @@ from telegram.ext import Application, ContextTypes
 from agent.comparison import ComparisonEngine, ComparisonResult, ProbeTarget
 from agent.orchestrator import Orchestrator
 from agent.persistence import (
+    CloudActionRepository,
+    ContactRepository,
     SavedTaskRepository,
     SavedTaskRow,
     ScheduleRepository,
@@ -31,7 +34,9 @@ from bot.apps import (
 )
 from bot.intent import (
     CompareIntent,
+    EmailIntent,
     IntentClassifier,
+    MeetingIntent,
     RunSavedIntent,
     SaveIntent,
     ScheduleIntent,
@@ -43,6 +48,13 @@ from bot.scheduler import build_schedule_spec, describe_schedule
 from bot.session import Session, SessionState, SessionStore
 from bot.users import UserPolicy, UserRecord, UserStore
 from security.hitl_gate import HitlGate
+from services.google_auth import GoogleAuthError
+from services.google_workspace import (
+    CalendarService,
+    CloudActionError,
+    DirectoryService,
+    GmailService,
+)
 
 
 # Inline-keyboard layout knobs.
@@ -112,13 +124,15 @@ class _PendingIntent:
 
     `compare` is set when the pending item is a cross-app comparison rather than
     a single task — handle_external_confirm launches the comparison flow instead
-    of a direct run_task.
+    of a direct run_task. `cloud` is set when it's a cloud action (Gmail send /
+    Meet invite) — those execute off-device and never touch `_running`.
     """
 
     description: str
     launch_package: str | None
     created_at: float
     compare: CompareIntent | None = None
+    cloud: object | None = None
 
 
 @dataclass
@@ -163,6 +177,11 @@ class Handlers:
         schedules: ScheduleRepository | None = None,
         timezone_name: str = "Asia/Kolkata",
         event_bus=None,
+        gmail: GmailService | None = None,
+        gcal: CalendarService | None = None,
+        cloud_repo: CloudActionRepository | None = None,
+        contacts: ContactRepository | None = None,
+        directory: DirectoryService | None = None,
     ) -> None:
         self._app = application
         self._orch = orchestrator
@@ -183,6 +202,15 @@ class Handlers:
         self._tz = timezone_name
         # Dashboard event bus (#6 viz). None when the dashboard is off.
         self._event_bus = event_bus
+        # Cloud actions (Gmail send / Meet invites). None = disabled — the
+        # user gets a "connect Google" hint instead of an attempt.
+        self._gmail = gmail
+        self._gcal = gcal
+        self._cloud_repo = cloud_repo
+        self._contacts = contacts
+        # Workspace directory resolver (Route C). None = no directory fallback;
+        # bare names that miss the local book come back "missing" as before.
+        self._directory = directory
         self._sessions = SessionStore()
         self._running: dict[int, asyncio.Task] = {}
         # External-trigger proposals awaiting a spoken yes/no, keyed by user.
@@ -303,6 +331,13 @@ class Handlers:
                     )
                     return
                 await self._run_saved(update.message, user.id, row)
+                return
+            if isinstance(intent, (EmailIntent, MeetingIntent)):
+                # Typed text is deliberate — execute the cloud action now. The
+                # voice path stages it for a spoken confirm instead.
+                await update.message.reply_text(
+                    await self._execute_cloud(user.id, intent)
+                )
                 return
             if isinstance(intent, SingleIntent):
                 await self._launch_route(update, user.id, intent.route)
@@ -705,6 +740,30 @@ class Handlers:
         user_id = row.user_id
         if not self._is_paired(user_id):
             return False
+        if row.action_kind != "device":
+            # Cloud fire: no phone involved, so it neither consults nor
+            # occupies the one-task-per-user slot — it runs even while a
+            # device task is mid-flight.
+            try:
+                payload = json.loads(row.payload_json or "")
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            intent = EmailIntent(
+                to=tuple(payload.get("to") or ()),
+                subject=str(payload.get("subject") or ""),
+                body=str(payload.get("body") or ""),
+            )
+            line = await self._execute_cloud_email(user_id, intent)
+            await self._notify(user_id, f'⏰ Scheduled "{row.name}": {line}')
+            # The 📧 marker only appears on the success line, so it doubles as
+            # the done/failed signal for the last_state column.
+            if self._schedules is not None:
+                await self._schedules.set_last_state(
+                    row.id, "done" if line.startswith("📧") else "failed"
+                )
+            return True
         if self._has_running_task(user_id):
             await self._notify(
                 user_id,
@@ -751,13 +810,46 @@ class Handlers:
             freq=intent.freq, time_str=intent.time_str, tz=self._tz,
             now=datetime.now(timezone.utc),
             weekday_name=intent.weekday_name, day_of_month=intent.day_of_month,
+            date_str=intent.date_str,
         )
         if spec is None:
             return (
                 "I couldn't understand that schedule. Try e.g. "
                 '"order milk on blinkit every day at 9am".'
             )
+        if intent.action_kind == "email" and intent.payload is not None:
+            # Cloud schedule: resolve contact names NOW so a typo'd name fails
+            # here, not silently when the schedule fires unattended.
+            email = intent.payload
+            emails, missing = await self._resolve_recipients(user_id, email.to)
+            if missing:
+                return _missing_contacts_line(missing)
+            name = intent.name or f"Email: {email.subject[:40]}"
+            sid = await self._schedules.insert(
+                user_id=user_id, name=name, freq=intent.freq,
+                at_minute=spec["at_minute"], tz=self._tz,
+                raw_description=f'Email {", ".join(emails)}: {email.subject}',
+                next_run_at=spec["next_run_at"],
+                weekday=spec["weekday"], day_of_month=spec["day_of_month"],
+                action_kind="email",
+                payload_json=json.dumps(
+                    {"to": emails, "subject": email.subject, "body": email.body}
+                ),
+            )
+            phrase = describe_schedule(
+                intent.freq, spec["at_minute"], spec["weekday"],
+                spec["day_of_month"],
+            )
+            return (
+                f'✉ Scheduled "{name}" {phrase} (#{sid}). '
+                f"Next run: {_fmt_local(spec['next_run_at'], self._tz)}."
+            )
         route = intent.route
+        if route is None:
+            return (
+                "I couldn't understand that schedule. Try e.g. "
+                '"order milk on blinkit every day at 9am".'
+            )
         description = render_prompt(route.task.template, route.param)
         name = intent.name or f"{route.app.name}: {route.task.label}"
         sid = await self._schedules.insert(
@@ -781,6 +873,181 @@ class Handlers:
             f'📅 Scheduled "{name}" {phrase} (#{sid}). '
             f"Next run: {_fmt_local(spec['next_run_at'], self._tz)}.{pay}"
         )
+
+    # ------------------------------------------------------------------
+    # Cloud actions: Gmail send + Meet scheduling (no phone involved)
+
+    async def _resolve_recipients(
+        self, user_id: int, raw: tuple[str, ...]
+    ) -> tuple[list[str], list[str]]:
+        """Split raw recipients into (resolved emails, unknown contact names).
+
+        Tokens containing "@" are already addresses; everything else is looked
+        up in the local contact book (case-insensitive), then — on a miss — in
+        the Google Workspace directory (Route C). A name that resolves nowhere
+        comes back missing; the caller's line tells the user how to add it.
+        """
+        resolved: list[str] = []
+        missing: list[str] = []
+        for token in raw:
+            token = token.strip()
+            if not token:
+                continue
+            if "@" in token:
+                resolved.append(token)
+                continue
+            row = (
+                await self._contacts.get(user_id, token)
+                if self._contacts is not None
+                else None
+            )
+            if row is not None:
+                resolved.append(row.email)
+                continue
+            email = await self._resolve_via_directory(user_id, token)
+            if email is not None:
+                resolved.append(email)
+            else:
+                missing.append(token)
+        return resolved, missing
+
+    async def _resolve_via_directory(
+        self, user_id: int, name: str
+    ) -> str | None:
+        """Resolve a bare name against the Workspace directory; None if unsure.
+
+        Only an UNAMBIGUOUS hit resolves (exactly one match, or exactly one
+        exact-name match among several) — guessing could email the wrong
+        person. Never raises: a not-connected/locked-down/erroring directory
+        degrades to None so the name simply comes back "missing". A hit is
+        cached into the local book (lazy sync) so the next lookup is instant.
+        """
+        if self._directory is None:
+            return None
+        try:
+            matches = await self._directory.resolve_name(name)
+        except (GoogleAuthError, CloudActionError):
+            return None
+        match = _pick_directory_match(name, matches)
+        if match is None:
+            return None
+        if self._contacts is not None:
+            try:
+                await self._contacts.upsert(
+                    user_id=user_id, name=name, email=match.email
+                )
+            except Exception:
+                pass
+        return match.email
+
+    async def _log_cloud(
+        self,
+        user_id: int,
+        kind: str,
+        payload: dict,
+        result: dict | None,
+        *,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        """Best-effort history row + dashboard event for a cloud attempt."""
+        if self._cloud_repo is not None:
+            try:
+                await self._cloud_repo.insert(
+                    user_id=user_id, kind=kind, payload=payload,
+                    result=result, status=status, error=error,
+                )
+            except Exception:
+                pass
+        if self._event_bus is not None:
+            try:
+                summary = payload.get("subject") or payload.get("title") or kind
+                self._event_bus.publish({
+                    "type": "cloud",
+                    "kind": kind,
+                    "user_id": user_id,
+                    "summary": str(summary),
+                    "status": status,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception:
+                pass
+
+    async def _execute_cloud_email(
+        self, user_id: int, intent: EmailIntent
+    ) -> str:
+        """Send an EmailIntent via Gmail; returns the one user-facing line."""
+        if self._gmail is None:
+            return (
+                "Email isn't set up — connect Google from the dashboard "
+                "Settings page."
+            )
+        emails, missing = await self._resolve_recipients(user_id, intent.to)
+        if missing:
+            return _missing_contacts_line(missing)
+        payload = {"to": emails, "subject": intent.subject, "body": intent.body}
+        try:
+            result = await self._gmail.send_email(
+                to=emails, subject=intent.subject, body=intent.body
+            )
+        except GoogleAuthError as e:
+            return str(e)
+        except CloudActionError as e:
+            await self._log_cloud(
+                user_id, "email", payload, None, status="error", error=str(e)
+            )
+            return f"Couldn't send the email: {e}"
+        await self._log_cloud(user_id, "email", payload, result, status="ok")
+        return f'📧 Sent "{intent.subject}" to {", ".join(emails)}.'
+
+    async def _execute_cloud_meeting(
+        self, user_id: int, intent: MeetingIntent
+    ) -> str:
+        """Create a Calendar event + Meet link; returns the one user-facing line."""
+        if self._gcal is None:
+            return (
+                "Meetings aren't set up — connect Google from the dashboard "
+                "Settings page."
+            )
+        emails, missing = await self._resolve_recipients(
+            user_id, intent.attendees
+        )
+        if missing:
+            return _missing_contacts_line(missing)
+        payload = {
+            "title": intent.title,
+            "attendees": emails,
+            "start_local": intent.start_local,
+            "duration_minutes": intent.duration_minutes,
+            "description": intent.description,
+        }
+        try:
+            result = await self._gcal.create_meeting(
+                title=intent.title, start_local=intent.start_local,
+                duration_minutes=intent.duration_minutes, tz=self._tz,
+                attendees=emails, description=intent.description,
+            )
+        except GoogleAuthError as e:
+            return str(e)
+        except CloudActionError as e:
+            await self._log_cloud(
+                user_id, "meeting", payload, None, status="error", error=str(e)
+            )
+            return f"Couldn't schedule the meeting: {e}"
+        when = _fmt_meeting_start(intent.start_local)
+        line = f"📅 Meet scheduled: {intent.title} — {when}."
+        if emails:
+            line += f" Invite sent to {len(emails)} people."
+        if result.get("meet_link"):
+            line += f" {result['meet_link']}"
+        await self._log_cloud(user_id, "meeting", payload, result, status="ok")
+        return line
+
+    async def _execute_cloud(self, user_id: int, intent) -> str:
+        """Dispatch a cloud intent to its executor; both surfaces share it."""
+        if isinstance(intent, EmailIntent):
+            return await self._execute_cloud_email(user_id, intent)
+        return await self._execute_cloud_meeting(user_id, intent)
 
     # ------------------------------------------------------------------
     # Cross-app comparison (feature #6)
@@ -1024,6 +1291,18 @@ class Handlers:
                     created_at=time.monotonic(),
                 )
                 return f"Got it — run {row.label}. Confirm?"
+            if isinstance(intent, (EmailIntent, MeetingIntent)):
+                # Cloud actions are irreversible once sent (an email can't be
+                # unsent), so the voice path ALWAYS stages them for a spoken
+                # yes/no — never execute un-confirmed.
+                preview = _cloud_preview(intent)
+                self._pending[user_id] = _PendingIntent(
+                    description=preview,
+                    launch_package=None,
+                    created_at=time.monotonic(),
+                    cloud=intent,
+                )
+                return f"{preview}. Confirm?"
             if isinstance(intent, SingleIntent):
                 route = intent.route
         elif self._router is not None:
@@ -1091,6 +1370,21 @@ class Handlers:
             return "There's nothing to confirm — say the task first."
         if not approve:
             return "Okay, cancelled."
+
+        # A staged cloud action: runs off-device, so it neither consults nor
+        # occupies the one-task-per-user slot (deliberately ahead of the
+        # running-task guard). The result line lands on Telegram.
+        if pending.cloud is not None:
+            cloud = pending.cloud
+
+            async def _run_cloud() -> None:
+                await self._notify(
+                    user_id, await self._execute_cloud(user_id, cloud)
+                )
+
+            asyncio.create_task(_run_cloud())
+            return "On it — I'll confirm on Telegram."
+
         if self._has_running_task(user_id):
             return "A task is already running. Finish or abort it first."
 
@@ -1254,8 +1548,10 @@ class Handlers:
             phrase = describe_schedule(r.freq, r.at_minute, r.weekday, r.day_of_month)
             off = "" if r.enabled else " (off)"
             pay = " · auto-pay" if r.pay_automatically else ""
+            # Cloud schedules get the ✉ marker — they fire off-device.
+            mark = "✉ " if r.action_kind != "device" else ""
             lines.append(
-                f"#{r.id} {r.name} — {phrase}{pay}{off}\n"
+                f"#{r.id} {mark}{r.name} — {phrase}{pay}{off}\n"
                 f"    next: {_fmt_local(r.next_run_at, self._tz)}  ·  /unschedule {r.id}"
             )
         await update.message.reply_text("\n".join(lines))
@@ -1278,6 +1574,57 @@ class Handlers:
         removed = await self._schedules.delete(user.id, sid)
         await update.message.reply_text(
             f"Removed schedule #{sid}." if removed else f"No schedule #{sid}."
+        )
+
+    # ------------------------------------------------------------------
+    # Contact book (cloud actions) — what makes "email Ayush" resolvable
+
+    async def contact_cmd(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if update.message is None or user is None:
+            return
+        if not self._is_paired(user.id):
+            return
+        if self._contacts is None:
+            await update.message.reply_text("Contacts aren't enabled.")
+            return
+        args = context.args or []
+        sub = args[0].lower() if args else ""
+        if sub == "add" and len(args) >= 3 and "@" in args[-1]:
+            # Last token is the address; everything between is the name, so
+            # multi-word names ("/contact add Ayush K ayush@x.com") work.
+            name = " ".join(args[1:-1]).strip()
+            email = args[-1]
+            await self._contacts.upsert(user_id=user.id, name=name, email=email)
+            await update.message.reply_text(
+                f"Saved contact: {name.lower()} → {email}."
+            )
+            return
+        if sub == "list":
+            rows = await self._contacts.list_for(user.id)
+            if not rows:
+                await update.message.reply_text(
+                    "No contacts yet. Add one with /contact add <name> <email>."
+                )
+                return
+            lines = ["Your contacts:"]
+            lines += [f"• {r.name} — {r.email}" for r in rows]
+            await update.message.reply_text("\n".join(lines))
+            return
+        if sub == "remove" and len(args) >= 2:
+            name = " ".join(args[1:]).strip()
+            removed = await self._contacts.delete(user.id, name)
+            await update.message.reply_text(
+                f"Removed contact {name.lower()}."
+                if removed
+                else f"No contact called {name.lower()}."
+            )
+            return
+        await update.message.reply_text(
+            "Usage:\n"
+            "/contact add <name> <email>\n"
+            "/contact list\n"
+            "/contact remove <name>"
         )
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1515,6 +1862,59 @@ def _fmt_local(iso_utc: str, tz: str) -> str:
         )
     except Exception:
         return iso_utc
+
+
+# ---------------------------------------------------------------------------
+# Cloud-action rendering (Gmail send / Meet scheduling)
+
+def _pick_directory_match(name: str, matches: list) -> object | None:
+    """Choose one unambiguous directory match, or None.
+
+    0 matches → None. 1 match → it. Several → resolve only if exactly one has
+    a display name equal (case-insensitive) to the query; otherwise None, so an
+    ambiguous "Mohan" is reported missing rather than mailed to the wrong one.
+    """
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    key = name.strip().lower()
+    exact = [m for m in matches if m.name.strip().lower() == key]
+    return exact[0] if len(exact) == 1 else None
+
+
+def _missing_contacts_line(missing: list[str]) -> str:
+    """The shared "unknown recipient" line — every cloud surface returns it."""
+    return (
+        f"I don't have an email for: {', '.join(missing)}. "
+        "Add them with /contact add <name> <email> or on the dashboard."
+    )
+
+
+def _fmt_meeting_start(start_local: str) -> str:
+    """Render a "YYYY-MM-DD HH:MM" meeting start as e.g. 'Tue 15:00'."""
+    try:
+        return (
+            datetime.strptime(start_local, "%Y-%m-%d %H:%M")
+            .strftime("%a %H:%M")
+        )
+    except ValueError:
+        return start_local
+
+
+def _cloud_preview(intent) -> str:
+    """Short spoken proposal for a staged cloud action.
+
+    Recipients are echoed raw (names as spoken, not resolved addresses) so the
+    user recognizes what was heard. No trailing period — the caller appends
+    ". Confirm?", the voice-client contract token.
+    """
+    if isinstance(intent, EmailIntent):
+        return f'Email to {", ".join(intent.to)} — "{intent.subject}"'
+    line = f'Meet "{intent.title}" {_fmt_meeting_start(intent.start_local)}'
+    if intent.attendees:
+        line += f" with {', '.join(intent.attendees)}"
+    return line
 
 
 def _ranking_label(ranking_key: str) -> str:

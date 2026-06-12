@@ -17,14 +17,24 @@ Surfaces:
   GET  /api/analytics/apps                           preferred/most-used apps
   GET  /api/analytics/summary                        headline tiles
   GET  /api/saved | /api/schedules | /api/comparisons
+  GET  /api/google/status                            OAuth client + account state
+  POST /api/google/connect                           start OAuth (returns auth_url)
+  GET  /api/google/oauth/callback                    Google redirects here (no auth)
+  POST /api/google/disconnect                        forget the connected account
+  GET  /api/cloud-actions                            executed email/Meet history
+  GET|POST /api/contacts, DELETE /api/contacts/{name}  name → email address book
+  POST /api/command                                  run a typed command via the bot
   (static)  the built SPA, when a dist dir is provided
 
 Auth: a bearer token (Authorization: Bearer <t> or ?token=<t> for SSE/<img>).
-Everything except /api/health and the static bundle requires it.
+Everything except /api/health, the OAuth callback (the browser arrives from
+Google with no Bearer — it's gated by the HMAC state instead) and the static
+bundle requires it.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -95,14 +105,25 @@ def build_dashboard_app(
     hitl=None,
     cors_origin: str = "http://localhost:5173",
     dist_dir: Path | None = None,
+    google_auth=None,
+    cloud_repo=None,
+    contacts_repo=None,
+    trigger=None,
 ) -> web.Application:
     if not token:
         raise ValueError("dashboard token must be non-empty")
 
+    # OAuth CSRF state: derived from the dashboard token so it needs no extra
+    # secret or storage, and only someone who already holds the token (i.e.
+    # clicked Connect on an authed page) can mint a callback Google will pass.
+    oauth_state = hmac.new(
+        token.encode(), b"google-oauth", hashlib.sha256
+    ).hexdigest()[:32]
+
     def _cors(resp: web.StreamResponse) -> web.StreamResponse:
         resp.headers["Access-Control-Allow-Origin"] = cors_origin
         resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
         return resp
 
     def _authorized(request: web.Request) -> bool:
@@ -116,9 +137,9 @@ def build_dashboard_app(
         if request.method == "OPTIONS":
             return _cors(web.Response(status=204))
         path = request.path
-        needs_auth = path != "/api/health" and (
-            path.startswith("/api") or path == "/events"
-        )
+        needs_auth = path not in (
+            "/api/health", "/api/google/oauth/callback"
+        ) and (path.startswith("/api") or path == "/events")
         if needs_auth and not _authorized(request):
             return _cors(web.json_response(
                 {"ok": False, "error": "unauthorized"}, status=401))
@@ -248,14 +269,24 @@ def build_dashboard_app(
         if schedule_repo is None:
             return web.json_response({"items": []})
         rows = await schedule_repo.list_for(owner_user_id)
-        return web.json_response({"items": [
-            {"id": r.id, "name": r.name, "freq": r.freq, "at_minute": r.at_minute,
-             "weekday": r.weekday, "day_of_month": r.day_of_month,
-             "next_run_at": r.next_run_at, "last_run_at": r.last_run_at,
-             "enabled": bool(r.enabled), "pay_automatically": bool(r.pay_automatically),
-             "description": r.raw_description, **_app_meta(r.launch_package)}
-            for r in rows
-        ]})
+        items = []
+        for r in rows:
+            item = {
+                "id": r.id, "name": r.name, "freq": r.freq, "at_minute": r.at_minute,
+                "weekday": r.weekday, "day_of_month": r.day_of_month,
+                "next_run_at": r.next_run_at, "last_run_at": r.last_run_at,
+                "enabled": bool(r.enabled), "pay_automatically": bool(r.pay_automatically),
+                "description": r.raw_description, "action_kind": r.action_kind,
+                **_app_meta(r.launch_package),
+            }
+            if r.action_kind != "device":
+                try:
+                    payload = json.loads(r.payload_json or "")
+                except (json.JSONDecodeError, TypeError):
+                    payload = {}
+                item["payload"] = payload if isinstance(payload, dict) else {}
+            items.append(item)
+        return web.json_response({"items": items})
 
     async def approval(request: web.Request) -> web.Response:
         """Approve/deny the pending HITL request from the dashboard.
@@ -292,6 +323,119 @@ def build_dashboard_app(
             for r in rows
         ]})
 
+    async def google_status(_: web.Request) -> web.Response:
+        if google_auth is None:
+            return web.json_response({
+                "configured": False, "connected": False,
+                "email": None, "scopes": [], "connected_at": None,
+            })
+        account = google_auth.status()
+        return web.json_response({
+            "configured": bool(google_auth.configured),
+            "connected": account is not None,
+            "email": account.email if account else None,
+            "scopes": list(account.scopes) if account else [],
+            "connected_at": account.connected_at if account else None,
+        })
+
+    async def google_connect(_: web.Request) -> web.Response:
+        if google_auth is None or not google_auth.configured:
+            return web.json_response(
+                {"ok": False, "error": "google not configured"}, status=400)
+        return web.json_response({"auth_url": google_auth.build_auth_url(oauth_state)})
+
+    async def google_callback(request: web.Request) -> web.Response:
+        """Google's redirect target — the one auth-exempt route besides health.
+
+        The HMAC state (minted by /api/google/connect, round-tripped through
+        Google) is the gate here: a mismatch means the flow wasn't started from
+        an authed dashboard page, so reject before touching the code.
+        """
+        if google_auth is None:
+            return web.json_response(
+                {"ok": False, "error": "google not configured"}, status=400)
+        state = request.query.get("state", "")
+        if not hmac.compare_digest(state, oauth_state):
+            return web.json_response(
+                {"ok": False, "error": "bad state"}, status=403)
+        code = request.query.get("code", "")
+        if not code:
+            return web.json_response(
+                {"ok": False, "error": "missing code"}, status=400)
+        try:
+            await google_auth.exchange_code(code)
+        except Exception:
+            log.exception("Google OAuth code exchange failed")
+            raise web.HTTPFound("/settings?google=error") from None
+        raise web.HTTPFound("/settings?google=connected")
+
+    async def google_disconnect(_: web.Request) -> web.Response:
+        if google_auth is not None:
+            google_auth.disconnect()
+        return web.json_response({"ok": True})
+
+    async def cloud_actions(_: web.Request) -> web.Response:
+        if cloud_repo is None:
+            return web.json_response({"items": []})
+        rows = await cloud_repo.list_for(owner_user_id)
+        return web.json_response({"items": [
+            {"id": r.id, "kind": r.kind, "status": r.status, "error": r.error,
+             "created_at": r.created_at, "payload": r.payload(),
+             "result": r.result()}
+            for r in rows
+        ]})
+
+    async def contacts_list(_: web.Request) -> web.Response:
+        if contacts_repo is None:
+            return web.json_response({"items": []})
+        rows = await contacts_repo.list_for(owner_user_id)
+        return web.json_response({"items": [
+            {"id": r.id, "name": r.name, "email": r.email,
+             "created_at": r.created_at}
+            for r in rows
+        ]})
+
+    async def contacts_add(request: web.Request) -> web.Response:
+        if contacts_repo is None:
+            return web.json_response(
+                {"ok": False, "error": "contacts unavailable"}, status=503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        name = str((body or {}).get("name", "")).strip()
+        email = str((body or {}).get("email", "")).strip()
+        if not name or "@" not in email:
+            return web.json_response(
+                {"ok": False, "error": "name and a valid email are required"},
+                status=400,
+            )
+        await contacts_repo.upsert(user_id=owner_user_id, name=name, email=email)
+        return web.json_response({"ok": True})
+
+    async def contacts_delete(request: web.Request) -> web.Response:
+        if contacts_repo is None:
+            return web.json_response({"ok": False, "deleted": False})
+        deleted = await contacts_repo.delete(
+            owner_user_id, request.match_info["name"]
+        )
+        return web.json_response({"ok": True, "deleted": deleted})
+
+    async def command(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        text = str((body or {}).get("text", "")).strip()
+        if not text:
+            return web.json_response(
+                {"ok": False, "error": "text must be non-empty"}, status=400)
+        if trigger is None:
+            return web.json_response(
+                {"ok": False, "message": "command runner unavailable"})
+        message = await trigger.handle_external_run(owner_user_id, text)
+        return web.json_response({"ok": True, "message": message})
+
     app = web.Application(middlewares=[gate])
     r = app.router
     r.add_get("/api/health", health)
@@ -307,6 +451,15 @@ def build_dashboard_app(
     r.add_get("/api/schedules", schedules)
     r.add_get("/api/comparisons", comparisons)
     r.add_post("/api/approval", approval)
+    r.add_get("/api/google/status", google_status)
+    r.add_post("/api/google/connect", google_connect)
+    r.add_get("/api/google/oauth/callback", google_callback)
+    r.add_post("/api/google/disconnect", google_disconnect)
+    r.add_get("/api/cloud-actions", cloud_actions)
+    r.add_get("/api/contacts", contacts_list)
+    r.add_post("/api/contacts", contacts_add)
+    r.add_delete("/api/contacts/{name}", contacts_delete)
+    r.add_post("/api/command", command)
 
     # Serve the built SPA (single process) when present. Unknown non-/api paths
     # fall back to index.html for client-side routing.

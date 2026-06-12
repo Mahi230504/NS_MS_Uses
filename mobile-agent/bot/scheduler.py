@@ -109,13 +109,18 @@ def build_schedule_spec(
     now: datetime,
     weekday_name: object = None,
     day_of_month: object = None,
+    date_str: object = None,
 ) -> dict | None:
     """Validate + normalize a natural-language schedule into storable fields.
 
     Returns {at_minute, weekday, day_of_month, next_run_at} (next_run_at is a
     UTC ISO string), or None if the inputs are invalid/incomplete. Does NO
     natural-language parsing of its own — the LLM supplies freq/time/weekday/
-    day_of_month; this only validates and does the calendar/UTC math.
+    day_of_month/date; this only validates and does the calendar/UTC math.
+
+    `date_str` ("YYYY-MM-DD") pins a 'once' schedule to that local calendar
+    date; a date already in the past returns None (refuse, don't fire now).
+    Other freqs ignore it.
     """
     freq = (freq or "").strip().lower()
     if freq not in VALID_FREQ:
@@ -138,6 +143,22 @@ def build_schedule_spec(
             return None
         if not (1 <= dom <= 31):
             return None
+
+    if freq == "once" and date_str is not None:
+        try:
+            day = datetime.strptime(str(date_str).strip(), "%Y-%m-%d")
+            cand = _local_at(day.year, day.month, day.day, at_minute, ZoneInfo(tz))
+        except Exception:
+            return None
+        nxt = cand.astimezone(timezone.utc)
+        if nxt <= now:
+            return None
+        return {
+            "at_minute": at_minute,
+            "weekday": None,
+            "day_of_month": None,
+            "next_run_at": nxt.isoformat(),
+        }
 
     try:
         nxt = compute_next_run(

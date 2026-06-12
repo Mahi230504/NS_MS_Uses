@@ -83,6 +83,50 @@ class TestBuildScheduleSpec:
         assert build_schedule_spec(freq="yearly", time_str="9:00", tz=IST, now=NOW) is None
         assert build_schedule_spec(freq="daily", time_str="nope", tz=IST, now=NOW) is None
 
+    def test_once_with_date_pins_that_local_day(self) -> None:
+        spec = build_schedule_spec(
+            freq="once", time_str="9:00", tz=IST, now=NOW, date_str="2026-06-12"
+        )
+        # 09:00 IST on the 12th == 03:30 UTC — local wall-clock converted.
+        assert spec["next_run_at"] == datetime(
+            2026, 6, 12, 3, 30, tzinfo=timezone.utc
+        ).isoformat()
+        assert spec["at_minute"] == 540
+        assert spec["weekday"] is None and spec["day_of_month"] is None
+
+    def test_once_with_past_date_refused(self) -> None:
+        assert build_schedule_spec(
+            freq="once", time_str="9:00", tz=IST, now=NOW, date_str="2026-06-09"
+        ) is None
+        # Today but the time already passed locally (07:00 IST < 08:00 IST now).
+        assert build_schedule_spec(
+            freq="once", time_str="7:00", tz=IST, now=NOW, date_str="2026-06-10"
+        ) is None
+
+    def test_once_with_bad_date_format_refused(self) -> None:
+        for bad in ("tomorrow", "2026/06/12", "12-06-2026", ""):
+            assert build_schedule_spec(
+                freq="once", time_str="9:00", tz=IST, now=NOW, date_str=bad
+            ) is None
+
+    def test_other_freqs_ignore_date(self) -> None:
+        # A past (or garbage) date must not poison a recurring schedule.
+        spec = build_schedule_spec(
+            freq="daily", time_str="9:00", tz=IST, now=NOW, date_str="2026-06-09"
+        )
+        assert spec is not None and spec["next_run_at"] > NOW.isoformat()
+        assert build_schedule_spec(
+            freq="weekly", time_str="9:00", weekday_name="sunday", tz=IST,
+            now=NOW, date_str="nonsense",
+        ) is not None
+
+    def test_once_without_date_unchanged(self) -> None:
+        spec = build_schedule_spec(freq="once", time_str="9:00", tz=IST, now=NOW)
+        # Falls back to next occurrence of the time-of-day (today, still future).
+        assert spec["next_run_at"] == datetime(
+            2026, 6, 10, 3, 30, tzinfo=timezone.utc
+        ).isoformat()
+
     def test_describe(self) -> None:
         assert describe_schedule("daily", 540, None, None) == "every day at 09:00"
         assert "Sunday" in describe_schedule("weekly", 540, 6, None)

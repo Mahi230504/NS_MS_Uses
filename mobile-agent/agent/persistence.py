@@ -100,11 +100,38 @@ CREATE TABLE IF NOT EXISTS schedules (
     last_run_at TEXT,
     last_state TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    action_kind TEXT NOT NULL DEFAULT 'device',  -- device | email
+    payload_json TEXT               -- JSON payload for cloud kinds
 );
 
 CREATE INDEX IF NOT EXISTS idx_sched_due
     ON schedules (enabled, next_run_at);
+
+CREATE TABLE IF NOT EXISTS cloud_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,            -- email | meeting
+    payload_json TEXT NOT NULL,
+    result_json TEXT,
+    status TEXT NOT NULL,          -- ok | error
+    error TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_user_created
+    ON cloud_actions (user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_user_name
+    ON contacts (user_id, name);
 """
 
 # Terminal states — used to flag what counts as a "still-running" orphan at
@@ -208,6 +235,46 @@ class ScheduleRow:
     last_state: str | None
     enabled: int
     created_at: str
+    # Defaulted so rows from a pre-migration DB still hydrate via SELECT *.
+    action_kind: str = "device"
+    payload_json: str | None = None
+
+
+@dataclass(frozen=True)
+class CloudActionRow:
+    id: int
+    user_id: int
+    kind: str
+    payload_json: str
+    result_json: str | None
+    status: str
+    error: str | None
+    created_at: str
+
+    def payload(self) -> dict:
+        """Parsed payload; {} if the JSON is somehow malformed."""
+        try:
+            data = json.loads(self.payload_json)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def result(self) -> dict:
+        """Parsed result; {} if absent or malformed."""
+        try:
+            data = json.loads(self.result_json)  # type: ignore[arg-type]
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+
+@dataclass(frozen=True)
+class ContactRow:
+    id: int
+    user_id: int
+    name: str
+    email: str
+    created_at: str
 
 
 class TaskRepository:
@@ -225,14 +292,22 @@ class TaskRepository:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self._path) as db:
             await db.executescript(_SCHEMA)
-            # Idempotent column adds for an existing tasks table (CREATE TABLE
-            # IF NOT EXISTS won't alter one that already exists). Used by the
-            # dashboard to attribute a task to its app and find its screenshots.
-            cursor = await db.execute("PRAGMA table_info(tasks)")
-            existing = {row[1] for row in await cursor.fetchall()}
-            for col in ("launch_package", "artifact_dir"):
+            # Idempotent column adds for existing tables (CREATE TABLE IF NOT
+            # EXISTS won't alter one that already exists). tasks: app/screenshot
+            # attribution for the dashboard. schedules: cloud action kinds.
+            migrations = (
+                ("tasks", "launch_package", "TEXT"),
+                ("tasks", "artifact_dir", "TEXT"),
+                ("schedules", "action_kind", "TEXT NOT NULL DEFAULT 'device'"),
+                ("schedules", "payload_json", "TEXT"),
+            )
+            for table, col, decl in migrations:
+                cursor = await db.execute(f"PRAGMA table_info({table})")
+                existing = {row[1] for row in await cursor.fetchall()}
                 if col not in existing:
-                    await db.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
+                    await db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {col} {decl}"
+                    )
             await db.commit()
 
     async def insert_task(self, task: Task) -> int:
@@ -625,6 +700,8 @@ class ScheduleRepository:
         param: str | None = None,
         launch_package: str | None = None,
         pay_automatically: bool = False,
+        action_kind: str = "device",
+        payload_json: str | None = None,
     ) -> int:
         async with aiosqlite.connect(self._path) as db:
             cursor = await db.execute(
@@ -632,13 +709,15 @@ class ScheduleRepository:
                 INSERT INTO schedules
                     (user_id, name, freq, at_minute, weekday, day_of_month, tz,
                      app_id, task_id, param, raw_description, launch_package,
-                     pay_automatically, next_run_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     pay_automatically, next_run_at, created_at, action_kind,
+                     payload_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id, name, freq, at_minute, weekday, day_of_month, tz,
                     app_id, task_id, param, raw_description, launch_package,
                     1 if pay_automatically else 0, next_run_at, _utcnow(),
+                    action_kind, payload_json,
                 ),
             )
             await db.commit()
@@ -715,3 +794,120 @@ class ScheduleRepository:
                 (state, schedule_id),
             )
             await db.commit()
+
+
+class CloudActionRepository:
+    """Async DAO for executed cloud actions (Gmail sends, Meet bookings).
+
+    Shares the SQLite file with TaskRepository; the `cloud_actions` table is
+    created by TaskRepository.initialize() via the shared _SCHEMA. Append-only
+    history — every attempt is logged with status 'ok' or 'error'.
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._path = db_path
+
+    async def insert(
+        self,
+        *,
+        user_id: int,
+        kind: str,
+        payload: dict,
+        result: dict | None,
+        status: str,
+        error: str | None = None,
+    ) -> int:
+        async with aiosqlite.connect(self._path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO cloud_actions
+                    (user_id, kind, payload_json, result_json, status, error,
+                     created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    kind,
+                    json.dumps(payload, default=str),
+                    json.dumps(result, default=str) if result is not None else None,
+                    status,
+                    error,
+                    _utcnow(),
+                ),
+            )
+            await db.commit()
+            return cursor.lastrowid  # type: ignore[return-value]
+
+    async def list_for(
+        self, user_id: int, limit: int = 50
+    ) -> list[CloudActionRow]:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM cloud_actions
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            )
+            return [CloudActionRow(**dict(r)) for r in await cursor.fetchall()]
+
+
+class ContactRepository:
+    """Async DAO for the user's name → email address book.
+
+    Names are stored lowercase-stripped so lookups from voice/text commands
+    ("email Ayush") are case-insensitive. Uniqueness is per (user_id, name).
+    Table created by TaskRepository.initialize() via the shared _SCHEMA.
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._path = db_path
+
+    async def upsert(self, *, user_id: int, name: str, email: str) -> None:
+        """Create or replace the contact at (user_id, name)."""
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                """
+                INSERT INTO contacts (user_id, name, email, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, name) DO UPDATE SET
+                    email = excluded.email
+                """,
+                (user_id, name.strip().lower(), email, _utcnow()),
+            )
+            await db.commit()
+
+    async def get(self, user_id: int, name: str) -> ContactRow | None:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM contacts WHERE user_id = ? AND name = ?",
+                (user_id, name.strip().lower()),
+            )
+            row = await cursor.fetchone()
+            return ContactRow(**dict(row)) if row else None
+
+    async def list_for(self, user_id: int) -> list[ContactRow]:
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM contacts
+                WHERE user_id = ?
+                ORDER BY name ASC
+                """,
+                (user_id,),
+            )
+            return [ContactRow(**dict(r)) for r in await cursor.fetchall()]
+
+    async def delete(self, user_id: int, name: str) -> bool:
+        async with aiosqlite.connect(self._path) as db:
+            cursor = await db.execute(
+                "DELETE FROM contacts WHERE user_id = ? AND name = ?",
+                (user_id, name.strip().lower()),
+            )
+            await db.commit()
+            return (cursor.rowcount or 0) > 0

@@ -10,6 +10,7 @@ import Saved from "./pages/Saved";
 import Schedules from "./pages/Schedules";
 import Comparisons from "./pages/Comparisons";
 import Analytics from "./pages/Analytics";
+import Settings from "./pages/Settings";
 
 const NAV = [
   { to: "/", label: "Overview", icon: "◎", end: true },
@@ -19,6 +20,7 @@ const NAV = [
   { to: "/saved", label: "Saved", icon: "★" },
   { to: "/schedules", label: "Schedules", icon: "⏱" },
   { to: "/analytics", label: "Apps", icon: "▦" },
+  { to: "/settings", label: "Settings", icon: "⚙" },
 ];
 
 function TokenGate({ onSet }: { onSet: () => void }) {
@@ -124,6 +126,7 @@ function Shell() {
             <Route path="/schedules" element={<Schedules />} />
             <Route path="/comparisons" element={<Comparisons />} />
             <Route path="/analytics" element={<Analytics />} />
+            <Route path="/settings" element={<Settings />} />
           </Routes>
         </main>
       </div>

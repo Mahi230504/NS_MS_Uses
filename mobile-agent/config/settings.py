@@ -63,6 +63,13 @@ class Settings:
     dashboard_port: int
     dashboard_cors_origin: str
     dashboard_dist_dir: str
+    # Google cloud actions (Gmail send + Meet scheduling). Disabled when the
+    # OAuth client id/secret are empty — handlers and dashboard degrade to a
+    # "connect Google from Settings" hint instead.
+    google_client_id: str
+    google_client_secret: str
+    google_redirect_uri: str
+    google_token_path: Path
 
 
 def _resolve_config_dir() -> Path:
@@ -219,6 +226,17 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
         str(Path(__file__).resolve().parent.parent / "dashboard" / "dist"),
     ).strip()
 
+    # Google OAuth client for cloud actions. Empty id/secret disables the
+    # feature (no auth manager is constructed). The redirect default points at
+    # the dashboard's own callback route, so it must interpolate the parsed
+    # dashboard_port — keep this after the DASHBOARD_PORT block above.
+    google_client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+    google_client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    google_redirect_uri = (
+        os.environ.get("GOOGLE_REDIRECT_URI", "").strip()
+        or f"http://127.0.0.1:{dashboard_port}/api/google/oauth/callback"
+    )
+
     # Opt-in override of the emulator-only safety rule. Set to "1" / "true" /
     # "yes" to run on a physical device. Leave empty (default) to refuse.
     allow_physical = os.environ.get("ALLOW_PHYSICAL_DEVICE", "").strip().lower() in (
@@ -263,4 +281,8 @@ def load_settings(dotenv_path: str | os.PathLike | None = None) -> Settings:
         dashboard_port=dashboard_port,
         dashboard_cors_origin=dashboard_cors_origin,
         dashboard_dist_dir=dashboard_dist_dir,
+        google_client_id=google_client_id,
+        google_client_secret=google_client_secret,
+        google_redirect_uri=google_redirect_uri,
+        google_token_path=config_dir / "google_token.json",
     )

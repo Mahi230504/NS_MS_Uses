@@ -144,7 +144,8 @@ export default function Schedules() {
                         title={`${s.name} — ${hhmm(s.at_minute)}${s.pay_automatically ? " (auto-pay)" : ""}`}
                         className={"truncate rounded px-1.5 py-0.5 text-[10px] ring-1 " + colorOf(s.id)}
                       >
-                        {hhmm(s.at_minute)} {s.emoji} {s.name}
+                        {hhmm(s.at_minute)} {s.action_kind !== "device" ? "✉" : s.emoji}{" "}
+                        {s.name}
                       </div>
                     ))}
                     {fires.length > 3 && (

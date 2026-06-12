@@ -25,8 +25,10 @@ interface LiveState {
   summary: string | null;
   steps: Map<number, LiveStep>;
   approval: { reason: string; note: string } | null;
+  lastCloud: { kind: string; summary: string; status: string } | null;
   setConnected: (b: boolean) => void;
   clearApproval: () => void;
+  clearCloud: () => void;
   apply: (ev: any) => void;
 }
 
@@ -38,8 +40,10 @@ export const useLive = create<LiveState>((set) => ({
   summary: null,
   steps: new Map(),
   approval: null,
+  lastCloud: null,
   setConnected: (b) => set({ connected: b }),
   clearApproval: () => set({ approval: null }),
+  clearCloud: () => set({ lastCloud: null }),
   apply: (ev) =>
     set((s) => {
       if (ev.type === "step") {
@@ -76,6 +80,15 @@ export const useLive = create<LiveState>((set) => ({
       if (ev.type === "approval") {
         return { approval: { reason: ev.reason || "", note: ev.note || "" } };
       }
+      if (ev.type === "cloud") {
+        return {
+          lastCloud: {
+            kind: ev.kind || "",
+            summary: ev.summary || "",
+            status: ev.status || "",
+          },
+        };
+      }
       return {};
     }),
 }));
@@ -93,7 +106,7 @@ export function useEventStream() {
         /* ignore malformed frame */
       }
     };
-    const names = ["step", "state", "approval", "lag", "keepalive", "message"];
+    const names = ["step", "state", "approval", "cloud", "lag", "keepalive", "message"];
     names.forEach((n) => es.addEventListener(n, onMsg as EventListener));
     es.onopen = () => setConnected(true);
     es.onerror = () => setConnected(false);

@@ -8,6 +8,8 @@ from pathlib import Path
 from agent.comparison import ComparisonEngine
 from agent.orchestrator import Orchestrator
 from agent.persistence import (
+    CloudActionRepository,
+    ContactRepository,
     SavedTaskRepository,
     ScheduleRepository,
     TaskRepository,
@@ -139,6 +141,8 @@ def main() -> None:
     repo = TaskRepository(settings.db_path)
     saved_repo = SavedTaskRepository(settings.db_path)
     schedule_repo = ScheduleRepository(settings.db_path)
+    cloud_repo = CloudActionRepository(settings.db_path)
+    contacts_repo = ContactRepository(settings.db_path)
     asyncio.run(repo.initialize())
     recovered = asyncio.run(repo.recover_orphans())
     if recovered:
@@ -150,6 +154,31 @@ def main() -> None:
     # In-process event bus: the orchestrator publishes each step/state to it,
     # the dashboard's SSE endpoint subscribes. No-op cost when no one's watching.
     event_bus = EventBus()
+
+    # Google cloud actions (Gmail send + Meet scheduling) — built only when the
+    # OAuth client is configured. Everything downstream accepts None and
+    # degrades to a "connect Google from the dashboard Settings page" hint.
+    google_auth = None
+    gmail_service = None
+    gcal_service = None
+    directory_service = None
+    if settings.google_client_id and settings.google_client_secret:
+        from services.google_auth import GoogleAuthManager
+        from services.google_workspace import (
+            CalendarService,
+            DirectoryService,
+            GmailService,
+        )
+
+        google_auth = GoogleAuthManager(
+            client_id=settings.google_client_id,
+            client_secret=settings.google_client_secret,
+            redirect_uri=settings.google_redirect_uri,
+            token_path=settings.google_token_path,
+        )
+        gmail_service = GmailService(google_auth)
+        gcal_service = CalendarService(google_auth)
+        directory_service = DirectoryService(google_auth)
 
     orchestrator = Orchestrator(
         adb,
@@ -182,6 +211,7 @@ def main() -> None:
             vision,  # type: ignore[arg-type]
             router_instance,
             max_candidates=settings.comparison_max_candidates,
+            tz=settings.timezone,
         )
         # Salvage provider == the same vision provider (uses complete_text to
         # recover a quote when a probe forgets to `report`).
@@ -203,6 +233,11 @@ def main() -> None:
         schedules=schedule_repo,
         timezone_name=settings.timezone,
         event_bus=event_bus,
+        gmail=gmail_service,
+        gcal=gcal_service,
+        cloud_repo=cloud_repo,
+        contacts=contacts_repo,
+        directory=directory_service,
     )
 
     orchestrator.on_approval_request = handlers.on_approval_request
@@ -230,6 +265,10 @@ def main() -> None:
             hitl=hitl,
             cors_origin=settings.dashboard_cors_origin,
             dist_dir=Path(settings.dashboard_dist_dir),
+            google_auth=google_auth,
+            cloud_repo=cloud_repo,
+            contacts_repo=contacts_repo,
+            trigger=handlers,
         )
     elif settings.dashboard_token:
         log.warning(

@@ -73,6 +73,8 @@ export interface ScheduleRow {
   description: string;
   app_name: string;
   emoji: string;
+  action_kind: string;
+  payload?: Record<string, unknown>;
 }
 
 export interface ComparisonRow {
@@ -85,6 +87,31 @@ export interface ComparisonRow {
   created_at: string;
   ordered_at: string | null;
   quotes: Array<Record<string, unknown>>;
+}
+
+export interface GoogleStatus {
+  configured: boolean;
+  connected: boolean;
+  email: string | null;
+  scopes: string[];
+  connected_at: string | null;
+}
+
+export interface CloudActionRow {
+  id: number;
+  kind: string;
+  status: string;
+  error: string | null;
+  created_at: string;
+  payload: Record<string, unknown>;
+  result: Record<string, unknown>;
+}
+
+export interface ContactRow {
+  id: number;
+  name: string;
+  email: string;
+  created_at: string;
 }
 
 // ---- auth + fetch ----------------------------------------------------------
@@ -118,6 +145,15 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
       Authorization: `Bearer ${getToken()}`,
     },
     body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json() as Promise<T>;
+}
+
+export async function apiDelete<T>(path: string): Promise<T> {
+  const res = await fetch(`/api${path}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${getToken()}` },
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json() as Promise<T>;

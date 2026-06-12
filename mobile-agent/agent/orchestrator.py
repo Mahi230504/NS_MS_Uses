@@ -13,7 +13,7 @@ from typing import Awaitable, Callable, Optional
 
 _log = logging.getLogger("mobile_agent.orchestrator")
 
-from agent.action_executor import execute as execute_action
+from agent.action_executor import NO_ENTER_COMMIT_PACKAGES, execute as execute_action
 from agent.persistence import TaskRepository
 from agent.phash import compute as compute_phash
 from agent.profiles import COMMERCE, AppProfile
@@ -445,6 +445,10 @@ class Orchestrator:
         self._low_rpd_warned: bool = False
         # Per-task scratch state, reset at run_task() entry.
         self._last_phash: str | None = None
+        # Foreground package from the most recent per-step read (the same
+        # read that resolves the profile) — consulted at execute time to
+        # suppress the post-type ENTER for NO_ENTER_COMMIT_PACKAGES apps.
+        self._foreground_pkg: str | None = None
         self._consecutive_synthetic_waits: int = 0
         self._consecutive_waits: int = 0
         self._cart_recover_backs: int = 0
@@ -501,6 +505,7 @@ class Orchestrator:
         self._last_step_status_at = 0.0
         self._low_rpd_warned = False
         self._last_phash = None
+        self._foreground_pkg = None
         self._consecutive_synthetic_waits = 0
         self._consecutive_waits = 0
         self._cart_recover_backs = 0
@@ -649,6 +654,7 @@ class Orchestrator:
                 # One foreground-package read per step, shared by skill lookup
                 # AND profile resolution (was a separate dumpsys per concern).
                 pkg = await self._foreground_package()
+                self._foreground_pkg = pkg
                 self._active_profile = self._resolve_profile(pkg)
                 skill_hint = self._compose_guidance(self._active_profile, pkg)
                 ui_tree, ui_elements, ui_xml = await self._lookup_ui_tree(
@@ -2297,7 +2303,11 @@ class Orchestrator:
             if backoff:
                 await asyncio.sleep(backoff)
             try:
-                return await execute_action(action, self._adb)
+                return await execute_action(
+                    action,
+                    self._adb,
+                    commit_enter=self._foreground_pkg not in NO_ENTER_COMMIT_PACKAGES,
+                )
             except AdbError as e:
                 last_err = e
                 _log.warning(

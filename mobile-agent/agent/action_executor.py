@@ -5,12 +5,16 @@ import asyncio
 
 from device.adb_controller import AdbController
 
+# Apps where the post-type ENTER must be suppressed: WhatsApp's "Enter is
+# send" setting would fire the message before the HITL approval gate.
+NO_ENTER_COMMIT_PACKAGES = frozenset({"com.whatsapp"})
+
 
 class ActionExecutionError(RuntimeError):
     """Raised when an action cannot be dispatched."""
 
 
-async def execute(action: dict, adb: AdbController) -> str:
+async def execute(action: dict, adb: AdbController, *, commit_enter: bool = True) -> str:
     """Dispatch a validated action via ADB. Returns a short result string."""
     action_type = action.get("action")
 
@@ -22,10 +26,11 @@ async def execute(action: dict, adb: AdbController) -> str:
     if action_type == "type":
         text = str(action["text"])
         await adb.type_text(text)
-        # Automatically send ENTER to dismiss the keyboard and commit searches.
-        # This prevents the keyboard from obscuring the UI for the next vision call.
-        await asyncio.sleep(0.5)
-        await adb.key_event(66) # KEYCODE_ENTER
+        if commit_enter:
+            # Automatically send ENTER to dismiss the keyboard and commit searches.
+            # This prevents the keyboard from obscuring the UI for the next vision call.
+            await asyncio.sleep(0.5)
+            await adb.key_event(66) # KEYCODE_ENTER
         return f"typed {len(text)} char(s)"
 
     if action_type == "swipe":

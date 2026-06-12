@@ -52,6 +52,7 @@ def register_handlers(app: Application, handlers: Handlers) -> None:
     app.add_handler(CommandHandler("schedule", handlers.schedule_cmd))
     app.add_handler(CommandHandler("schedules", handlers.list_schedules))
     app.add_handler(CommandHandler("unschedule", handlers.unschedule))
+    app.add_handler(CommandHandler("contact", handlers.contact_cmd))
     app.add_handler(CommandHandler("pair", handlers.pair))
     app.add_handler(CommandHandler("issue_pair_code", handlers.issue_pair_code))
     app.add_handler(CommandHandler("users", handlers.list_users))
