@@ -1,5 +1,8 @@
+import { motion } from "framer-motion";
 import { AppStat, useApi } from "../api";
-import { Card, Empty, Spinner, fmtTime } from "../components/bits";
+import { Card, Empty, Skeleton, fmtTime } from "../components/bits";
+import { Stagger, StaggerItem } from "../components/motion";
+import { Icon } from "../components/icons";
 
 export default function Analytics() {
   const { data, loading } = useApi<{ apps: AppStat[] }>("/analytics/apps");
@@ -8,38 +11,51 @@ export default function Analytics() {
 
   return (
     <div className="space-y-5">
-      <h1 className="text-xl font-semibold text-zinc-100">Your apps</h1>
       <p className="text-sm text-zinc-500">
         What you actually use the assistant for, most-used first.
       </p>
       {loading ? (
-        <Spinner />
+        <Card className="space-y-5 p-5">
+          {Array.from({ length: 5 }).map((_, i) => (
+            <div key={i} className="space-y-2">
+              <Skeleton className="h-3.5 w-1/3" />
+              <Skeleton className="h-2 w-full rounded-full" />
+            </div>
+          ))}
+        </Card>
       ) : apps.length ? (
         <Card className="p-5">
-          <div className="space-y-4">
+          <Stagger className="space-y-5" gap={0.06}>
             {apps.map((a) => (
-              <div key={a.launch_package ?? a.app_name}>
-                <div className="mb-1 flex items-center justify-between text-sm">
-                  <span className="text-zinc-200">
-                    {a.emoji} {a.app_name}
-                  </span>
-                  <span className="text-xs text-zinc-500">
-                    {a.run_count} runs · {Math.round(a.success_rate * 100)}% ok ·
-                    avg {a.avg_steps} steps · {fmtTime(a.last_used_at)}
-                  </span>
+              <StaggerItem key={a.launch_package ?? a.app_name}>
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between gap-3 text-sm">
+                    <span className="flex items-center gap-2 text-zinc-200">
+                      <span className="text-lg">{a.emoji}</span>
+                      {a.app_name}
+                    </span>
+                    <span className="font-mono text-[11px] text-zinc-500">
+                      {a.run_count} runs · {Math.round(a.success_rate * 100)}% ok
+                      · avg {a.avg_steps} steps · {fmtTime(a.last_used_at)}
+                    </span>
+                  </div>
+                  <div className="h-2.5 overflow-hidden rounded-full bg-white/5">
+                    <motion.div
+                      className="h-full origin-left rounded-full bg-brand"
+                      style={{ width: `${(a.run_count / max) * 100}%` }}
+                      initial={{ scaleX: 0 }}
+                      whileInView={{ scaleX: 1 }}
+                      viewport={{ once: true }}
+                      transition={{ duration: 0.9, ease: [0.22, 1, 0.36, 1] }}
+                    />
+                  </div>
                 </div>
-                <div className="h-2 overflow-hidden rounded-full bg-white/5">
-                  <div
-                    className="h-full rounded-full bg-gradient-to-r from-cyan-500 to-emerald-400"
-                    style={{ width: `${(a.run_count / max) * 100}%` }}
-                  />
-                </div>
-              </div>
+              </StaggerItem>
             ))}
-          </div>
+          </Stagger>
         </Card>
       ) : (
-        <Empty>No usage yet.</Empty>
+        <Empty icon={<Icon.apps className="h-6 w-6" />}>No usage yet.</Empty>
       )}
     </div>
   );

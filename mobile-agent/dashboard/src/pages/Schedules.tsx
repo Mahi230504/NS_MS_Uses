@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { ScheduleRow, useApi } from "../api";
-import { Spinner } from "../components/bits";
+import { Skeleton } from "../components/bits";
+import { Icon } from "../components/icons";
 
 // Sunday-first, like Google Calendar's default month view.
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -72,66 +73,87 @@ export default function Schedules() {
   const todayStr = new Date().toDateString();
 
   return (
-    <div className="flex h-full flex-col space-y-4">
-      <div className="flex items-center justify-between">
+    <div className="space-y-4">
+      <div className="flex items-center justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold text-zinc-100">Schedules</h1>
-          {items.length === 0 && (
+          {items.length === 0 && !loading && (
             <p className="text-sm text-zinc-500">
-              No schedules yet — say "order milk on blinkit every day at 9am" or use
-              /schedule, and it'll appear here.
+              No schedules yet — say "order milk on blinkit every day at 9am" or
+              use /schedule, and it'll appear here.
             </p>
           )}
         </div>
         <div className="flex items-center gap-2">
           <button
             onClick={goToday}
-            className="rounded-lg bg-white/5 px-3 py-1 text-sm text-zinc-300 hover:bg-white/10"
+            className="rounded-lg bg-white/5 px-3 py-1.5 text-sm font-medium text-zinc-300 ring-1 ring-white/10 transition hover:bg-white/10"
           >
             Today
           </button>
           <div className="flex items-center gap-1">
-            <button onClick={() => shift(-1)} className="rounded-lg bg-white/5 px-2.5 py-1 text-zinc-300 hover:bg-white/10">‹</button>
-            <span className="min-w-[10rem] text-center text-sm font-medium text-zinc-200">
+            <button
+              onClick={() => shift(-1)}
+              aria-label="Previous month"
+              className="grid h-8 w-8 place-items-center rounded-lg bg-white/5 text-zinc-300 transition hover:bg-white/10"
+            >
+              <Icon.chevronLeft className="h-4 w-4" />
+            </button>
+            <span className="min-w-[10.5rem] text-center font-display text-sm font-semibold text-zinc-100">
               {MONTHS[view.m]} {view.y}
             </span>
-            <button onClick={() => shift(1)} className="rounded-lg bg-white/5 px-2.5 py-1 text-zinc-300 hover:bg-white/10">›</button>
+            <button
+              onClick={() => shift(1)}
+              aria-label="Next month"
+              className="grid h-8 w-8 place-items-center rounded-lg bg-white/5 text-zinc-300 transition hover:bg-white/10"
+            >
+              <Icon.chevronRight className="h-4 w-4" />
+            </button>
           </div>
         </div>
       </div>
 
       {loading ? (
-        <Spinner />
+        <Skeleton className="h-[70vh] rounded-2xl" />
       ) : (
-        <div className="flex flex-1 flex-col overflow-hidden rounded-xl ring-1 ring-white/10">
+        <div className="overflow-hidden rounded-2xl bg-panel/40 ring-1 ring-white/10 backdrop-blur-xl">
           {/* weekday header */}
           <div className="grid grid-cols-7 border-b border-white/10 bg-white/[0.03]">
             {DOW.map((d) => (
-              <div key={d} className="px-2 py-2 text-center text-[11px] font-medium uppercase tracking-wide text-zinc-500">
+              <div
+                key={d}
+                className="px-2 py-2.5 text-center text-[11px] font-semibold uppercase tracking-wider text-zinc-500"
+              >
                 {d}
               </div>
             ))}
           </div>
           {/* day grid */}
           <div
-            className="grid flex-1 grid-cols-7"
-            style={{ gridTemplateRows: `repeat(${weeks}, minmax(96px, 1fr))` }}
+            className="grid grid-cols-7"
+            style={{ gridTemplateRows: `repeat(${weeks}, minmax(108px, 1fr))` }}
           >
             {cells.map((d, i) => {
               if (!d)
-                return <div key={i} className="border-b border-r border-white/5 bg-white/[0.01]" />;
+                return (
+                  <div
+                    key={i}
+                    className="border-b border-r border-white/5 bg-white/[0.01]"
+                  />
+                );
               const fires = items.filter((s) => firesOn(s, d));
               const isToday = d.toDateString() === todayStr;
               return (
                 <div
                   key={i}
-                  className="min-w-0 border-b border-r border-white/5 p-1.5 hover:bg-white/[0.02]"
+                  className="min-w-0 border-b border-r border-white/5 p-1.5 transition hover:bg-white/[0.025]"
                 >
                   <div className="flex justify-end">
                     <span
                       className={
-                        "grid h-6 w-6 place-items-center rounded-full text-xs " +
-                        (isToday ? "bg-cyan-500 font-semibold text-black" : "text-zinc-400")
+                        "grid h-6 w-6 place-items-center rounded-full text-xs nums " +
+                        (isToday
+                          ? "bg-brand font-semibold text-ink shadow-glow-cyan"
+                          : "text-zinc-400")
                       }
                     >
                       {d.getDate()}
@@ -141,15 +163,27 @@ export default function Schedules() {
                     {fires.slice(0, 3).map((s) => (
                       <div
                         key={s.id}
-                        title={`${s.name} — ${hhmm(s.at_minute)}${s.pay_automatically ? " (auto-pay)" : ""}`}
-                        className={"truncate rounded px-1.5 py-0.5 text-[10px] ring-1 " + colorOf(s.id)}
+                        title={`${s.name} — ${hhmm(s.at_minute)}${
+                          s.pay_automatically ? " (auto-pay)" : ""
+                        }`}
+                        className={
+                          "flex items-center gap-1 truncate rounded-md px-1.5 py-0.5 text-[10px] ring-1 " +
+                          colorOf(s.id)
+                        }
                       >
-                        {hhmm(s.at_minute)} {s.action_kind !== "device" ? "✉" : s.emoji}{" "}
-                        {s.name}
+                        <span className="font-mono">{hhmm(s.at_minute)}</span>
+                        {s.action_kind !== "device" ? (
+                          <Icon.mail className="h-3 w-3 shrink-0" />
+                        ) : (
+                          <span>{s.emoji}</span>
+                        )}
+                        <span className="truncate">{s.name}</span>
                       </div>
                     ))}
                     {fires.length > 3 && (
-                      <div className="px-1 text-[10px] text-zinc-500">+{fires.length - 3} more</div>
+                      <div className="px-1 text-[10px] text-zinc-500">
+                        +{fires.length - 3} more
+                      </div>
                     )}
                   </div>
                 </div>

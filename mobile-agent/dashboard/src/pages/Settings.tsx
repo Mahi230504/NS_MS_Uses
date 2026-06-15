@@ -7,17 +7,52 @@ import {
   apiPost,
   useApi,
 } from "../api";
-import { Card, Spinner, fmtTime } from "../components/bits";
+import { Card, Skeleton, fmtTime } from "../components/bits";
+import { Stagger, StaggerItem } from "../components/motion";
+import { Icon } from "../components/icons";
+
+const inputCls =
+  "rounded-xl bg-black/40 px-3.5 py-2.5 text-sm text-zinc-100 ring-1 ring-white/10 outline-none transition focus:ring-2 focus:ring-brand-cyan/50 placeholder:text-zinc-600";
+const primaryBtn =
+  "inline-flex items-center justify-center gap-1.5 rounded-xl bg-brand bg-[length:200%_200%] px-3.5 py-2.5 text-sm font-semibold text-ink transition hover:animate-gradient-x hover:shadow-glow-cyan disabled:opacity-50 disabled:hover:shadow-none";
+const dangerBtn =
+  "inline-flex items-center justify-center gap-1.5 rounded-xl bg-rose-500/20 px-3.5 py-2.5 text-sm font-semibold text-rose-200 ring-1 ring-rose-400/40 transition hover:bg-rose-500/30 disabled:opacity-50";
+
+function CardHeader({
+  icon,
+  title,
+  desc,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  desc: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-start gap-3">
+      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-brand-soft text-cyan-200 ring-1 ring-white/10">
+        {icon}
+      </span>
+      <div>
+        <div className="text-sm font-semibold text-zinc-100">{title}</div>
+        <p className="mt-0.5 text-xs leading-relaxed text-zinc-500">{desc}</p>
+      </div>
+    </div>
+  );
+}
 
 function StatusPill({ status }: { status: string }) {
-  const cls =
-    status === "ok"
-      ? "bg-emerald-500/15 text-emerald-300 ring-emerald-400/30"
-      : "bg-red-500/15 text-red-300 ring-red-400/30";
+  const ok = status === "ok";
   return (
     <span
-      className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ${cls}`}
+      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ${
+        ok
+          ? "bg-emerald-500/15 text-emerald-300 ring-emerald-400/30"
+          : "bg-rose-500/15 text-rose-300 ring-rose-400/30"
+      }`}
     >
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${ok ? "bg-emerald-400" : "bg-rose-400"}`}
+      />
       {status}
     </span>
   );
@@ -63,33 +98,47 @@ function GoogleCard() {
 
   return (
     <Card className="p-5">
-      <div className="text-sm font-medium text-zinc-100">Google account</div>
-      <p className="mt-1 text-xs text-zinc-500">
-        Powers cloud actions — Gmail sends and Google Meet invites, no phone needed.
-      </p>
+      <CardHeader
+        icon={<Icon.mail className="h-[18px] w-[18px]" />}
+        title="Google account"
+        desc="Powers cloud actions — Gmail sends and Google Meet invites, no phone needed."
+      />
       {banner && (
         <div
           className={
-            "mt-3 rounded-lg p-3 text-sm " +
+            "mt-4 flex items-center gap-2 rounded-xl p-3 text-sm ring-1 " +
             (banner === "connected"
-              ? "bg-emerald-500/10 text-emerald-200"
-              : "bg-red-500/10 text-red-200")
+              ? "bg-emerald-500/10 text-emerald-200 ring-emerald-400/20"
+              : "bg-rose-500/10 text-rose-200 ring-rose-400/20")
           }
         >
+          {banner === "connected" ? (
+            <Icon.check className="h-4 w-4" />
+          ) : (
+            <Icon.x className="h-4 w-4" />
+          )}
           {banner === "connected"
             ? "Google connected — you're all set."
             : "Google connection failed — try again."}
         </div>
       )}
       {loading ? (
-        <div className="mt-4">
-          <Spinner />
-        </div>
+        <Skeleton className="mt-4 h-10 w-full" />
       ) : !data ? null : !data.configured ? (
         <div className="mt-4 text-sm text-zinc-400">
-          Not configured. Set <code className="rounded bg-white/5 px-1.5 py-0.5">GOOGLE_CLIENT_ID</code>{" "}
-          and <code className="rounded bg-white/5 px-1.5 py-0.5">GOOGLE_CLIENT_SECRET</code> in the
-          bot's <code className="rounded bg-white/5 px-1.5 py-0.5">.env</code>, then restart.
+          Not configured. Set{" "}
+          <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-xs">
+            GOOGLE_CLIENT_ID
+          </code>{" "}
+          and{" "}
+          <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-xs">
+            GOOGLE_CLIENT_SECRET
+          </code>{" "}
+          in the bot's{" "}
+          <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-xs">
+            .env
+          </code>
+          , then restart.
         </div>
       ) : data.connected ? (
         <div className="mt-4 space-y-3">
@@ -102,30 +151,25 @@ function GoogleCard() {
             {data.scopes.map((s) => (
               <span
                 key={s}
-                className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-zinc-400 ring-1 ring-white/10"
+                className="rounded-full bg-white/5 px-2 py-0.5 font-mono text-[10px] text-zinc-400 ring-1 ring-white/10"
               >
                 {s.replace("https://www.googleapis.com/auth/", "")}
               </span>
             ))}
           </div>
           {data.connected_at && (
-            <div className="text-xs text-zinc-500">connected {fmtTime(data.connected_at)}</div>
+            <div className="font-mono text-xs text-zinc-500">
+              connected {fmtTime(data.connected_at)}
+            </div>
           )}
-          <button
-            disabled={busy}
-            onClick={disconnect}
-            className="rounded-lg bg-red-500/20 px-3 py-2 text-sm font-medium text-red-200 ring-1 ring-red-400/40 hover:bg-red-500/30 disabled:opacity-50"
-          >
+          <button disabled={busy} onClick={disconnect} className={dangerBtn}>
             Disconnect
           </button>
         </div>
       ) : (
-        <button
-          disabled={busy}
-          onClick={connect}
-          className="mt-4 rounded-lg bg-cyan-500/90 px-3 py-2 text-sm font-medium text-black hover:bg-cyan-400 disabled:opacity-50"
-        >
+        <button disabled={busy} onClick={connect} className={primaryBtn + " mt-4"}>
           Connect Google
+          <Icon.arrow className="h-4 w-4" />
         </button>
       )}
     </Card>
@@ -168,47 +212,53 @@ function ContactsCard() {
 
   return (
     <Card className="p-5">
-      <div className="text-sm font-medium text-zinc-100">Contacts</div>
-      <p className="mt-1 text-xs text-zinc-500">
-        Names the assistant can resolve by voice — "meet with Ayush" works once
-        Ayush is here.
-      </p>
-      <div className="mt-3 flex gap-2">
+      <CardHeader
+        icon={<Icon.saved className="h-[18px] w-[18px]" />}
+        title="Contacts"
+        desc={
+          <>
+            Names the assistant can resolve by voice — "meet with Ayush" works
+            once Ayush is here.
+          </>
+        }
+      />
+      <div className="mt-4 flex gap-2">
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="name"
-          className="w-28 rounded-lg bg-black/40 px-3 py-2 text-sm text-zinc-100 ring-1 ring-white/10 outline-none focus:ring-cyan-400/40"
+          className={inputCls + " w-28"}
         />
         <input
           value={email}
           onChange={(e) => setEmail(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && add()}
           placeholder="email@example.com"
-          className="min-w-0 flex-1 rounded-lg bg-black/40 px-3 py-2 text-sm text-zinc-100 ring-1 ring-white/10 outline-none focus:ring-cyan-400/40"
+          type="email"
+          className={inputCls + " min-w-0 flex-1"}
         />
         <button
           disabled={busy || !name.trim() || !email.trim()}
           onClick={add}
-          className="rounded-lg bg-cyan-500/90 px-3 py-2 text-sm font-medium text-black hover:bg-cyan-400 disabled:opacity-50"
+          className={primaryBtn}
         >
           Add
         </button>
       </div>
       {loading ? (
-        <div className="mt-4">
-          <Spinner />
-        </div>
+        <Skeleton className="mt-4 h-10 w-full" />
       ) : data && data.items.length ? (
         <ul className="mt-3 divide-y divide-white/5">
           {data.items.map((c) => (
             <li key={c.id} className="flex items-center gap-3 py-2">
               <span className="text-sm text-zinc-200">{c.name}</span>
-              <span className="min-w-0 flex-1 truncate text-xs text-zinc-500">{c.email}</span>
+              <span className="min-w-0 flex-1 truncate font-mono text-xs text-zinc-500">
+                {c.email}
+              </span>
               <button
                 disabled={busy}
                 onClick={() => remove(c.name)}
-                className="rounded px-2 py-0.5 text-xs text-zinc-500 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-50"
+                className="rounded-lg px-2 py-1 text-xs text-zinc-500 transition hover:bg-rose-500/10 hover:text-rose-300 disabled:opacity-50"
               >
                 remove
               </button>
@@ -247,29 +297,32 @@ function CommandCard() {
 
   return (
     <Card className="p-5">
-      <div className="text-sm font-medium text-zinc-100">Command</div>
-      <p className="mt-1 text-xs text-zinc-500">
-        Type anything you'd say to the assistant — "email alice@x.com that the
-        demo is ready", "meet with Ayush tomorrow 3pm".
-      </p>
-      <div className="mt-3 flex gap-2">
+      <CardHeader
+        icon={<Icon.bolt className="h-[18px] w-[18px]" />}
+        title="Command"
+        desc={
+          <>
+            Type anything you'd say to the assistant — "email alice@x.com that
+            the demo is ready", "meet with Ayush tomorrow 3pm".
+          </>
+        }
+      />
+      <div className="mt-4 flex gap-2">
         <input
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && run()}
           placeholder="what should Atlas do?"
-          className="min-w-0 flex-1 rounded-lg bg-black/40 px-3 py-2 text-sm text-zinc-100 ring-1 ring-white/10 outline-none focus:ring-cyan-400/40"
+          className={inputCls + " min-w-0 flex-1"}
         />
-        <button
-          disabled={busy || !text.trim()}
-          onClick={run}
-          className="rounded-lg bg-cyan-500/90 px-3 py-2 text-sm font-medium text-black hover:bg-cyan-400 disabled:opacity-50"
-        >
+        <button disabled={busy || !text.trim()} onClick={run} className={primaryBtn}>
           {busy ? "Running…" : "Run"}
         </button>
       </div>
       {reply && (
-        <div className="mt-3 rounded-lg bg-white/5 p-3 text-sm text-zinc-300">{reply}</div>
+        <div className="mt-3 rounded-xl bg-white/5 p-3 text-sm text-zinc-300 ring-1 ring-white/5">
+          {reply}
+        </div>
       )}
     </Card>
   );
@@ -289,26 +342,31 @@ function CloudActionsCard() {
   const { data, loading } = useApi<{ items: CloudActionRow[] }>("/cloud-actions");
   return (
     <Card className="p-5">
-      <div className="text-sm font-medium text-zinc-100">Recent cloud actions</div>
-      <p className="mt-1 text-xs text-zinc-500">
-        Emails sent and meetings scheduled straight from the cloud — no phone.
-      </p>
+      <CardHeader
+        icon={<Icon.calendar className="h-[18px] w-[18px]" />}
+        title="Recent cloud actions"
+        desc="Emails sent and meetings scheduled straight from the cloud — no phone."
+      />
       {loading ? (
-        <div className="mt-4">
-          <Spinner />
-        </div>
+        <Skeleton className="mt-4 h-10 w-full" />
       ) : data && data.items.length ? (
         <ul className="mt-3 divide-y divide-white/5">
           {data.items.map((a) => (
             <li key={a.id} className="flex items-center gap-3 py-2.5">
-              <span className="text-lg">{a.kind === "email" ? "✉" : "📅"}</span>
+              <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-white/5 text-zinc-300 ring-1 ring-white/5">
+                {a.kind === "email" ? (
+                  <Icon.mail className="h-4 w-4" />
+                ) : (
+                  <Icon.calendar className="h-4 w-4" />
+                )}
+              </span>
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm text-zinc-200">{summarize(a)}</div>
                 {a.error && (
-                  <div className="truncate text-xs text-red-300">{a.error}</div>
+                  <div className="truncate text-xs text-rose-300">{a.error}</div>
                 )}
               </div>
-              <span className="hidden text-xs text-zinc-500 sm:block">
+              <span className="hidden font-mono text-xs text-zinc-500 sm:block">
                 {fmtTime(a.created_at)}
               </span>
               <StatusPill status={a.status} />
@@ -327,13 +385,24 @@ function CloudActionsCard() {
 export default function Settings() {
   return (
     <div className="space-y-5">
-      <h1 className="text-xl font-semibold text-zinc-100">Settings</h1>
-      <div className="grid gap-4 lg:grid-cols-2">
-        <GoogleCard />
-        <ContactsCard />
-        <CommandCard />
-        <CloudActionsCard />
-      </div>
+      <p className="text-sm text-zinc-500">
+        Connect accounts, teach the assistant who your people are, and fire
+        off cloud actions — all without touching the phone.
+      </p>
+      <Stagger className="grid gap-4 lg:grid-cols-2" gap={0.06}>
+        <StaggerItem>
+          <GoogleCard />
+        </StaggerItem>
+        <StaggerItem>
+          <ContactsCard />
+        </StaggerItem>
+        <StaggerItem>
+          <CommandCard />
+        </StaggerItem>
+        <StaggerItem>
+          <CloudActionsCard />
+        </StaggerItem>
+      </Stagger>
     </div>
   );
 }
