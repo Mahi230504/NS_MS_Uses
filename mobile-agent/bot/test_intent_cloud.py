@@ -114,6 +114,30 @@ class TestMeetingIntent:
         assert isinstance(r, MeetingIntent)
         assert r.duration_minutes == 45 and r.attendees == ()
 
+    async def test_meeting_null_title_synthesized_from_attendee(self) -> None:
+        # Regression: "meeting with X at 7pm" gives no topic, so the model
+        # returns meeting_title=null. We must NOT fall through to the device
+        # agent — synthesize a title from the attendee and route to cloud Meet.
+        c, _ = _classifier(
+            '{"intent":"meeting","meeting_title":null,'
+            '"meeting_attendees":["Mohammed Wasim"],'
+            '"meeting_start":"2026-06-16 19:00","meeting_duration_minutes":30}'
+        )
+        r = await c.classify("schedule a meeting with Mohammed Wasim at 7pm today")
+        assert isinstance(r, MeetingIntent)
+        assert r.title == "Meeting with Mohammed Wasim"
+        assert r.attendees == ("Mohammed Wasim",)
+        assert r.start_local == "2026-06-16 19:00"
+
+    async def test_meeting_null_title_no_attendees_generic(self) -> None:
+        c, _ = _classifier(
+            '{"intent":"meeting","meeting_title":null,"meeting_attendees":[],'
+            '"meeting_start":"2026-06-16 19:00"}'
+        )
+        r = await c.classify("set up a meeting at 7pm today")
+        assert isinstance(r, MeetingIntent)
+        assert r.title == "Meeting"
+
     async def test_meeting_unresolved_start_falls_back_to_router(self) -> None:
         # "tomorrow 3pm" is not "YYYY-MM-DD HH:MM" → builder fails → router.
         c, _ = _classifier(

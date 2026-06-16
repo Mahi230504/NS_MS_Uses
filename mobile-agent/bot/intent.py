@@ -416,14 +416,21 @@ class IntentClassifier:
         )
 
     def _build_meeting(self, data: dict) -> MeetingIntent | None:
-        title = _clean_str(data.get("meeting_title"))
         start = _clean_str(data.get("meeting_start"))
-        if not title or not start:
+        if not start:
             return None
         try:
             datetime.strptime(start, "%Y-%m-%d %H:%M")
         except ValueError:
             return None  # the model didn't resolve to an absolute start
+        attendees = _str_tuple(data.get("meeting_attendees"))
+        # The model often omits a title when the user names only an attendee and
+        # a time ("meeting with Wasim at 7pm"). Don't reject — synthesize one
+        # from the attendees so it still routes to the cloud Meet action instead
+        # of falling through to the freeform device agent.
+        title = _clean_str(data.get("meeting_title"))
+        if not title:
+            title = f"Meeting with {attendees[0]}" if attendees else "Meeting"
         dur_raw = data.get("meeting_duration_minutes")
         try:
             duration = int(dur_raw) if dur_raw is not None else 30
@@ -431,7 +438,7 @@ class IntentClassifier:
             duration = 30
         return MeetingIntent(
             title=title,
-            attendees=_str_tuple(data.get("meeting_attendees")),
+            attendees=attendees,
             start_local=start,
             duration_minutes=duration if duration > 0 else 30,
         )
