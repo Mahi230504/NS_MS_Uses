@@ -10,6 +10,7 @@ import pytest
 from agent.orchestrator import (
     Orchestrator,
     _is_single_item_task,
+    _is_variant_options_sheet,
     _requested_quantity,
 )
 from agent.persistence import TaskRepository
@@ -3149,6 +3150,99 @@ class TestExcessQuantityGuardArmedWithCheckoutClause:
         # ADD executed (qty 1); the increment was rejected (guard now armed).
         assert adb.taps == [(600, 900)]
         assert any("over-add" in str(h.get("result", "")) for h in task.history)
+
+
+class TestVariantOptionsSheet:
+    """Live-run fix (2026-06-22): tapping ADD on a multi-variant product ('N
+    options' sub-label) opens a pack/size bottom-sheet and adds NOTHING. The
+    old code treated the ADD as a completed add, claimed 'item in your cart',
+    and steered the model to swipe away — so it never picked an option and the
+    task looped to a hard abort. The sheet must instead be recognised and the
+    model steered to pick an option."""
+
+    def _add_el(self, container_label: str, **kw) -> UiElement:
+        base = dict(
+            text="", desc="ADD", resource_id="", class_name="View",
+            cx=900, cy=1000, bounds=(840, 950, 1000, 1050), clickable=True,
+            is_action=True, container_label=container_label,
+        )
+        base.update(kw)
+        return UiElement(**base)
+
+    # --- the detector ----------------------------------------------------
+    def test_detects_sheet_from_price_offer_labels(self) -> None:
+        # Two ADD buttons whose container_label is the option's price line
+        # (not a product name) = the variant sheet. Mirrors the live capture.
+        sheet = [
+            self._add_el("quantity  ₹115 rupees , offer", cy=1863),
+            self._add_el("quantity  ₹58 rupees , offer", cy=2145),
+        ]
+        assert _is_variant_options_sheet(sheet) is True
+
+    def test_results_grid_is_not_a_sheet(self) -> None:
+        # On the grid every ADD's container_label is a distinct product name.
+        grid = [
+            self._add_el("Maggi Masala 2 Minutes Instant Noodles", cy=913),
+            self._add_el("Moi Soi Veg Hakka Noodles Not Fried", cy=913),
+            self._add_el("MasterChow Whole Wheat Noodles", cy=1888),
+        ]
+        assert _is_variant_options_sheet(grid) is False
+
+    def test_single_option_add_is_not_a_sheet(self) -> None:
+        assert _is_variant_options_sheet(
+            [self._add_el("quantity  ₹58 rupees , offer")]
+        ) is False
+
+    def test_empty_labels_do_not_trip_detector(self) -> None:
+        # Label-less ADD buttons (no ancestor found) are ambiguous, not noise.
+        assert _is_variant_options_sheet(
+            [self._add_el(""), self._add_el("")]
+        ) is False
+
+    # --- the behavioural consequences ------------------------------------
+    def test_cart_reveal_hint_steers_to_pick_option(self) -> None:
+        # Even with an executed ADD in history, an open sheet must NOT claim
+        # the item is in the cart — it must tell the model to pick an option.
+        t = Task(user_id=1, description="order noodles")
+        t.history = _add_hist(note="tap ADD for Maggi Masala")
+        sheet = [
+            self._add_el("quantity  ₹115 rupees , offer", cy=1863),
+            self._add_el("quantity  ₹58 rupees , offer", cy=2145),
+        ]
+        hint = Orchestrator._cart_reveal_hint(t, sheet)
+        assert "options sheet is open" in hint
+        assert "NOTHING is in the cart yet" in hint
+        assert "already in your cart" not in hint
+        assert "SWIPE UP" not in hint
+
+    def test_no_auto_back_while_sheet_open(self) -> None:
+        # ADD + swipe history would normally trigger a back-press; an open
+        # sheet must suppress it (backing out cancels the picker).
+        t = Task(user_id=1, description="order noodles")
+        t.history = _add_hist(note="tap ADD for Maggi Masala") + [
+            {"action": {"action": "swipe", "x1": 5, "y1": 9, "x2": 5, "y2": 1},
+             "result": "swiped"},
+        ]
+        sheet = [
+            self._add_el("quantity  ₹115 rupees , offer", cy=1863),
+            self._add_el("quantity  ₹58 rupees , offer", cy=2145),
+        ]
+        assert Orchestrator._should_auto_back_to_cart(t, sheet) is False
+
+    def test_excess_quantity_skips_option_tap_on_sheet(self) -> None:
+        # The sheet-opening ADD is counted as 1 increase; without the guard,
+        # tapping an option (the real add) for a qty-1 task would be rejected.
+        t = Task(user_id=1, description="order noodles")
+        t.history = _add_hist(note="tap ADD for Maggi Masala")  # the sheet-opener
+        sheet = [
+            self._add_el("quantity  ₹115 rupees , offer", cy=1863),
+            self._add_el("quantity  ₹58 rupees , offer", cy=2145),
+        ]
+        action = {"action": "tap", "x": 900, "y": 2145,
+                  "note": "tap ADD for the 300 g pack"}
+        # On the sheet → skipped (None). Off the sheet → would reject.
+        assert Orchestrator._excess_quantity_rejection(t, action, sheet) is None
+        assert Orchestrator._excess_quantity_rejection(t, action, []) is not None
 
 
 def _add_hist(note: str = "tap ADD on Amul milk", result: str = "tapped (1,2)"):

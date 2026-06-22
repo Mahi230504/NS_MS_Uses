@@ -91,6 +91,10 @@ _ADD_TAP_NOTE_RE = re.compile(
     r"\b(add\s+to\s+cart|tap\s+add|ADD\b|\+\s|qty|quantity|increment|buy\s+now)",
     re.IGNORECASE,
 )
+# Matches an ELEMENT's own ADD label (desc/text), not a model note. Used to
+# spot the ADD buttons on a variant/pack options sheet — see
+# `_is_variant_options_sheet`.
+_ADD_DESC_RE = re.compile(r"\badd\b", re.IGNORECASE)
 # Intent regexes for the intent-vs-element check. They scan the tap's `note`
 # field to infer what the model THINKS it's tapping, then we cross-check
 # against the actual element under the coord.
@@ -1016,7 +1020,7 @@ class Orchestrator:
             # "3 milks instead of 1" finding). Reject so the model goes to
             # the cart instead of bumping the stepper again.
             excess_problem = (
-                self._excess_quantity_rejection(task, action)
+                self._excess_quantity_rejection(task, action, ui_elements)
                 if self._active_profile.enforce_shopping_guards else None
             )
             if excess_problem is not None:
@@ -1323,6 +1327,20 @@ class Orchestrator:
         from the home screen would exit the app. Returns "" when no nudge is
         warranted. Caller gates on the commerce profile.
         """
+        # A pack/size options sheet is open: the prior ADD opened a picker and
+        # added NOTHING. Steer the model to pick an option (the real add) — do
+        # NOT claim the item is in the cart, which would send it swiping away.
+        if _is_variant_options_sheet(elements):
+            return (
+                "A pack/size options sheet is open for this product. Tapping "
+                "ADD opened it — NOTHING is in the cart yet. You MUST pick one "
+                "option to add the item: tap the [ACTION] ADD next to the pack "
+                "that matches the request. If no size or quantity was "
+                "specified, choose the smallest single pack (usually the "
+                "lowest-priced row). Do NOT swipe, press back, or tap the "
+                "product again — that just cancels the selection without "
+                "adding anything."
+            )
         if not _history_has_executed_add(task.history):
             return ""
         # A cart path is already visible — nothing to reveal.
@@ -1364,6 +1382,10 @@ class Orchestrator:
         enforces the commerce profile and the MAX_CART_RECOVER_BACKS cap, so
         we only ever back out once (results -> home).
         """
+        # An options sheet is open — backing out would cancel it, not reveal a
+        # cart. The cart-reveal hint steers the model to pick an option instead.
+        if _is_variant_options_sheet(elements):
+            return False
         if not _history_has_executed_add(task.history):
             return False
         if not _swipe_after_last_add(task.history):
@@ -1804,7 +1826,9 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _excess_quantity_rejection(task: Task, action: dict) -> str | None:
+    def _excess_quantity_rejection(
+        task: Task, action: dict, elements: list[UiElement]
+    ) -> str | None:
         """Reject an add/increment tap that would exceed the requested quantity.
 
         Production finding (2026-06-08 live Blinkit run): asked for "one pack
@@ -1828,6 +1852,11 @@ class Orchestrator:
         if not _QTY_INCREASE_NOTE_RE.search(note):
             return None
         if not _is_single_item_task(task.description):
+            return None
+        # On an options sheet, the prior ADD only opened the picker (added
+        # nothing). This tap on an option IS the first real add, so it must not
+        # be counted against the prior sheet-opening tap.
+        if _is_variant_options_sheet(elements):
             return None
         target = _requested_quantity(task.description)
         executed_increases = 0
@@ -2867,6 +2896,35 @@ def _looks_like_product_label(label: str) -> bool:
         ):
             return True
     return False
+
+
+def _is_variant_options_sheet(elements: list[UiElement]) -> bool:
+    """True when a product's pack/size options bottom-sheet is open.
+
+    Production finding (2026-06-22 live Blinkit run): tapping ADD on a
+    multi-variant product (its card carries an "N options" sub-label) adds
+    NOTHING — it opens a bottom-sheet listing each pack/size, every row with
+    its OWN ADD button, and one must be picked to actually add the item. The
+    old code treated the ADD tap as a completed add, asserted "item is in your
+    cart", and steered the model to swipe away / press back — so it never
+    picked an option and nothing was ordered.
+
+    Signature: two or more [ACTION] ADD buttons whose `container_label` is a
+    non-empty price/offer line (the option's price text) rather than a product
+    name. On the results grid each ADD's container_label is a distinct product
+    title, so `_looks_like_product_label` is True there and this returns False —
+    no false positive on a normal results screen. Empty labels are ambiguous
+    (no ancestor found) and are NOT counted, so a label-less grid can't trip it.
+    """
+    option_adds = sum(
+        1
+        for e in elements
+        if e.is_action
+        and _ADD_DESC_RE.search(f"{e.desc} {e.text}")
+        and e.container_label.strip()
+        and not _looks_like_product_label(e.container_label)
+    )
+    return option_adds >= 2
 
 
 def _extract_product_from_add_note(note: str) -> str | None:
